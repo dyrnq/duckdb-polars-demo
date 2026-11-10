@@ -1142,7 +1142,7 @@ Polars 想放行得显式说：`scan_parquet(..., cast_options=pl.ScanCastOption
 
 | 写法 | 结果 |
 | --- | --- |
-| DuckDB `read_parquet('{root}/*/*.parquet')` | 3 行，列 = `id, v, **dt**`（自动认分区列） |
+| DuckDB `read_parquet('{root}/*/*.parquet')` | 3 行，列 = `id, v, dt`（自动认出分区列 dt） |
 | Polars `scan_parquet('{root}/*/*.parquet')` | 3 行，列 = `id, v` ← **没有 dt** |
 | Polars `scan_parquet('{root}')`（传目录） | 3 行，列 = `id, v, dt` |
 | Polars `scan_parquet(..., hive_partitioning=True)` | 3 行，列 = `id, v, dt` |
