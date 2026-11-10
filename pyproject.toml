@@ -1,0 +1,27 @@
+[project]
+name = "duckdb-polars-demo"
+version = "0.1.0"
+description = "DuckDB 与 Polars 的用法、语义差异与性能对比"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.5.3",
+    "polars>=1.30",
+    "pyarrow>=20",
+    "numpy>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
