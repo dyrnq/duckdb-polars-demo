@@ -156,9 +156,10 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 | `json_bigint.ndjson` | 3 行 | 超大整数 | JSON 大整数精度 |
 | `index_customers_sorted_*.parquet` | 500 万行 | `customer_id`、`name`、`region`、`balance` | 索引与点查（**按主键排序**） |
 | `index_customers_shuf_*.parquet` | 500 万行 | 同上（**整行随机置换**） | 索引与点查（对照组） |
-| `decimal_amounts_1000000.parquet` | 100 万笔金额 | `amount`（最小单位 0.0001 元） | 金额与 Decimal |
-| `write_demo/` | 每次运行重建 | 各种写入产物 | 写入路径与事务（覆盖/原子替换/压缩） |
-| `csv_demo/` | 每次运行重建 | 各种 CSV 样本（含坏行、超采样窗口的值） | CSV 读写与往返保真 |
+| `decimal_amounts_1000000.parquet` | 100 万笔金额 | `id`、`amount`（最小单位 0.0001 元）、`amount_units`（整数最小单位，**精确答案的基准列**） | 金额与 Decimal |
+| `write_demo/` | 每次运行产出（目录**不清空**，旧文件会越攒越多） | 各种写入产物 | 写入路径与事务（覆盖/原子替换/压缩） |
+| `csv_demo/` | 每次运行覆盖同名文件 | 各种 CSV 样本（含坏行、超采样窗口的值） | CSV 读写与往返保真 |
+| `tz_demo/` | 每次运行覆盖同名文件 | `duckdb_ts.parquet`、`polars_ts.parquet`（两边各写一份时间戳） | 日期时间与时区（Parquet 往返） |
 
 `index_customers_*` 的文件名里带行数：换个 `--rows` 就是另一份文件，**永远不覆盖已有数据**。
 
@@ -180,21 +181,23 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 
 | 查询 | DuckDB(ms) | Polars(ms) | 更快 | 等价 |
 | --- | --- | --- | --- | --- |
-| 区域 × 类目 Top-N | 57.5 | 35.7 | Polars 1.61× | ✅ |
-| 每日收入趋势 | 49.2 | 29.4 | Polars 1.67× | ✅ |
-| 高价值客户 Top 20 | 56.4 | 45.2 | Polars 1.25× | ✅ |
+| 区域 × 类目 Top-N | 59.4 | 30.5 | Polars 1.95× | ✅ |
+| 每日收入趋势 | 44.8 | 27.3 | Polars 1.64× | ✅ |
+| 高价值客户 Top 20 | 45.9 | 43.1 | Polars 1.07× | ✅ |
 
 **场景 B：DuckDB 读物化后的 `demo.duckdb`，Polars 仍读 Parquet**
 
 | 查询 | DuckDB(ms) | Polars(ms) | 更快 | 等价 |
 | --- | --- | --- | --- | --- |
-| 区域 × 类目 Top-N | 17.8 | 36.8 | DuckDB 2.07× | ✅ |
-| 每日收入趋势 | 10.2 | 30.0 | DuckDB 2.94× | ✅ |
-| 高价值客户 Top 20 | 13.7 | 32.4 | DuckDB 2.37× | ✅ |
+| 区域 × 类目 Top-N | 13.9 | 33.4 | DuckDB 2.40× | ✅ |
+| 每日收入趋势 | 9.1 | 31.8 | DuckDB 3.49× | ✅ |
+| 高价值客户 Top 20 | 13.0 | 56.1 | DuckDB 4.32× | ✅ |
 
-**结论**：直接扫 Parquet 时 Polars 更快；但 DuckDB 读自己的存储格式快得多 —— **存储格式带来的差异（2~3×）大于引擎本身的差异（1.2~1.7×）**。选型时先决定存储格式，再谈用什么引擎。
+**结论**：直接扫 Parquet 时 Polars 更快；但 DuckDB 读自己的存储格式快得多 —— **存储格式带来的差异（2.4~4.3×）大于引擎本身的差异（1.1~2.0×）**。选型时先决定存储格式，再谈用什么引擎。
 
-另外注意：这个量级下两个引擎都在 10~60 ms，噪声足以让快慢关系在不同轮次翻转（Top 20 那条查询在多次运行里两边都赢过）。**单次测量没有意义**，本项目默认重复 5 次取中位数，并保留 `--json` 便于做多轮统计。
+另外注意：这个量级下两个引擎都在 10~60 ms，噪声足以让快慢关系在不同轮次翻转（Top 20 那条查询在多次运行里两边都赢过）。
+两张表里的 **Polars 那一列是两次独立运行**测的同一个查询（读同一份 parquet），数字照样会跟着机器负载浮动 ——
+同一轮里 Top 20 测出过 43 ms，也测出过 56 ms。**单次测量没有意义**，本项目默认重复 5 次取中位数，并保留 `--json` 便于做多轮统计。
 
 ## 语义差异（踩坑记录）
 
@@ -230,7 +233,7 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 | 25 | 整数除以零 | **抛异常** | 给 **null** | DuckDB 侧用 `TRY(...)` |
 | 26 | 浮点求和精度 | 朴素累加（和 Python 逐行累加**结果完全一样**） | 偏序合并，**明显更准** | 两边都别拿浮点算钱 |
 | 27 | 数值溢出 | **抛异常**（Conversion / OutOfRange） | Float64 静默给 `inf` | Polars 的 Decimal 会报错，Float64 不会 |
-| 28 | JOIN 的输出列 | `ON` 出**两个**同名列，`USING` 才合并成一个 | 永远一个；`how='right'` 把右表列放前面；`how='full'` 多一列 `k_right` | DuckDB 侧写 `USING (k)` |
+| 28 | JOIN 的输出列 | `ON` 出**两个**同名列，`USING` 才合并成一个 | 永远一个；`how='right'` 把右表列放前面；`how='full'` / `how='cross'` 多一列 `k_right` | DuckDB 侧写 `USING (k)` |
 | 29 | 连接键类型不一致 | 把字符串侧**偷偷转成整数**后继续连 | **SchemaError**，干脆不连 | 连接前先把两侧类型对齐 |
 | 30 | 写同一个路径 | **静默覆盖** | **静默覆盖** | 两边一样：增量场景要自己防 |
 | 31 | 覆盖已有文件的原子性 | 先写 `tmp_*` 再 rename（**原子替换**） | 直接写目标路径 | Polars 侧自己写临时文件再 rename |
@@ -250,6 +253,7 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 | 45 | Hive 分区目录 | 传 glob **自动认**分区列 | 传 glob **不认**，得传目录或 `hive_partitioning=True` | 路径写法决定结果里有没有分区列 |
 | 46 | 分区值当字符串过滤 | 隐式转换掉，不报错 | **报类型错** | Polars 用 `pl.lit(date(...))` |
 | 47 | 写分区 | **不把分区列写进文件**（读时从路径补） | **把分区列留在文件里** | 两边目录名都是 hive 写法，能互相读 |
+| 48 | 分支求值（`CASE WHEN` / `when/then`） | **只算命中的那个分支** | **每个分支都算一遍**，最后才挑对的那条 | 结果两边一致，差的是代价；分支越贵越吃亏（Polars 没有开关能关） |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -257,7 +261,7 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 第 11~14 条在 `ASOF JOIN（时间序列 join）`、第 15~17 条在 `JSON 与嵌套类型`、第 18~20 条在 `索引与点查` 里展开；
 第 21~25 条在 `NULL 与三值逻辑`、第 26~27 条在 `金额与 Decimal`、第 28~29 条在 `JOIN 全景`、
 第 30~33 条在 `写入路径与事务`、第 34~36 条在 `CSV 读写与往返保真`、第 37~41 条在 `日期时间与时区`、
-第 42 条在 `排序稳定性`、第 43~47 条在 `多文件与分区表` 里展开。
+第 42 条在 `排序稳定性`、第 43~47 条在 `多文件与分区表`、第 48 条在 `自定义函数（UDF）` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -337,27 +341,46 @@ con.register("t", polars_df)  # Polars -> DuckDB
 
 `uv run python src/udf_demo.py` 用同一个自定义规则，两边各写几种，量「算这条规则」的代价（输入已物化，不含扫描 Parquet 的时间）。
 
-实测（20 万行，本机，两组规则）：
+实测（**100 万行** = 脚本默认数据量，本机，两组规则）：
 
 | 引擎 | 写法 | 实现细节 | 轻量规则 | 计算密集规则 |
 | --- | --- | --- | --- | --- |
-| DuckDB | 原生 SQL | `CASE WHEN` | **7.3 ms** | **7.6 ms** |
-| DuckDB | Python UDF | `type='native'`（**逐行**） | 44 ms | 60 ms |
-| DuckDB | Python UDF | `type='arrow'`（批）+ pyarrow.compute | 62 ms | 144 ms |
-| DuckDB | Python UDF | `type='arrow'`（批）+ **numpy** | 23 ms | 21 ms |
-| Polars | 原生表达式 | `when/then` | **2.2 ms** | 7.5 ms |
-| Polars | `map_batches` | 批内**逐行** Python | 35 ms | 53 ms |
-| Polars | `map_batches` | 批内**向量化** | 1.5 ms | 8.2 ms |
+| DuckDB | 原生 SQL | `CASE WHEN` | **23.8 ms** | **14.3 ms** |
+| DuckDB | Python UDF | `type='native'`（**逐行**） | 310 ms | 335 ms |
+| DuckDB | Python UDF | `type='arrow'`（批）+ pyarrow.compute | 566 ms | 1027 ms |
+| DuckDB | Python UDF | `type='arrow'`（批）+ **numpy** | 127 ms | 130 ms |
+| Polars | 原生表达式 | `when/then` | **8.1 ms** | 60 ms |
+| Polars | `map_batches` | 批内**逐行** Python | 189 ms | 286 ms |
+| Polars | `map_batches` | 批内**向量化** | 9.2 ms | 61 ms |
 
-七种写法结果逐值一致 ✅。三个反直觉的发现：
+七种写法结果逐值一致 ✅。同一份脚本连跑几次，这张表里**原生那两行浮动最大**
+（DuckDB 原生 SQL 在 14~32 ms 之间跳、Polars 原生表达式在 6~10 ms 之间跳 —— 机器是共享的），
+UDF 那几行很稳。
+
+五个反直觉的发现：
 
 1. **同样叫「Python UDF」，两个引擎的默认粒度不一样。** DuckDB 的 `type='native'` 是**逐行**调用
    （每行跨一次 Python/C 边界），Polars 的 `map_batches` 拿到的**是整批**。
 2. **DuckDB 的 arrow UDF 是批式接口，但函数体怎么写决定成败** —— 同一批数据，
-   numpy 函数体比 pyarrow.compute 函数体快 **2.8×~6.8×**。原因是 `pc.if_else` 在
-   ChunkedArray 上做标量广播很慢，numpy 走的是连续内存。
-3. **批式接口不一定比逐行快。** 轻量规则下，用 pyarrow.compute 写的 arrow UDF（62 ms）
-   甚至比逐行 UDF（44 ms）还慢。
+   numpy 函数体比 pyarrow.compute 函数体快 **4×（轻量）~ 8×（计算密集）**
+   （多次运行落在 3×~8×）。原因是 `pc.if_else` 在 ChunkedArray 上做标量广播很慢，
+   numpy 走的是连续内存。
+3. **批式接口不一定比逐行快。** 轻量规则下，用 pyarrow.compute 写的 arrow UDF（566 ms）
+   甚至比逐行 UDF（310 ms）还慢。
+4. **「原生」的赢家随规则变。** 轻量规则 Polars 原生表达式更快（8.1 ms vs 23.8 ms），
+   计算密集规则反过来 DuckDB 原生 SQL 更快（14.3 ms vs 60 ms）—— 原因见下一条。
+5. **分支求值：两个引擎选对分支的结果一样，但算的遍数不一样。**
+   构造一条规则，每个分支里都塞一次 `power()`（脚本第 3 部分实测）：
+
+   | 引擎 | 单分支 | 四分支 | 四分支 ÷ 单分支 |
+   | --- | --- | --- | --- |
+   | DuckDB `CASE WHEN` | 8.1 ms | 11.5 ms | **1.4×** |
+   | Polars `when/then` | 19.7 ms | 99.6 ms | **5.1×** |
+
+   DuckDB 的四分支几乎没变贵（真按四遍算的话，比例应该 ≥ 4×）—— 它按行选分支；
+   Polars 那边四个分支**全算了一遍**才挑对的那条。
+   两个引擎选中的分支结果完全一致（脚本里跟 NumPy 逐行算的基准对过账，最大偏差 0.00e+00），
+   差的只是**算几遍** —— 分支越多、每支越贵，差距越大。
 
 选型口诀：
 
@@ -686,6 +709,21 @@ DuckDB 的浮点求和和 Python 逐行累加**结果完全一样** —— 说�
 Polars 明显更准 —— 但**两边都是错的**，Polars 只是错得少一点。
 这不是「Polars 更对」的结论，而是「两边都不该拿浮点算钱」。
 
+**分组求和 vs 一次求和：本来就是两个数**
+
+| 路径 | 结果 | 与精确值之差 |
+| --- | --- | --- |
+| 精确答案（整数单位求和） | 99938829.8636 | 0 |
+| DuckDB 一次 `SUM` | 99938829.86360525 | +5.25e-06 |
+| DuckDB 先分组再汇总 | 99938829.86359999 | -1.49e-08 |
+| Polars 一次 `sum` | 99938829.8636 | 0 |
+| Polars 先 `group_by` 再汇总 | 99938829.86360002 | +1.49e-08 |
+
+分组前后 DuckDB 差 5.26e-06 元、Polars 差 1.49e-08 元 —— **「一次求和」和「分组求和再汇总」本来就是两个数**。
+这次分组路径反而更接近精确值，那是运气：两者的误差符号和量级都不一样，
+**没有任何理由指望分组能抵消或修好误差**。
+实用结论：两种口径的报表对不上是正常的，要对齐就得统一口径（都用整数或 DECIMAL）。
+
 **Polars 想要精确金额：三条路**
 
 | 写法 | 求和结果（元） | 耗时 | 保证精确 |
@@ -757,6 +795,7 @@ SQL 里 SUM 无行 = NULL，Polars 里 sum 无值 = 0 —— 这是本 demo 唯�
 | --- | --- | --- |
 | INNER / LEFT / RIGHT / FULL | 2 / 4 / 4 / 6 | 2 / 4 / 4 / 6 |
 | SEMI / ANTI | 2 / 2 | 2 / 2 |
+| CROSS（无连接键，笛卡尔积） | 12 | 12 |
 
 **但输出列的结构不一样 —— 这是最容易忽略的坑**
 
@@ -764,9 +803,11 @@ SQL 里 SUM 无行 = NULL，Polars 里 sum 无值 = 0 —— 这是本 demo 唯�
 | --- | --- |
 | DuckDB `ON` | `['k', 'lv', 'k', 'rv']` ← **两个 k** |
 | DuckDB `USING` | `['k', 'lv', 'rv']` |
+| DuckDB `CROSS JOIN` | `['k', 'lv', 'k', 'rv']` ← 同样两个 k |
 | Polars `inner` / `left` | `['k', 'lv', 'rv']` |
 | Polars `right` | `['lv', 'k', 'rv']` ← 右表列排在前面 |
 | Polars `full` | `['k', 'lv', 'k_right', 'rv']` ← 多一列 |
+| Polars `cross` | `['k', 'lv', 'k_right', 'rv']` ← 跟 `full` 同一个套路 |
 
 FULL OUTER 的**行内容**其实一致（6 行逐行对得上）：DuckDB 的 `USING` 把两边的键合并进一列 `k`，Polars 保留两列 ——
 匹配上的行 `k` 和 `k_right` 相同，只在左边出现的行 `k_right` 是 NULL，反之亦然。**是同一行数据，只是列结构不同。**
@@ -807,14 +848,13 @@ FULL OUTER 的**行内容**其实一致（6 行逐行对得上）：DuckDB 的 `
 
 `uv run python src/write_demo.py` 比「写出去」这件事的两边差异。
 
-**1. 写同一个路径：两边都是静默覆盖**
+**1. 写同一个路径：两边都是静默覆盖；覆盖写的安全性还不一样**
 
 DuckDB 第一次 199 字节、第二次 199 字节；Polars 第一次 579 字节、第二次 579 字节 —— 都是覆盖，**都不是追加**，也都不会提示你。
 增量场景里这是坑：以为在追加，其实把上一批数据冲掉了。
 
-**2. 写失败时旧文件还在吗**：两边都保住了旧文件（错误发生在真正写文件之前）。
-
-**但「覆盖写」的安全性不一样**（实测写入过程中目录里出现过的文件名）：
+写失败时两边都保住了旧文件（错误发生在真正写文件之前）。
+但**「覆盖写」的安全性不一样**（实测写入过程中目录里出现过的文件名）：
 
 | 引擎 | 覆盖已有文件时目录里出现 | 语义 |
 | --- | --- | --- |
@@ -824,7 +864,7 @@ DuckDB 第一次 199 字节、第二次 199 字节；Polars 第一次 579 字节
 DuckDB 的读者要么看到完整的旧文件，要么看到完整的新文件；Polars 写到一半进程被杀，会留下一个半截的 parquet。
 （补充：DuckDB 写**新文件**时也是直接写，临时文件只在「替换已有文件」时才用 —— 「第一次写」和「覆盖写」的安全性并不完全一样。）
 
-**3. 事务：DuckDB 有，Polars 没有**
+**2. 事务：DuckDB 有，Polars 没有**
 
 DuckDB（`.duckdb` 文件，单连接）：`BEGIN` + `INSERT` 后 2 行 → `ROLLBACK` 后 1 行 → 再 `COMMIT` 后 2 行。**真的完整的 ACID 事务**，还带 WAL 文件。
 
@@ -836,11 +876,11 @@ Polars 的 `DataFrame` / `LazyFrame` **没有事务 API** —— 没有 BEGIN / 
 能做的只是把几个 DataFrame 在内存里 `pl.concat` 起来，那是「拼数据」不是「事务」：没有隔离级别，没有回滚点，
 更没有和文件系统写入绑定的原子性。要在 Polars 侧做出同等效果，只能靠「写新文件 + 原子替换 + 读者重试」。
 
-**4. 类型往返**：纳秒时间戳不丢（DuckDB 2.0 有 `TIMESTAMP_NS`），Decimal 无损（decimal128）。
+**3. 类型往返**：纳秒时间戳不丢（DuckDB 2.0 有 `TIMESTAMP_NS`），Decimal 无损（decimal128）。
 两处要留意：DuckDB 的 `TIMESTAMP` 本身就是**微秒**精度（Polars 是纳秒，parquet 里各存各的）；
 `TIMESTAMPTZ` 落到 Polars 会被**规范化成 UTC**，原来的 +08 偏移没了。
 
-**5. 写一百万行 parquet**
+**4. 写一百万行 parquet**
 
 | 口径 | 写法 | 耗时 | 文件大小 |
 | --- | --- | --- | --- |
@@ -1058,18 +1098,18 @@ DuckDB 的 `default_null_order = NULLS_LAST`（**升序降序都空最后**）�
 
 **3. 排序稳不稳：同一个查询，重复执行答案可能不一样**
 
-100 万行、排序键只有 1000 个不同取值。看 k=0 的那批行的相对顺序，连跑 5 次 → **跑出了 2 种不同的顺序**。
+100 万行、排序键只有 1000 个不同取值。看 k=0 的那批行的相对顺序，连跑 5 次 → **跑出了好几种不同的顺序**
+（具体几种每次跑都不同，实测见过 2 种、也见过 4 种）。
 
 线程数的影响（每个线程数单独测 3 次）：
 
 | threads | 结果 |
 | --- | --- |
-| 1 | ✅ 稳定 |
-| 2 | ❌ 2 种结果 |
-| 4 | ✅ 稳定 |
-| 8 | ❌ 3 种结果 |
+| 1 | ✅ 稳定（串行排序，顺序固定） |
+| 2 / 4 / 8 | ⚠️ **不保证** —— 实测有时碰巧稳、有时一次跑出 3~4 种结果 |
 
 单线程走串行排序，顺序就是插入顺序；**2 线程起就走并行排序**，合并顺序取决于各线程什么时候把结果交上来 —— 每次都可能不同。
+线程数越多，合并的批次越多，撞出不同顺序的机会也越多 —— 但**多线程不一定每次都不稳**，所以别拿「某次跑出来是稳的」当保证。
 （这和 `scaling_demo.py` 里「线程数变了结果是否还一致」是同一个根因。）
 
 Polars 侧：`sort()` 的 `maintain_order` 默认 **False**。单列排序实测恰好是稳的，**多列排序就不稳了**；
@@ -1078,7 +1118,7 @@ DuckDB 的 `preserve_insertion_order` **管不了这个** —— 它管的是表
 
 **4. 后果：LIMIT 会取到不同的行**
 
-百万行表 `ORDER BY k LIMIT 5` 连跑 6 次 → **跑出了 4 种结果**。
+百万行表 `ORDER BY k LIMIT 5` 连跑 6 次 → **跑出了多种结果**（实测见过 3 种、也见过 4 种）。
 生产里长这样：榜单刷新一次第 10 名换人；翻页时第 21 行永远看不到或者出现两次；「取前 100 条导出」导出的内容每次不一样。
 **两个引擎都不报错** —— 这就是它危险的地方。
 
@@ -1098,13 +1138,15 @@ Polars  → [22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
 `'Apple' < 'apple'`（大写在前，和 MySQL 的 `utf8mb4_general_ci` 不同）；中文按 Unicode 码位排（`'上'=U+4E0A < '北'=U+5317`），**不是拼音**。
 这一条两边一致 —— 值得记一笔：**一致的地方不用管，不一致的地方才要命**。
 
-**7. 修法只有一个：排序键要能唯一确定顺序**
+**7. 性能，以及「排序稳定」的代价**
+
+百万行全排序 DuckDB 18.8 ms / Polars 17.6 ms（`maintain_order=True` 17.8 ms）；
+Top-N 走专门的 top-N 算子（2.2 ms / 1.7 ms），比全排序快得多 —— 「要前 10 条就别全排」两边都成立。
+
+修法只有一个：**排序键要能唯一确定顺序**。
 
 - DuckDB：**没有开关**能让 `ORDER BY` 变稳，只能自己加唯一 tiebreaker（`ORDER BY k, p`）
 - Polars：`sort(..., maintain_order=True)`，实测没有额外开销，直接开着
-
-**8. 性能**：百万行全排序 DuckDB 22.4 ms / Polars 20.8 ms（`maintain_order=True` 17.4 ms）；
-Top-N 走专门的 top-N 算子（2.5 ms / 1.8 ms），比全排序快得多 —— 「要前 10 条就别全排」两边都成立。
 
 ## 多文件与分区表
 
@@ -1115,7 +1157,8 @@ DuckDB 的 `read_parquet` 只接**一个**参数（字符串或列表），多�
 
 **2. 文件读取顺序：DuckDB 靠一个开关保序，Polars 没有开关**
 
-DuckDB 的 `preserve_insertion_order`（默认 True）关掉之后，前 5 行的 id 从 `[0, 1, 2, 3, 4]` 变成 `[4000, 4001, 4002, 4003, 4004]`。
+DuckDB 的 `preserve_insertion_order`（默认 True）关掉之后，前 5 行的 id 不再是 `[0, 1, 2, 3, 4]`，
+而是**换成别的文件里的行**（具体是哪个文件、哪几行，每次跑都不一样 —— 实测见过 `[4000, …]`、`[12000, …]`、`[72000, …]`）。
 **Polars 没有这个开关**，顺序固定按文件名。依赖行序的查询，两边都要显式 `ORDER BY`。
 
 **3. 各文件的列类型不一致：一个自动统一，一个直接报错**
@@ -1222,7 +1265,8 @@ duckdb-polars-demo/
 │   ├── index_customers_shuf_*.parquet    # index_demo.py：打乱行序
 │   ├── decimal_amounts_*.parquet         # decimal_demo.py：金额样本
 │   ├── write_demo/                       # write_demo.py：写入产物
-│   └── csv_demo/                         # csv_demo.py：CSV 样本与产物
+│   ├── csv_demo/                         # csv_demo.py：CSV 样本与产物
+│   └── tz_demo/                          # tz_demo.py：两边各写一份时间戳
 ├── src/
 │   ├── common.py           # 唯一事实来源：口径常量 + 结果等价性校验 + 终端排版
 │   ├── gen_data.py         # 造数

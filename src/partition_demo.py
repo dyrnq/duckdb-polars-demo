@@ -117,7 +117,7 @@ def scenario_read_many(con: duckdb.DuckDBPyConnection, n_files: int) -> None:
     print("  两边都是「一个 glob → 一张逻辑表」，用法一致。")
     print("  注意 DuckDB 的 `read_parquet` 只接**一个**参数（字符串或列表），")
     print("  传多个文件要写成 `read_parquet(['a.parquet', 'b.parquet'])`，")
-    print("  直接 `read_parquet('a.parquet', 'b.parquet')` 会报 BinderError。")
+    print("  直接 `read_parquet('a.parquet', 'b.parquet')` 会报 BinderException。")
 
 
 # ---------------------------------------------------------------- 场景 2：文件顺序

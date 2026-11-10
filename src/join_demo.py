@@ -84,13 +84,19 @@ def scenario_types(con: duckdb.DuckDBPyConnection) -> None:
     }
     print(f"  {'连接类型':<12}{'DuckDB 行数':<14}{'Polars 行数':<14}{'行数一致?'}")
     print("  " + "-" * 60)
-    for how in ["inner", "left", "right", "full", "semi", "anti"]:
-        pol = LEFT.join(RIGHT, on="k", how=how)
-        # DuckDB 侧：SEMI/ANTI 用专用语法，其余用 JOIN 关键字
+    for how in ["inner", "left", "right", "full", "semi", "anti", "cross"]:
+        # CROSS 没有连接键，Polars 侧不能传 on=
+        if how == "cross":
+            pol = LEFT.join(RIGHT, how="cross")
+        else:
+            pol = LEFT.join(RIGHT, on="k", how=how)
+        # DuckDB 侧：SEMI/ANTI 用专用语法，CROSS 没有连接条件，其余用 JOIN 关键字
         if how == "semi":
             sql = "SELECT * FROM left_t SEMI JOIN right_t ON left_t.k = right_t.k"
         elif how == "anti":
             sql = "SELECT * FROM left_t ANTI JOIN right_t ON left_t.k = right_t.k"
+        elif how == "cross":
+            sql = "SELECT * FROM left_t CROSS JOIN right_t"
         else:
             sql = duck_sql[how.upper()].format(j=how.upper())
         try:
@@ -125,12 +131,18 @@ def scenario_columns(con: duckdb.DuckDBPyConnection) -> None:
     cols = _cols(con, "SELECT * FROM left_t LEFT JOIN right_t USING (k)")
     print(f"    USING  → {cols}")
     print()
+    print("  CROSS 没有连接键，两个引擎都是笛卡尔积：")
+    cols = _cols(con, "SELECT * FROM left_t CROSS JOIN right_t")
+    print(f"    DuckDB CROSS → {cols}")
+    print()
     print("  Polars 侧：")
     for how in ["inner", "left", "right", "full", "semi", "anti"]:
         cols = LEFT.join(RIGHT, on="k", how=how).columns
         print(f"    {how:<6} → {cols}")
+    cols = LEFT.join(RIGHT, how="cross").columns
+    print(f"    {'cross':<6} → {cols}")
     print()
-    print("  三处不一样：")
+    print("  四处不一样：")
     print(
         "    1. DuckDB 的 `ON` 版本有两个 `k`；Polars 永远只有一个 —— "
         "想对齐，DuckDB 侧要写 `USING (k)`。"
@@ -140,6 +152,7 @@ def scenario_columns(con: duckdb.DuckDBPyConnection) -> None:
     print("    3. Polars 的 `how='full'` 多出一个 `k_right`（两边的键都留着），")
     print("       DuckDB 的 FULL OUTER JOIN 用 `USING` 时只留一个 `k`（值合并，")
     print("       匹配上的取左边的值，没匹配上的取右边的值）。")
+    print("    4. CROSS 也是同一个套路：DuckDB 出两个 `k`，Polars 出 `k` + `k_right`。")
     print()
     print("  这些差异在**按列名取数**时不会报错，只会让结果悄悄少一列或多一列。")
     print("  举例：把 DuckDB 的 ON 版结果直接转成 Arrow，schema 里会有两个 `k` 字段 ——")
@@ -433,6 +446,7 @@ def summary() -> None:
     print("     · DuckDB `ON` 连接出两个同名列，`USING` 才合并成一个；Polars 永远一个。")
     print("     · Polars 的 `how='right'` 把右表列排在前面；DuckDB 的列顺序不变。")
     print("     · Polars 的 `how='full'` 多一个 `k_right`；DuckDB 的 FULL OUTER 合并成一个 `k`。")
+    print("     · CROSS（无连接键）也一样：DuckDB 出两个 `k`，Polars 出 `k` + `k_right`。")
     print("     · 字符串列的 Arrow 类型也不同：DuckDB `string`，Polars `large_string`。")
     print("  3. 连接键类型不一致：DuckDB 把字符串侧转成整数后继续连，")
     print("     '02' 和 '2' 塌缩成同一个键，**行数被悄悄放大**；")
@@ -447,7 +461,7 @@ def summary() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="JOIN 全景：语义、行数与输出列结构")
     parser.add_argument("--repeat", type=int, default=5, help="性能测量重复次数")
-    parser.parse_args()
+    args = parser.parse_args()
 
     print(f"DuckDB {duckdb.__version__} · Polars {pl.__version__}")
     print(f"机器状态：{common.describe_machine()}")
@@ -463,7 +477,7 @@ def main() -> int:
     scenario_key_types(con)
     scenario_fanout(con)
     con.close()
-    scenario_performance(5)
+    scenario_performance(args.repeat)
     summary()
     return 0
 

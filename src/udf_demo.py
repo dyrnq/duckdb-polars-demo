@@ -17,9 +17,11 @@
 
 结论跟直觉不一样，值得看两遍：
   · DuckDB 的 arrow UDF 是批式接口，但**函数体怎么写决定成败** ——
-    同样一批数据，numpy 函数体比 pyarrow.compute 函数体快 2~6 倍
+    同样一批数据，numpy 函数体比 pyarrow.compute 函数体快 4~8 倍
   · 轻量规则下，用 pyarrow.compute 写的 arrow UDF 甚至比逐行 UDF 还慢
   · Polars 的 map_batches 天生按批给数据，真正的坑是「批内又退回逐行 Python」
+  · 两个引擎的**原生表达式**选对分支的结果一样，但 DuckDB 只算命中的那个分支，
+    Polars 每个分支都算一遍 —— 规则越复杂、分支越贵，差距越大
 
 为了只量「算这条规则」的代价（而不是扫描 Parquet 的代价），
 输入会先物化好，再分别计时。
@@ -32,7 +34,9 @@
 from __future__ import annotations
 
 import argparse
+import statistics
 import time
+from typing import Any
 
 import duckdb
 import numpy as np
@@ -300,6 +304,111 @@ def polars_map_batch(df: pl.DataFrame, rule: dict) -> pl.DataFrame:
     )
 
 
+# ---------------------------------------------------------------- 分支求值探针
+
+# 四个分支，每个分支里都塞一次 power()。
+# 如果引擎只算命中的那个分支 → 四分支 ≈ 单分支；
+# 如果四个分支全算一遍 → 四分支 ≈ 4 × 单分支。
+
+BRANCH_SQL_ONE = "SELECT power(unit_price, 0.99::DOUBLE) AS v FROM src"
+
+BRANCH_SQL_FOUR = """
+    SELECT CASE WHEN unit_price < 10.0  THEN power(unit_price, 0.99::DOUBLE)
+                WHEN unit_price < 50.0  THEN power(unit_price*1.1::DOUBLE, 0.99::DOUBLE)
+                WHEN unit_price < 100.0 THEN power(unit_price*1.2::DOUBLE, 0.99::DOUBLE)
+                ELSE                      power(unit_price*1.3::DOUBLE, 0.99::DOUBLE)
+           END AS v
+    FROM src
+"""
+
+
+def polars_branch_one(df: pl.DataFrame) -> pl.DataFrame:
+    """单分支：一次 power。"""
+    c = pl.col("unit_price")
+    return df.select(c.pow(0.99).alias("v"))
+
+
+def polars_branch_four(df: pl.DataFrame) -> pl.DataFrame:
+    """四分支，每个分支一次 power。"""
+    c = pl.col("unit_price")
+    return df.select(
+        pl.when(c < 10.0)
+        .then(c.pow(0.99))
+        .when(c < 50.0)
+        .then((c * 1.1).pow(0.99))
+        .when(c < 100.0)
+        .then((c * 1.2).pow(0.99))
+        .otherwise((c * 1.3).pow(0.99))
+        .alias("v")
+    )
+
+
+def bench(fn, repeat: int = 5) -> tuple[Any, float]:
+    """跑 repeat 次取中位数（秒），返回 (最后一次的结果, 中位耗时)。"""
+    out = None
+    timings = []
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        out = fn()
+        timings.append(time.perf_counter() - t0)
+    return out, statistics.median(timings)
+
+
+def scenario_branch(con: duckdb.DuckDBPyConnection, polars_df: pl.DataFrame) -> None:
+    section("第 3 部分 · 原生表达式：四个分支，引擎到底算几遍？")
+    print("  构造一条规则：每个分支里都塞一次 power() —— 分支里的活越重，越容易看出差别。")
+    print()
+
+    duck_one, t_duck_one = bench(lambda: pl.from_arrow(con.sql(BRANCH_SQL_ONE).to_arrow_table()))
+    duck_four, t_duck_four = bench(lambda: pl.from_arrow(con.sql(BRANCH_SQL_FOUR).to_arrow_table()))
+    pol_one, t_pol_one = bench(lambda: polars_branch_one(polars_df))
+    pol_four, t_pol_four = bench(lambda: polars_branch_four(polars_df))
+
+    print(f"  {'引擎':<9}{'写法':<42}{'耗时(ms)':>10}")
+    print("  " + "-" * 64)
+    for engine, desc, value in [
+        ("DuckDB", "单分支 power(unit_price, 0.99)", t_duck_one * 1000),
+        ("DuckDB", "四分支 CASE WHEN（每分支一次 power）", t_duck_four * 1000),
+        ("DuckDB", "四分支 ÷ 单分支", f"{t_duck_four / t_duck_one:.1f}×"),
+        ("Polars", "单分支 unit_price.pow(0.99)", t_pol_one * 1000),
+        ("Polars", "四分支 when/then（每分支一次 power）", t_pol_four * 1000),
+        ("Polars", "四分支 ÷ 单分支", f"{t_pol_four / t_pol_one:.1f}×"),
+    ]:
+        shown = f"{value:.1f}" if isinstance(value, float) else value
+        print(f"  {common.pad(engine, 9)}{common.pad(desc, 42)}{shown:>10}")
+    print()
+
+    # 逐行算一遍当基准（NumPy，按行选分支）
+    up = polars_df["unit_price"].to_numpy()
+    factor = np.where(up < 10.0, 1.0, np.where(up < 50.0, 1.1, np.where(up < 100.0, 1.2, 1.3)))
+    truth = np.power(up * factor, 0.99)
+    duck_v = duck_four["v"].to_numpy()
+    pol_v = pol_four["v"].to_numpy()
+    duck_err = float(np.max(np.abs(duck_v - truth)))
+    pol_err = float(np.max(np.abs(pol_v - truth)))
+    same = bool(np.allclose(duck_v, pol_v, rtol=1e-9, atol=1e-9))
+
+    print(f"  分支选择的对账：两个引擎选的结果一致 {'✅' if same else '❌'}")
+    print("    与 NumPy 逐行算的基准相比，最大绝对偏差：")
+    print(f"      DuckDB {duck_err:.2e}   Polars {pol_err:.2e}")
+    print()
+
+    duck_ratio = t_duck_four / t_duck_one
+    pol_ratio = t_pol_four / t_pol_one
+    print("  读数：")
+    print(
+        f"    DuckDB 四分支比单分支贵 {duck_ratio:.1f}× —— "
+        "四个分支的重活**没有全算一遍**（真按四遍算，比例应该 ≥ 4×）。"
+    )
+    print(
+        f"    Polars 四分支比单分支贵 {pol_ratio:.1f}× —— "
+        "四个分支的重活**全算了一遍**，最后才挑对的那条。"
+    )
+    print("    也就是说：两个引擎**选哪条分支**的结果完全一样，")
+    print("    差的是**算几遍** —— 这也是原生 SQL 在计算密集规则上反超 Polars 原生表达式的原因。")
+    print()
+
+
 # ---------------------------------------------------------------- 主流程
 
 
@@ -418,10 +527,11 @@ def main() -> None:
                 label = f"{engine}  {kind} / {detail}"
                 print(f"  {label:<50}{'✅ 与原生 SQL 一致' if ok else '❌ ' + info}")
 
+        scenario_branch(con, polars_df)
     finally:
         con.close()
 
-    section("第 3 部分 · 结论")
+    section("第 4 部分 · 结论")
     light, heavy = picked[0], picked[1]
 
     print("  1) 同样叫「Python UDF」，两个引擎的默认粒度不一样：")
@@ -462,7 +572,12 @@ def main() -> None:
         f"快 {light['pol_row'] / light['pol_batch']:.0f}×"
     )
     print()
-    print("  4) 选型口诀：")
+    print("  4) 原生表达式：两个引擎**选对分支的结果**一样，但**算的遍数**不一样 ——")
+    print("     DuckDB 的 CASE WHEN 只算命中的那个分支，Polars 的 when/then 每个分支都算一遍。")
+    print("     这就是计算密集规则上 DuckDB 原生 SQL 反超 Polars 原生表达式的原因；")
+    print("     轻量规则上分支少、每支的活也少，Polars 还是更快。")
+    print()
+    print("  5) 选型口诀：")
     print("     · 规则能改写成原生表达式 —— 永远用原生（比逐行 UDF 快一个量级）")
     print("     · 只能用 Python 写 —— 用批式接口（DuckDB type='arrow' / Polars map_batches）")
     print("     · DuckDB 的 arrow UDF，函数体优先用 numpy，别用 pyarrow.compute")

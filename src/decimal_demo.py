@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
 import time
+from pathlib import Path
 
 import duckdb
 import polars as pl
@@ -268,7 +270,7 @@ def scenario_grouped(path: str, n_rows: int) -> None:
 # ---------------------------------------------------------------- 场景 4
 
 
-def scenario_decimal_paths(path: str, n_rows: int) -> None:
+def scenario_decimal_paths(path: str, n_rows: int, repeat: int = 5) -> None:
     section("场景 4 · Polars 想要精确金额：三条路，代价各多少")
 
     df = pl.read_parquet(path)
@@ -294,16 +296,16 @@ def scenario_decimal_paths(path: str, n_rows: int) -> None:
     print(f"  {'写法':<34}{'求和结果（元）':<30}{'耗时(ms)':<12}{'保证精确?'}")
     print("  " + "-" * 92)
     for label, fn, to_yuan, exact_mark in variants:
-        ms = timeit(fn)
+        ms = timeit(fn, repeat)
         shown = to_yuan(fn())
         print(
             f"  {common.pad(label, 34)}{common.pad(repr(shown), 30)}"
             f"{common.pad(f'{ms:.2f}', 12)}{exact_mark}"
         )
 
-    dec_ms = timeit(lambda: decimals.sum())
-    flt_ms = timeit(lambda: df["amount"].sum())
-    int_ms = timeit(lambda: units.sum())
+    dec_ms = timeit(lambda: decimals.sum(), repeat)
+    flt_ms = timeit(lambda: df["amount"].sum(), repeat)
+    int_ms = timeit(lambda: units.sum(), repeat)
     print()
     print(f"  · Float64 sum 1M  : {flt_ms:.2f} ms")
     print(f"  · Int64  sum 1M  : {int_ms:.2f} ms（和 Float64 同量级，聚合是整数加法）")
@@ -369,7 +371,7 @@ def scenario_roundtrip(con: duckdb.DuckDBPyConnection) -> None:
 
     import pyarrow.parquet as pq
 
-    path = "/tmp/probe_decimal_roundtrip.parquet"
+    path = str(Path(tempfile.mkdtemp(prefix="decimal_roundtrip_")) / "roundtrip.parquet")
     con.execute("CREATE OR REPLACE TABLE t AS SELECT 123.45::DECIMAL(18,2) AS amount, 1 AS id")
     con.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
 
@@ -468,7 +470,7 @@ def main() -> int:
     scenario_literal(con)
     scenario_sum(path, args.rows)
     scenario_grouped(path, args.rows)
-    scenario_decimal_paths(path, args.rows)
+    scenario_decimal_paths(path, args.rows, args.repeat)
     scenario_overflow(con)
     scenario_roundtrip(con)
     con.close()
