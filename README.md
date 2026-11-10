@@ -125,7 +125,7 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 | # | 差异 | DuckDB | Polars | 对齐方式 |
 | --- | --- | --- | --- | --- |
 | 1 | 并列名次 | `RANK()` 取最小名次（1,2,2,4） | `rank()` 默认 `average`（1,2,2.5,4） | `rank(method="min")` |
-| 2 | 整数求和类型 | `SUM(int32)` → HUGEINT（Arrow 里是 `decimal[38,0]`） | `sum()` → Int64 | 两边都转 `Int64` / `::BIGINT` |
+| 2 | 整数求和类型 | `SUM(int32)` → HUGEINT（Arrow 里是 `decimal[38,0]`） | `sum()` 保持输入类型（Int32 → Int32） | 两边都转 `Int64` / `::BIGINT` |
 | 3 | 计数类型 | `COUNT(*)` → BIGINT | `pl.len()` → UInt32 | 两边都转 Int64 |
 | 4 | 窗口过滤 | 有 `QUALIFY` 子句 | 没有等价语法 | 先 `with_columns` 算窗口，再 `filter` |
 | 5 | 浮点求和顺序 | 并行 + 向量化，顺序不保证 | 同左 | `SUM` 末位可能有 1e-9 级差异，校验用容差（`rtol=1e-9`）而非精确相等 |
@@ -157,8 +157,8 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 
 ```python
 # 两个方向都成立
-pl.from_arrow(con.sql("SELECT ...").to_arrow_table())   # DuckDB -> Polars
-con.register("t", polars_df)                            # Polars -> DuckDB
+pl.from_arrow(con.sql("SELECT ...").to_arrow_table())  # DuckDB -> Polars
+con.register("t", polars_df)  # Polars -> DuckDB
 ```
 
 但**格式通用 ≠ 语义通用**：默认类型和名次规则仍要显式对齐（见上面第 2、3、7 条）。选型时的实用结论是：想让两个引擎都能碰的数据存 Parquet 最安全；引擎私有的 `.duckdb` 一旦落盘就把引擎锁死了。
