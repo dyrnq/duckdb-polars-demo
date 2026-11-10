@@ -47,11 +47,16 @@ uv run python src/benchmark.py --source duckdb # DuckDB 读物化后的 .duckdb 
 uv run python src/benchmark.py --json out.json # 结果写成 JSON
 ```
 
-用 DuckDB CLI 交互探索：
+用 DuckDB 交互式探索数据：
 
 ```bash
-duckdb data/demo.duckdb
+uv run python src/sql.py "SELECT region, count(*) AS n FROM orders GROUP BY 1 ORDER BY n DESC"
+uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 ```
+
+> **别直接用 `duckdb data/demo.duckdb`**：DuckDB 2.x 写出的存储格式是 v999，而系统里装的
+> duckdb CLI（1.5.3）只认 v64~v68，会报 `Trying to read a database file with version number 999`。
+> 用 `src/sql.py` 走 Python 侧的 DuckDB，版本和项目里其他地方一致，不会有这个问题。
 
 ## 数据模型
 
@@ -124,6 +129,7 @@ duckdb data/demo.duckdb
 | 4 | 窗口过滤 | 有 `QUALIFY` 子句 | 没有等价语法 | 先 `with_columns` 算窗口，再 `filter` |
 | 5 | 浮点求和顺序 | 并行 + 向量化，顺序不保证 | 同左 | `SUM` 末位可能有 1e-9 级差异，校验用容差（`rtol=1e-9`）而非精确相等 |
 | 6 | DuckDB 2.0 Python API | `con.execute(sql).arrow()` 已移除 | —— | 用 `con.sql(query, params).to_arrow_table()`；参数绑定受支持，且是 relation（每次读取都重新执行），不走 DB-API 就不会多一次行拷贝 |
+| 7 | 存储格式版本 | 2.x 写 v999，1.5.3 的 CLI 只认 v64~v68 | —— | 探索数据走 `src/sql.py`（同一个 Python DuckDB），别指望老 CLI |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -148,6 +154,7 @@ duckdb-polars-demo/
 │   ├── gen_data.py         # 造数
 │   ├── duckdb_demo.py      # DuckDB / SQL 实现
 │   ├── polars_demo.py      # Polars / DataFrame 实现
+│   ├── sql.py              # 临时跑一条 SQL（不依赖 duckdb CLI 的版本）
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     └── bench.sh            # 一键跑完整流程
