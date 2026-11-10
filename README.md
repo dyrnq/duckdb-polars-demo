@@ -11,6 +11,8 @@
 | 用法差异 | SQL（声明式）与 DataFrame API（命令式）如何表达同一个分析任务 |
 | 执行模型 | DuckDB 向量化执行 + SQL 优化器 vs. Polars 惰性查询 + 流式执行 |
 | 语义差异 | 排名、聚合类型、窗口过滤等地方两个引擎的默认行为是否一致 |
+| 并行 | 多线程扩展性与并行效率；线程数变了结果是否还一致 |
+| 存储与索引 | 数据布局、索引的适用边界与代价 —— 点查快不快到底取决于什么 |
 | 性能 | 相同数据规模下的耗时对比；结果等价性校验 |
 
 ## 环境要求
@@ -34,6 +36,10 @@ uv run python src/interop.py         # 互操作演示：同一份 Parquet + Arr
 uv run python src/dialect_demo.py    # 方言差异专场：NULL 排序 / NaN / 透视表 / 递归 CTE …
 uv run python src/streaming_demo.py  # 流式 vs 物化：内存随数据量怎么变
 uv run python src/udf_demo.py        # 自定义函数：两边「Python UDF」代价差很多
+uv run python src/scaling_demo.py    # 线程扩展性：1/2/4/8 线程各跑一遍，看加速比与并行效率
+uv run python src/asof_demo.py       # ASOF JOIN：时间序列 join 的语义差异（并列 / 排序 / tolerance）
+uv run python src/json_demo.py       # JSON 与嵌套类型：类型推断、精度损失、STRUCT/LIST 互转
+uv run python src/index_demo.py      # 索引与点查：ART 索引的作用范围与代价，以及 Polars 的点查方案
 ```
 
 一键跑完整流程：
@@ -53,6 +59,10 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `dialect_demo.py` | 8 个「静默算错」的语义差异场景 |
 | `streaming_demo.py` | 流式消费的内存是 O(1)，一次性物化是 O(n) |
 | `udf_demo.py` | 同样叫 UDF，DuckDB 逐行、Polars 按批，代价差很多 |
+| `scaling_demo.py` | 线程扩展性：加速比、并行效率、轮间波动，以及线程数变了结果是否还一致 |
+| `asof_demo.py` | ASOF JOIN：INNER/LEFT 语义、并列时间戳、排序要求、容忍窗口 |
+| `json_demo.py` | JSON 与嵌套类型：类型推断差异、大整数精度、STRUCT/LIST 互转、解析代价 |
+| `index_demo.py` | 索引与点查：ART 索引的作用范围与代价，以及 Polars 没有索引时的点查办法 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -65,6 +75,10 @@ uv run python src/benchmark.py --json out.json # 结果写成 JSON
 uv run python src/streaming_demo.py --rows 8000000  # 换更大的数据量
 uv run python src/udf_demo.py --rows 200000        # 换更小的数据量
 uv run python src/interop.py --extension           # 试装 duckdb 的 polars 扩展（要联网）
+uv run python src/scaling_demo.py --rows 8000000 --threads 1,2,4,8
+uv run python src/asof_demo.py --trades 800000 --quotes 400000
+uv run python src/json_demo.py --rows 500000
+uv run python src/index_demo.py --rows 8000000 --rounds 5
 ```
 
 用 DuckDB 交互式探索数据：
@@ -103,6 +117,22 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 
 **分析窗口**：`[2024-01-01, 2024-07-01)`，左闭右开。
 
+### 各 demo 自己的数据集
+
+后面的四个 demo 各带一份自己的数据（都是脚本自己造的，重复跑同一个规模就直接复用）：
+
+| 文件 | 规模 | 列 | 用来演示 |
+| --- | --- | --- | --- |
+| `scale_orders.parquet` / `scale_users.parquet` | 400 万订单 / 5 万用户 | 与 `orders`/`users` 同构 | 线程扩展性（量足够大才看得出线程差异） |
+| `asof_trades.parquet` | 40 万笔成交 | `symbol`、`ts`、`qty` | ASOF JOIN |
+| `asof_quotes.parquet` | 20 万条报价 | `symbol`、`ts`、`px` | ASOF JOIN（单独一份是刻意的：时间序列 join 的右表要能乱序，才能测出排序要求的坑） |
+| `json_events.ndjson` | 20 万行 | `event_id`、`user_id`、`event_type`、`ts`、`amount`、`props`（含嵌套 STRUCT/LIST） | JSON 与嵌套类型 |
+| `json_bigint.ndjson` | 3 行 | 超大整数 | JSON 大整数精度 |
+| `index_customers_sorted_*.parquet` | 500 万行 | `customer_id`、`name`、`region`、`balance` | 索引与点查（**按主键排序**） |
+| `index_customers_shuf_*.parquet` | 500 万行 | 同上（**整行随机置换**） | 索引与点查（对照组） |
+
+`index_customers_*` 的文件名里带行数：换个 `--rows` 就是另一份文件，**永远不覆盖已有数据**。
+
 ## 三条对照查询
 
 | 查询 | DuckDB | Polars |
@@ -139,7 +169,8 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 
 ## 语义差异（踩坑记录）
 
-两个引擎默认行为并不一致，这是本项目最有价值的部分。以下每一条都在代码里做了显式对齐：
+两个引擎默认行为并不一致，这是本项目最有价值的部分。以下每一条都在代码里跑过、对过账，
+要么给出了显式对齐的写法，要么明确标出「没有对齐办法、只能靠约定避开」：
 
 | # | 差异 | DuckDB | Polars | 对齐方式 |
 | --- | --- | --- | --- | --- |
@@ -153,10 +184,21 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 | 8 | NULL 排序位置 | 升序默认 NULLS **LAST** | 默认 NULLS **FIRST** | Polars `sort(nulls_last=True)` |
 | 9 | 数值字面量类型 | `CASE WHEN … THEN 100.0` → **decimal[4,1]** | `pl.lit(100.0)` → Float64 | DuckDB 侧 `::DOUBLE` |
 | 10 | 「Python UDF」的粒度 | `type='native'` **逐行**调用 | `map_batches` **按批**给数据 | DuckDB 用 `type='arrow'`，且函数体优先用 numpy |
+| 11 | ASOF JOIN 的默认连接 | `ASOF JOIN` 是 **INNER**，匹配不上的行直接消失 | `join_asof` 是**左连接**语义，匹配不上给 null | DuckDB 侧写 `ASOF LEFT JOIN` |
+| 12 | ASOF 并列时间戳 | 取右表物理顺序的**第一条** | backward 取命中点往前扫到的**最后一条** | 右表加确定性 tie-break 键，或保证 (symbol, ts) 唯一 |
+| 13 | ASOF 输入有序性 | 不要求，引擎自己排 | 要求有序，但**带 `by` 分组时只警告不报错** | Polars 侧永远先 `sort(["symbol","ts"])` |
+| 14 | ASOF 容忍窗口 | 没有 `tolerance` 参数 | 原生 `tolerance=` 参数 | DuckDB 侧用 `ASOF LEFT JOIN` + ON 里加不等式 |
+| 15 | JSON 时间戳推断 | 认出 ISO-8601 → **TIMESTAMP** | 保持 **String** | Polars 侧 `str.to_datetime()` |
+| 16 | JSON 超大整数 | 没有 UHUGEINT，退化成 **DOUBLE**（精度丢失） | 推断成 **Int128**，不丢 | 对账要拿原始 JSON 文本比，别比读进来的列 |
+| 17 | 取嵌套字段 | `json_extract` 返回 **JSON** 类型、`json_value` 返回 **VARCHAR** | 只能整份 `str.json_decode(dtype=...)` | DuckDB 侧要数字得自己 `::DOUBLE` |
+| 18 | 索引 | 有 ART 索引 | 没有索引 | Polars 靠 Parquet row group 统计剪枝 + 向量化过滤 |
+| 19 | 执行计划里看不看得出用了索引 | `EXPLAIN` 只渲染 "Seq Scan"，要看真相得用 `EXPLAIN ANALYZE` | —— | 判断索引有没有生效只能看 `EXPLAIN ANALYZE` 的 Row Groups Scanned |
+| 20 | `is_in` 的入参类型 | —— | 传**同 dtype** 的 `pl.Series` 会告警（2.1 废弃警告） | 用 `pl.Series(...).implode()` 或 Python list |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
-第 8~10 条在下面三节里展开：`方言差异专场`、`流式处理与内存`、`自定义函数（UDF）`。
+第 8~10 条在下面三节里展开：`方言差异专场`、`流式处理与内存`、`自定义函数（UDF）`；
+第 11~14 条在 `ASOF JOIN（时间序列 join）`、第 15~17 条在 `JSON 与嵌套类型`、第 18~20 条在 `索引与点查` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -268,6 +310,284 @@ con.register("t", polars_df)  # Polars -> DuckDB
 顺带一个类型坑：DuckDB 的 `CASE WHEN` 里 `100.0` 是 **DECIMAL 字面量**，整列会变成
 `decimal[4,1]`，和 UDF 返回的 DOUBLE 对不上 —— 需要 `::DOUBLE` 对齐。
 
+## 线程扩展性
+
+`uv run python src/scaling_demo.py` 在同一份 400 万行数据上，用 1/2/4/8 线程各跑三条查询。
+每个「引擎 × 线程数」组合放进独立子进程，再把所有组合**交错跑若干轮**（每轮把所有组合测一遍），
+最后分别给两个口径：「各轮中位数的中位数」和「所有轮次里的最快一次」。
+
+机器状态：8 核，load1 在 6.9~13.0 之间飘 —— 这是台共享开发机，数字只能看相对关系。
+
+**口径一：各轮中位数的中位数（ms）**
+
+| 查询 | 引擎 | 1 线程 | 2 线程 | 4 线程 | 8 线程 | 8 线程加速比 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 区域 × 类目 Top-N | DuckDB | 254.9 | 265.9 | 158.7 | 154.7 | 1.65× |
+| 区域 × 类目 Top-N | Polars | 203.8 | 178.7 | 167.0 | 85.7 | **2.38×** |
+| 每日收入趋势 | DuckDB | 205.1 | 213.4 | 134.7 | 143.8 | 1.43× |
+| 每日收入趋势 | Polars | 265.2 | 150.5 | 136.4 | 43.3 | **6.12×** |
+| 高价值客户 Top 20 | DuckDB | 247.3 | 250.6 | 145.9 | 129.5 | 1.91× |
+| 高价值客户 Top 20 | Polars | 259.5 | 227.6 | 164.1 | 57.6 | **4.51×** |
+
+**口径二：所有轮次里的最快一次（ms）** —— 更接近「机器空闲时」的上限
+
+| 查询 | 引擎 | 1 线程 | 2 线程 | 4 线程 | 8 线程 | 8 线程加速比 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 区域 × 类目 Top-N | DuckDB | 179.3 | 100.7 | 60.3 | 61.2 | 2.93× |
+| 区域 × 类目 Top-N | Polars | 155.4 | 79.7 | 49.0 | 41.4 | 3.75× |
+| 每日收入趋势 | DuckDB | 150.6 | 84.9 | 72.5 | 50.2 | 3.00× |
+| 每日收入趋势 | Polars | 137.8 | 71.4 | 43.9 | 38.7 | 3.56× |
+| 高价值客户 Top 20 | DuckDB | 165.3 | 96.9 | 98.5 | 65.8 | 2.51× |
+| 高价值客户 Top 20 | Polars | 188.7 | 103.8 | 59.0 | 51.3 | 3.68× |
+
+结论：
+
+- **Polars 的扩展性更好。** 三个查询的 8 线程加速比（中位数口径）Polars 2.38× / 6.12× / 4.51×，
+  DuckDB 1.65× / 1.43× / 1.91×；最快一次口径也全部是 Polars 赢（3.75× / 3.56× / 3.68× vs 2.93× / 3.00× / 2.51×）。
+- **两个引擎在 2 线程时几乎都没收益**（DuckDB 0.96~0.99×，Polars 1.14~1.76×）—— 这个量级的查询不是被线程数卡住的，
+  瓶颈在扫描和聚合本身，加线程只能互相抢 CPU。
+- **并行效率掉得厉害**（效率 = 加速比 / 线程数）：8 线程时 DuckDB 只有 18%~24%，Polars 30%~76%。
+  线程不是加得越多越好。
+- **轮间波动比加速比本身还大**：同一组合各轮中位数的 max/min 最高到 4.54×（Polars 每日收入趋势 8 线程）。
+  在这台机器上，「8 线程比 1 线程快 6 倍」这种结论说到底是噪声 —— 想看真实上限得在机器空闲时重测。
+- **负载 > 核数时测到的加速比是保守值**：多线程引擎在抢不到 CPU 时最吃亏，线程越多亏得越多。
+
+结果一致性：六个「查询 × 引擎」组合在 1/2/4/8 线程下结果**完全一致**（SUM 相对差 ≤ 8.53e-15）。
+并行执行不改变结果，但会改变浮点求和的**顺序**，所以跨线程数比较 SUM 时末位有 1e-9 级差异 —— 别当成 bug。
+
+## ASOF JOIN（时间序列 join）
+
+`uv run python src/asof_demo.py` 用同一份数据（40 万笔成交 × 20 万条报价），
+把「拿成交时刻之前最近的一条报价」这件事在两个引擎里各写一遍，再逐值对账。
+
+四个语义差异（都是静默的错数据，不报错）：
+
+| # | 差异 | DuckDB | Polars | 对齐方式 |
+| --- | --- | --- | --- | --- |
+| 1 | 默认连接类型 | `ASOF JOIN` 是 **INNER** —— 匹配不上的行直接消失 | `join_asof` 是**左连接** —— 匹配不上给 null，行还在 | DuckDB 侧写 `ASOF LEFT JOIN` |
+| 2 | 并列时间戳 | 取右表物理顺序的**第一条**（10.0） | backward 取命中点往前扫到的**最后一条**（11.0） | 右表加确定性 tie-break 键，或保证 (symbol, ts) 唯一 |
+| 3 | 输入要不要先排序 | 不要求，引擎自己排 | 要求有序，但**带 `by` 分组时只警告不报错** | Polars 侧永远先 `sort(["symbol","ts"])` |
+| 4 | 容忍窗口 | 没有 `tolerance` 参数 | 原生 `tolerance=` 参数 | DuckDB 侧用 `ASOF LEFT JOIN` + ON 里加不等式 |
+
+第 1 条最容易踩：5 行的成交里有一笔早于所有报价，DuckDB 侧**根本不返回这一行**（5 行 vs 6 行）。
+写成 `ASOF LEFT JOIN` 之后两边逐值完全一致 ✅。
+
+第 3 条是雷区 —— 报价表倒着排（最新的在最前面）时：
+
+| 引擎 | 结果 |
+| --- | --- |
+| DuckDB | 5 行，px = `[10.0, 10.0, 20.0, 20.0, 30.0]`（引擎自己排，结果不变） |
+| Polars 不排序 | 6 行，px = `[None, None, None, 20.0, 20.0, 30.0]` |
+| Polars 排序后 | 6 行，px = `[None, 10.0, 10.0, 20.0, 20.0, 30.0]` ✅ |
+
+**顺序错了，但 Polars 照样返回了结果** —— 没有报错，只有结果不对。`join_asof` 在**不带** `by` 时会检查顺序（不有序直接抛错），
+一旦用了 `by` 分组（真实场景基本都要用），检查就只剩一条警告。
+
+第 4 条：容忍窗口 = 60 秒时，两边都是 `[10.0, 12.0, None]`（最后一笔距离上一条报价 90 秒 > 60 秒 → null）。
+边界是闭区间 —— 差值正好等于 tolerance 时仍然匹配。DuckDB 不加条件会给 `[10.0, 12.0, 12.0]`。
+
+大数据对账：40 万行 × 4 列逐值一致 ✅（这份数据里成交时间戳刻意和报价错开了 500 微秒，不存在并列；
+场景 2 说明了有并列时两边会选到不同的行）。
+
+性能（40 万成交 × 20 万报价，本机，load1 = 10.5）：
+
+| 做法 | 耗时 (ms，中位数) |
+| --- | --- |
+| DuckDB ASOF JOIN（端到端，含扫 parquet） | 83.1 |
+| Polars `join_asof`（只算 join，输入已排序） | **15.1** |
+| Polars 读 parquet + 排序 | 51.0 |
+| Polars 端到端（读 + 排 + join） | 71.3 |
+
+- 只看 join 这一步：Polars 15 ms vs DuckDB 83 ms，快 5.5×。
+- 但 DuckDB 那 83 ms 里**已经包含了把右表排好**的成本；Polars 端到端 71 ms 比「只算 join」多了 56 ms，
+  这 56 ms 全部是「Polars 必须自己排序」的代价 —— DuckDB 一次 ASOF JOIN 就把它藏起来了。
+- 结论：**Polars 的 ASOF JOIN 引擎更快，DuckDB 的写法更省心**（不用管排序，也不用管 INNER/LEFT 的默认差异）。
+
+## JSON 与嵌套类型
+
+`uv run python src/json_demo.py` 用同一份 20 万行 NDJSON，比两个引擎读同一份 JSON 之后的行为。
+
+**类型推断：6 列里 5 列一致**，唯一不一致的是 `ts`：
+
+| 列 | DuckDB | Polars |
+| --- | --- | --- |
+| `event_id` / `user_id` | BIGINT | Int64 |
+| `event_type` | VARCHAR | String |
+| `amount` | DOUBLE | Float64 |
+| `props` | `STRUCT("source" VARCHAR, campaign STRUCT(id BIGINT, "name" VARCHAR), "value" DOUBLE, flags VARCHAR[])` | `Struct{source=String, campaign=Struct{id=Int64, name=String}, value=Float64, flags=List(String)}` |
+| `ts` | **TIMESTAMP** | **String** |
+
+`ts` 的差异不是 bug，是两边「顺手多做了」的事：DuckDB 的 JSON 读取器认出 ISO-8601 字符串直接推成 TIMESTAMP，
+Polars 的 `read_ndjson` 只做 JSON 类型映射，字符串就是字符串。对齐办法：Polars 侧 `str.to_datetime()`，
+DuckDB 侧 `read_json(..., timestampformat=…)` 或直接 `::TIMESTAMP`。
+不对齐的代价：按 `ts` 过滤/排序时 Polars 侧是在**比字符串**，格式一旦不统一（比如有人写成 `2024-1-5`）排序结果就是错的，而且不报错。
+
+**大整数：两边读出来的数不是同一个数。**
+
+| 原始值 | DuckDB | Polars |
+| --- | --- | --- |
+| 1 | 1.0 | 1 |
+| 99999999999999999999 | **1e+20** | 99999999999999999999 |
+| 12345678901234567890 | **1.2345678901234567e+19** | 12345678901234567890 |
+
+DuckDB 的 JSON 读取器没有 UHUGEINT，超大整数会退化成 DOUBLE，**精度直接没了**；Polars 推断成 Int128，一个不丢。
+对账时要拿「原始 JSON 文本」比，别拿读进来的列比。
+
+**取嵌套字段：两边的写法完全不同。** DuckDB 有 JSON 路径：
+
+- `json_extract(j, '$.props.value')` 返回的是 **JSON 类型**，不是数字 —— 值是**原文**（字符串会带引号，比如 `"双十一"`），要数字得自己 `::DOUBLE`。
+- `json_value(j, '$.props.value')` 看起来该给个类型，其实**返回 VARCHAR**，`'9.5'` 还是字符串。
+- `->` 返回 JSON，`->>` 返回 VARCHAR，分别等价于 `json_extract` / `json_extract_string`。
+- 路径不存在时三个函数都返回 NULL，不报错。
+
+Polars 没有「JSON 路径取值」，只有「整份解码」，而且 `str.json_decode` 的 `dtype` 在 2.1 里是**必填参数**：
+
+```python
+pl.col("j").str.json_decode(dtype=pl.Struct({...}))   # 忘了 dtype -> TypeError
+pl.col("props").struct.field("campaign").struct.field("name")   # 不支持 'a.b.c' 点号路径
+```
+
+**嵌套类型（STRUCT / LIST）两边是对齐的** —— 在 Arrow 上是标准格式，DuckDB → Arrow → Polars、
+Polars → `con.register()` → DuckDB 两个方向来回转都不丢信息、不丢类型。
+真正有差异的是「JSON 文本」这一层。
+
+**代价：JSON 文本列，每抽一个字段就重新解析一次。**
+
+| 做法 | 耗时 |
+| --- | --- |
+| DuckDB 抽 1 个字段 | 120 ms |
+| DuckDB 抽 3 个字段 | 398 ms（每多抽一个字段 ≈ **+139 ms**，基本线性） |
+| Polars 整份解码成 struct（20 万行） | 409 ms |
+| Polars 解码之后取 3 个字段 | **8.0 ms** |
+
+DuckDB 的 `json_extract` 是「一行一次解析」，抽 N 个字段就解析 N 次；Polars 是「整份解码成 struct」，
+解码一次之后取字段是纯内存操作。所以**数据在磁盘上就是 JSON 文本时，DuckDB 侧最好先把需要的字段抽出来落成列**，
+别在下游反复抽。
+
+读一份 NDJSON 谁快（load1 = 9.9）：DuckDB `read_json_auto` 298.3 ms vs Polars `read_ndjson` 253.4 ms —— **Polars 快 1.2×**。
+两边读出来的行数一致（200,000 / 200,000），`amount` 求和一致（34996936.3200002 vs 34996936.319999985）。
+
+## 索引与点查
+
+`uv run python src/index_demo.py` 用同一批 500 万行客户数据造**两份**：一份按主键排序，一份随机打乱行序
+（整行置换，两份文件里同一个 `customer_id` 的其余列完全一样，可以对账）。
+为什么要两份：Parquet 的 row group 自带 min/max 统计，排好序时谓词一推就能整组跳过；
+「有没有索引」的收益会被这个因素完全盖住，所以必须分开造。
+
+**场景 1：点查（`customer_id = 3,000,000`）**
+
+| 数据布局 | 实现 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- | --- |
+| 排序 | DuckDB 表 · 无索引 | 1.40 | 1.02 |
+| 排序 | DuckDB 表 · 有 ART 索引 | 1.44 | 1.19 |
+| 排序 | Polars · 扫 Parquet | 6.43 | 6.13 |
+| 排序 | Polars · 已在内存 | 2.67 | 1.76 |
+| 打乱 | DuckDB 表 · 无索引 | 3.72 | 2.89 |
+| 打乱 | DuckDB 表 · 有 ART 索引 | **1.29** | **1.00** |
+| 打乱 | Polars · 扫 Parquet | 42.24 | 35.43 |
+| 打乱 | Polars · 已在内存 | 2.53 | 2.26 |
+
+八个变体结果完全一致 ✅。三条结论：
+
+1. **索引的收益，取决于数据排没排序。** 排好序：DuckDB 1.40 ms（无索引）vs 1.44 ms（有索引）—— 没差别，
+   row group 统计已经把范围缩到一组了；打乱后：3.72 ms → 1.29 ms（**2.9×**）—— 这才是索引真正的用武之地。
+2. **排不排序，对 Polars 的影响比 DuckDB 还大**：扫 Parquet 6.43 ms → 42.24 ms（**6.6×**）。
+3. **但 Polars 的慢不是「没索引」的锅**：数据已经在内存里时 Polars 2.53 ms vs DuckDB 1.29 ms ——
+   差距在「读 Parquet」这一层，不在「点查」这一层。
+
+所以别拿「DuckDB 有索引、Polars 没有」当结论：排好序时 DuckDB **无索引** 1.40 ms 就已经比 Polars 扫文件 6.43 ms 快 4.6×。
+真正的工程动作是**按点查的键排序落盘**，而不是想办法造索引。
+
+**场景 2：索引的适用边界**（实测出来的，不是文档抄的）
+
+| 过滤条件 | 实际算子 | 扫了几个 row group | 走索引了吗 |
+| --- | --- | --- | --- |
+| 等值 `= K` | Index Scan | 0/50 | ✅ 是 |
+| `IN`（不连续的 3 个值） | Index Scan | 0/50 | ✅ 是 |
+| `IN`（连续的 3 个值） | Sequential Scan | 50/50 | — 否 |
+| 范围 `>= K`（中部，命中 200 万行） | Sequential Scan | 50/50 | — 否 |
+| 范围 `> n-1000`（尾部，命中 1000 行） | Index Scan | 0/50 | ✅ 是 |
+| `BETWEEN` 中部 1000 行 | Sequential Scan | 50/50 | — 否 |
+| `BETWEEN` 尾部 1000 行 | Index Scan | 0/50 | ✅ 是 |
+| `BETWEEN` 尾部 10000 行 | Sequential Scan | 50/50 | — 否 |
+| 列上的表达式 `+ 0` | Index Scan | 0/50 | ✅ 是 |
+| 列上的表达式 `abs()` | Index Scan | 0/50 | ✅ 是 |
+| 转成字符串比较 `::VARCHAR` | Sequential Scan | 50/50 | — 否 |
+| `OR` 两个等值 | Sequential Scan | 50/50 | — 否 |
+| 低基数列等值 | Sequential Scan | 50/50 | — 否 |
+
+- **等值一定走索引**：`= K`、不连续的 `IN` 都会走 ART 索引。
+- **范围不一定**：只有范围落在主键空间的**两端**、且命中行数很少（实测阈值在 5000 行左右，500 万行表 ≈ 0.1%）时才走索引。
+  同样 1000 行，落在尾部走索引，落在中部却全表扫 —— 优化器只能靠 min/max 统计估选择性，中部的区间它估不准。
+- **连续的 `IN` 会被改写成范围**：`IN (K, K+1, K+2)` → `>= K AND <= K+2`，于是按范围的规则判断，索引就丢了。
+  不连续的值（`IN (K, K+7, K+100)`）保持等值形式，索引还在。
+- 常量表达式会被折叠（`customer_id + 0 = K` → `customer_id = K`），照样能用索引；但 `::VARCHAR` 就彻底用不了了。
+- `OR` 两个等值、在低基数列上建索引，都不走索引（后者是另一个大坑：低基数列的索引既救不了点查，还白白拖慢写入）。
+
+**`EXPLAIN` 和 `EXPLAIN ANALYZE` 对索引的结论是相反的**：
+
+```
+EXPLAIN（逻辑计划）        EXPLAIN ANALYZE（实际执行）
+│ Type: Sequential Scan   │ Type: Index Scan
+│ Filters: customer_id…   │ Row Groups Scanned: 0 / 50
+```
+
+想确认索引到底用没用上，**只能看 `EXPLAIN ANALYZE` 的「Row Groups Scanned」**。
+
+**场景 3：索引的代价**（500 万行单列 ART 索引）
+
+| 项 | 数值 |
+| --- | --- |
+| 建索引耗时 | 565 ms |
+| 库文件体积 | 78.5 MB → 117.5 MB（+39.0 MB，+50%） |
+| 插入 50 万行 | 无索引 137 ms vs 有索引 312 ms（**2.3× 慢**） |
+
+索引是**写放大**：每插一行都要维护索引。批量灌数据的场景，正确做法是「先灌完再建索引」，而不是边写边维护。
+
+**场景 4：Polars 没有索引，点查的几种写法**（同一份内存里的 DataFrame）
+
+| 写法 | 中位数 (ms) | 最快 (ms) | 命中行数 |
+| --- | --- | --- | --- |
+| 全表过滤 `filter`（1 个键） | 2.32 | 1.91 | 1 |
+| 全表过滤 `is_in`（100 个键） | 13.71 | 8.99 | 100 |
+| 哈希 join semi（100 个键） | 7.62 | 6.99 | 100 |
+| 手工二分（100 个键，含建索引） | 341.19 | 272.86 | 100 |
+| 手工二分（100 个键，复用索引） | 12.66 | 12.28 | 100 |
+| 哈希 join semi（1000 个键） | 8.12 | 5.24 | 1,000 |
+| 全表过滤 `is_in`（1000 个键） | 6.47 | 4.65 | 1,000 |
+| 手工二分（1000 个键，复用索引） | 137.68 | 132.57 | 1,000 |
+
+八种写法结果一致 ✅。取舍：
+
+- 查 1 个键 → `filter` 最省事。Polars 没有索引可建，别硬造。
+- 查 N 个键 → `is_in` 和哈希 join 一个量级（8~14 ms）—— 都是「把键集做成哈希表 + 扫一遍主键列」，成本大头是那一次扫描。
+- 手工二分 → 查 100 键 13 ms、查 1000 键 138 ms，**随键数线性增长**。原因很直接：
+  `is_in` / join 是 Rust 里向量化的，`search_sorted` 是 Python 循环；而且前面还有一次性建索引的成本（排序 500 万行约 329 ms）。
+  👉 所以在 Polars 里手工造索引是**亏的**：要查很多键就直接 join。
+
+顺带一个 Polars 2.1 的坑 —— `is_in` 传什么参数，三种写法结果一样但告警不同：
+
+| 写法 | 命中 | 废弃警告 |
+| --- | --- | --- |
+| `is_in(python list)` | ✅ | 无 |
+| `is_in(pl.Series)` | ✅ | ⚠ **有** |
+| `is_in(pl.Series.implode())` | ✅ | 无 |
+
+脚本里用 `pl.Series(...).implode()`：语义明确，且不告警。
+
+**场景 5：真正决定点查快慢的，是数据布局**
+
+| 文件 | row group 总数 | 统计能命中的组数 | 必须真读的比例 |
+| --- | --- | --- | --- |
+| 排好序 | 25 | 1 | **4%** |
+| 打乱 | 25 | 25 | **100%** |
+
+Parquet 每个 row group 自带主键列的 min/max 统计，谓词一推就能整组跳过。**Polars 没有索引，
+但靠 Parquet 自带的统计拿到了和索引一样的效果。** 数据排好序 → 一个 row group 只覆盖一段主键区间 → 25 组里只读 1 组；
+数据打乱 → 每组的区间都是 `[1, N]` → 25 组全得读。
+
+DuckDB 的 `CREATE INDEX` 干的其实是同一件事 —— 排序落盘 = 免费索引。
+
 ## 目录结构
 
 ```
@@ -280,7 +600,15 @@ duckdb-polars-demo/
 │   ├── users.parquet
 │   ├── demo.duckdb
 │   ├── big_orders.parquet      # streaming_demo.py 的大数据（按需生成）
-│   └── stream_*.parquet        # streaming_demo.py 的流式写出产物
+│   ├── stream_*.parquet        # streaming_demo.py 的流式写出产物
+│   ├── scale_orders.parquet    # scaling_demo.py 的大数据（按需生成）
+│   ├── scale_users.parquet
+│   ├── asof_trades.parquet     # asof_demo.py：成交
+│   ├── asof_quotes.parquet     # asof_demo.py：报价
+│   ├── json_events.ndjson      # json_demo.py：事件流
+│   ├── json_bigint.ndjson      # json_demo.py：大整数样本
+│   ├── index_customers_sorted_*.parquet  # index_demo.py：按主键排序
+│   └── index_customers_shuf_*.parquet    # index_demo.py：打乱行序
 ├── src/
 │   ├── common.py           # 唯一事实来源：口径常量 + 结果等价性校验 + 终端排版
 │   ├── gen_data.py         # 造数
@@ -291,6 +619,10 @@ duckdb-polars-demo/
 │   ├── dialect_demo.py     # 方言差异专场：8 个静默算错的场景
 │   ├── streaming_demo.py   # 流式 vs 物化：内存随数据量怎么变
 │   ├── udf_demo.py         # 自定义函数：两边的 UDF 代价差很多
+│   ├── scaling_demo.py     # 线程扩展性：加速比 / 并行效率 / 轮间波动
+│   ├── asof_demo.py        # ASOF JOIN：时间序列 join 的语义差异
+│   ├── json_demo.py        # JSON 与嵌套类型：类型推断 / 精度 / 互转
+│   ├── index_demo.py       # 索引与点查：ART 索引与无索引的点查
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     └── bench.sh            # 一键跑完整流程
@@ -302,6 +634,9 @@ duckdb-polars-demo/
 - **结果先对账再比快慢**：`common.compare_frames()` 先按主键排序消除行序差异，再逐列比对（浮点用相对/绝对容差，其余列要求完全相等，含 NULL 位置；NaN 与 NaN 视为相等，因为 `math.isclose(nan, nan)` 是 False）。任一查询不一致，基准测试以退出码 1 结束。
 - **计时口径**：只覆盖查询执行与结果物化，不含进程启动和连接建立；默认预热 1 次（Polars 的惰性计划在首次 `collect()` 时才编译）。UDF 对比先把输入物化，量的是「算这条规则」的代价，不含扫描 Parquet 的时间。
 - **内存口径**：不用 RSS 差值下结论（子进程会继承父进程峰值、分配器 arena 会污染差值），改用对象自己报的字节数（`nbytes` / `estimated_size()`），确定性可复现。
+- **输入先物化再计时**：性能对比前先把输入准备好（Parquet 落盘、DataFrame 物化成表），别把「读文件」和「算」混在同一个数字里；两者确实有先后依赖时（ASOF JOIN 的排序）就分别列出来。
+- **交错轮次**：共享机器上负载会漂，所以把所有「引擎 × 线程数 × 查询」的组合**交错跑若干轮**（每轮把全部组合测一遍），而不是「一个组合测完再测下一个」。同时给出「各轮中位数的中位数」和「所有轮次里的最快一次」两个口径。
+- **结论跟着测量走**：数字和叙事冲突时改叙事，不改数字；脚本每次都打印当时的机器状态（核数 + load1），方便判断数字是不是在有竞争时测到的。
 - **可复现**：造数固定随机种子，基准测试打印 Python / 引擎版本、CPU 核数、平台与进程峰值 RSS。
 - **演示脚本都要能独立跑通**：每个脚本自己造数、自己对账，退出码非 0 就是有问题。
 
@@ -310,3 +645,7 @@ duckdb-polars-demo/
 - DuckDB 文档：<https://duckdb.org/docs/>
 - Polars 文档：<https://docs.pola.rs/>
 - DuckDB 与 Arrow 互操作：<https://duckdb.org/docs/guides/python/sql_on_arrow>
+- DuckDB ASOF JOIN：<https://duckdb.org/docs/guides/sql_features/asof_join>
+- DuckDB JSON：<https://duckdb.org/docs/stable/data/json/overview>
+- Polars `join_asof`：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.join_asof.html>
+- Polars `str.json_decode`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.str.json_decode.html>

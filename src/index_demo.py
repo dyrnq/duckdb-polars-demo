@@ -297,6 +297,7 @@ def scenario_point_query(
         rows_out = _as_rows(variants[label]())
         if ref is None:
             ref = rows_out
+            print(f"    {common.pad(label, 26)} ✅（作为对账基准）")
             continue
         same = rows_out == ref
         all_same = all_same and same
