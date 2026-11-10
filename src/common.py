@@ -128,6 +128,10 @@ def compare_frames(
                     return False, f"列 `{col}` 第 {i} 行 NULL 不一致: {a} vs {b}"
                 continue
             if is_float:
+                # NaN == NaN 视为相等（math.isclose(NaN, NaN) 是 False）
+                if isinstance(a, float) and isinstance(b, float):
+                    if math.isnan(a) and math.isnan(b):
+                        continue
                 if not math.isclose(a, b, rel_tol=rtol, abs_tol=atol):
                     return False, f"列 `{col}` 第 {i} 行数值不一致: {a!r} vs {b!r}"
             elif a != b:
