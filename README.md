@@ -30,6 +30,7 @@ uv run python src/gen_data.py        # 造数（100 万订单 + 2 万用户）
 uv run python src/duckdb_demo.py     # 跑 DuckDB 实现
 uv run python src/polars_demo.py     # 跑 Polars 实现
 uv run python src/benchmark.py       # 计时 + 等价性校验
+uv run python src/interop.py         # 互操作演示：同一份 Parquet + Arrow 零拷贝接力
 ```
 
 一键跑完整流程：
@@ -138,6 +139,30 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 - DuckDB：`Table Scan → Filters: (order_ts >= …) AND NOT is_returned`，且 Hash Join 会生成 `Dynamic Filters` 反向优化扫描
 - Polars：`Parquet SCAN → SELECTION: (col("is_returned").not() & (…))`，投影从 10 列裁到 7 列
 
+## 互操作：两个引擎能通用到什么程度
+
+`uv run python src/interop.py` 把这件事拆成 6 步跑一遍。结论：
+
+| 层面 | 通用的部分 | 不通用的部分 |
+| --- | --- | --- |
+| 磁盘格式 | Parquet / CSV / JSON / Arrow IPC —— 两边都能读 | `demo.duckdb` 只有 DuckDB 能开；DuckDB 还能读 SQLite/Postgres/S3 等，Polars 有 connectorx 等，两边的独占能力不重叠 |
+| 内存格式 | **Arrow** —— Polars 的内部模型就是 Arrow，DuckDB 的结果集能直接物化成 Arrow Table | 无 |
+| 引擎私有对象 | 能互相转换：DuckDB→Arrow→Polars，Polars→`con.register()`→DuckDB 表 | 直接用 SQL 查对方的 DataFrame 需要 DuckDB 的 `polars` 扩展（联网下载，本项目默认不装） |
+
+实测要点：
+
+- 两个引擎读同一个 `data/orders.parquet`，schema 一致、`equals()` 为 True —— 这是「比谁快」能站得住脚的前提
+- DuckDB → Arrow → Polars 转换后，**Arrow 底层 buffer 地址不变**（脚本里直接比对了地址），没有 Python 层的行拷贝
+- 接力流水线成立：DuckDB 做谓词下推 + 并行聚合 → Arrow → Polars 算窗口函数收尾，结果与纯 DuckDB、纯 Polars 三者逐值一致 ✅
+
+```python
+# 两个方向都成立
+pl.from_arrow(con.sql("SELECT ...").to_arrow_table())   # DuckDB -> Polars
+con.register("t", polars_df)                            # Polars -> DuckDB
+```
+
+但**格式通用 ≠ 语义通用**：默认类型和名次规则仍要显式对齐（见上面第 2、3、7 条）。选型时的实用结论是：想让两个引擎都能碰的数据存 Parquet 最安全；引擎私有的 `.duckdb` 一旦落盘就把引擎锁死了。
+
 ## 目录结构
 
 ```
@@ -155,6 +180,7 @@ duckdb-polars-demo/
 │   ├── duckdb_demo.py      # DuckDB / SQL 实现
 │   ├── polars_demo.py      # Polars / DataFrame 实现
 │   ├── sql.py              # 临时跑一条 SQL（不依赖 duckdb CLI 的版本）
+│   ├── interop.py          # 互操作演示：Parquet / Arrow 接力 / 类型对齐
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     └── bench.sh            # 一键跑完整流程
