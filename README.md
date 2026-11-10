@@ -18,6 +18,7 @@
 | 写入与事务 | 覆盖还是追加、原子性、事务与并发读写 |
 | 文件布局 | 多文件与分区表：schema 冲突、分区裁剪、往返保真 |
 | 性能 | 相同数据规模下的耗时对比；结果等价性校验 |
+| 语义覆盖面 | 窗口 / 聚合 / 集合运算 / 正则 / 增删改 / Schema / 时间轴 / 近似计算 —— 每个都有一份实测对账 |
 
 ## 环境要求
 
@@ -83,6 +84,14 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `tz_demo.py` | 日期时间与时区：精度、会话时区、夏令时、Parquet 往返 |
 | `order_demo.py` | 排序稳定性：NULL/NaN 位置、并列顺序不确定、LIMIT 会取到不同的行 |
 | `partition_demo.py` | 多文件与分区表：glob 读法、schema 冲突、分区裁剪、分区写 |
+| `window_demo.py` | 窗口函数：默认 frame 是 RANGE 还是 ROWS、frame 家族、命名窗口、QUALIFY、LAG/LEAD |
+| `agg_demo.py` | 聚合函数语义：分位数插值、众数、arg_max 并列、字符串聚合顺序、整数求和溢出 |
+| `setop_demo.py` | 集合运算与去重：EXCEPT/INTERSECT 里的 NULL、UNION、去重保留哪一行 |
+| `regex_demo.py` | 正则与字符串：分组编号、整串 vs 子串、替换、切分、位置、中文与 Emoji 的字节/字符 |
+| `dml_demo.py` | 增删改：UPDATE/DELETE/INSERT、upsert、子查询快照、RETURNING、事务 |
+| `schema_demo.py` | Schema 演进：ALTER TABLE、标识符大小写、类型转换、读不一致的 schema、拼表 |
+| `timeseries_demo.py` | 时间轴与序列生成：端点语义、时间类型、补齐空档、截断、间隔加减 |
+| `approx_demo.py` | 近似计算 vs 精确：HLL 误差方向与量级、近似分位数、histogram、值不值 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -105,6 +114,14 @@ uv run python src/partition_demo.py --files 500     # 换更多的小文件
 uv run python src/join_demo.py --repeat 3          # 换更少的重复次数
 uv run python src/write_demo.py --repeat 3
 uv run python src/tz_demo.py --repeat 3
+uv run python src/window_demo.py --rows 2000000 --repeat 5
+uv run python src/agg_demo.py --rows 2000000 --repeat 5
+uv run python src/setop_demo.py --rows 2000000 --repeat 5
+uv run python src/regex_demo.py --rows 1000000 --repeat 5
+uv run python src/dml_demo.py --rows 2000000 --repeat 5
+uv run python src/schema_demo.py --rows 2000000 --repeat 5
+uv run python src/timeseries_demo.py --rows 2000000 --repeat 5
+uv run python src/approx_demo.py --rows 10000000 --repeat 5
 ```
 
 用 DuckDB 交互式探索数据：
@@ -254,6 +271,41 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 | 46 | 分区值当字符串过滤 | 隐式转换掉，不报错 | **报类型错** | Polars 用 `pl.lit(date(...))` |
 | 47 | 写分区 | **不把分区列写进文件**（读时从路径补） | **把分区列留在文件里** | 两边目录名都是 hive 写法，能互相读 |
 | 48 | 分支求值（`CASE WHEN` / `when/then`） | **只算命中的那个分支** | **每个分支都算一遍**，最后才挑对的那条 | 结果两边一致，差的是代价；分支越贵越吃亏（Polars 没有开关能关） |
+| 49 | 窗口默认 frame | 不带 frame 默认 **RANGE**（并列行一起进窗口） | `cum_sum()` 是 **ROWS** 口径 | SQL 里显式写 `ROWS BETWEEN …` |
+| 50 | 窗口默认 frame 随排序键个数变 | `ORDER BY x` 是 RANGE；`ORDER BY x, ord` 退化成 **ROWS**（RANGE 配多键直接报错） | 只有 ROWS 口径 | 别依赖默认值，显式写 frame |
+| 51 | frame 家族 | ROWS / RANGE / **GROUPS** | 只有 ROWS 口径的表达式 | RANGE / GROUPS 得自己 group_by + join 拼 |
+| 52 | 命名窗口 | `WINDOW w AS (…)` 可复用 | 没有 | Polars 把 `over(...)` 抄两遍 |
+| 53 | 分位数插值 | `quantile_cont` = linear；`quantile_disc` = 取实际值 | `quantile()` 默认 **nearest / higher** | Polars 显式 `interpolation="linear"` |
+| 54 | 分位数跟着列类型走 | DECIMAL 列上插值结果被**截断**回精度（1.75 → 1.7） | 不受此影响 | 两边都转 DOUBLE 再对账 |
+| 55 | 众数 | `mode()` 返回**一个**标量 | `mode()` 返回**所有**并列众数（顺序还不保证） | Polars `.mode().first()` |
+| 56 | arg_max 并列 | 碰到第一个就返回（**不保证**） | `get(arg_max)` 同口径（**也不保证**） | 两边都自己加唯一的 tie-break 键 |
+| 57 | 字符串聚合顺序 | `string_agg` 不带 ORDER BY **不保证顺序** | `implode()` 保证输入顺序 | DuckDB 侧写 `ORDER BY`，或两边都排序 |
+| 58 | 整数求和溢出 | BIGINT 的 sum 升到 **HUGEINT** | 保持 Int64，**静默回绕**成负数 | Polars 侧先转 Int128 / Decimal |
+| 59 | entropy | 以 2 为底的**标准香农熵** | 同名函数算的是别的东西（随数值变，常数列也不为 0） | 两个同名函数不可互换 |
+| 60 | 集合运算里的 NULL | `EXCEPT`/`INTERSECT` 里 **NULL 相等** | **没有** difference / intersection | Polars 用 `join(..., nulls_equal=True)` |
+| 61 | 去重保留哪一行 | `DISTINCT ON` 依赖外层 ORDER BY，没写就任意 | `unique(subset=, keep="first")` 取当前行序第一行 | 先 sort 再 unique |
+| 62 | 正则不匹配时的表示 | `regexp_extract` 返回**空串** | `str.extract` 返回 **null** | 判空要按各自的写法写 |
+| 63 | 整串匹配 | `regexp_full_match` | **没有** `str.fullmatch` | Polars 侧加 `^` `$` 锚定 |
+| 64 | 正则切分的默认值 | `string_split`（字面量）/ `regexp_split_to_array`（正则）分开 | `str.split` 默认 **literal=True** | Polars 侧显式 `literal=False` |
+| 65 | 正则位置查找 | `strpos` 只认**字面量**，没有 `regexp_instr` | `str.find` 走正则，返回**字节偏移 0 起数** | 位置口径不同（字符 1 起 vs 字节 0 起），别直接相减 |
+| 66 | LIKE | 有 `LIKE` / `ILIKE` | **没有** LIKE，只能用正则 | Polars 用正则 + `(?i)` 模拟 ILIKE |
+| 67 | 改数据 | `UPDATE`/`DELETE`/`INSERT` **原地**改 | DataFrame **不可变**，每次返回新对象 | Polars 侧自己拼 join / concat |
+| 68 | Polars 的 update | —— | `DataFrame.update` **unstable**，重复键会**复制行** | 别在生产代码里依赖它 |
+| 69 | upsert | `ON CONFLICT DO UPDATE` / `DO NOTHING` | 没有 | Polars 侧 anti join + coalesce 手工拼 |
+| 70 | 子查询更新 | 按**更新前的快照**算一次（无 Halloween 问题） | 纯表达式，天然没有 | —— |
+| 71 | RETURNING / 事务 | 有 `RETURNING`、`BEGIN`/`COMMIT`/`ROLLBACK` | **没有事务这个概念** | Polars 侧自己套「临时文件 + 原子替换」 |
+| 72 | 改表结构 | 完整 `ALTER TABLE`（加/删/改名/改类型） | 没有，改 schema = 造新 DataFrame | —— |
+| 73 | 标识符大小写 | **不敏感**（`SELECT ID` 查得到 `id`） | **敏感** | 两边各记一份字段名 |
+| 74 | 类型转换失败 | 默认**报错**，`TRY_CAST` 才放宽 | 默认**报错**，`cast(strict=False)` 才放宽 | 两边默认都是报错（这是好事） |
+| 75 | 读 schema 不一致的 parquet | 少列**报错**；多列**静默丢掉** | 两种都报错 | DuckDB `union_by_name=true` / Polars `missing_columns='insert'` |
+| 76 | 拼表 | `UNION ALL` 自动提升类型 | `concat` 默认**严格** | Polars 用 `how="diagonal_relaxed"` |
+| 77 | 序列端点 | `generate_series` **含**终点；`range` 不含 | `int_range` 不含；`date_range` **含** | `int_range(1, 6)` 才等于 `generate_series(1, 5, 1)` |
+| 78 | generate_series 的时间类型 | 起点是 DATE 时结果是 **TIMESTAMP** | `date_range` 返回 **Date** | —— |
+| 79 | 补齐缺失时间段 | 自己生成完整轴 + LEFT JOIN | `upsample` **只补中间**，不补两端 | Polars 侧要补两端得自己 join |
+| 80 | 按月截断 | `date_trunc('month', …)` 清零时分秒 | `dt.truncate('1mo')` 同上，但 `dt.month_start()` **保留时分秒** | 别拿 month_start 当 truncate |
+| 81 | 加一个月 | `INTERVAL 1 MONTH` 就是日历月 | `pl.duration()` **没有 months** | Polars 侧用 `dt.offset_by("1mo")` |
+| 82 | 近似 distinct | `approx_count_distinct`（HLL），本轮**偏低** | `approx_n_unique`（HLL），本轮**偏高** | 误差方向不固定，别比大小 |
+| 83 | 近似分位数 | `approx_quantile`（t-digest） | `approx_quantile`（KLL / REQ，可选算法） | 随机 sketch，每次运行结果都不同 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -307,6 +359,15 @@ con.register("t", polars_df)  # Polars -> DuckDB
 | 6 | 按组取第一条 | `DISTINCT ON (region)` | 无等价语法 | `sort` + `unique(subset=, keep="first")` |
 | 7 | 递归 CTE | `WITH RECURSIVE` 支持 | **不支持** | 只能用 `int_range` 展开，或做不到 |
 | 8 | 改数据 | `UPDATE` / `DELETE` 原地改 | 无原地修改 | `with_columns` + `filter` 返回新表 |
+| 9 | 窗口默认 frame | `ORDER BY x` 不带 frame 默认 RANGE | `cum_sum()` 是 ROWS 口径 | SQL 显式写 `ROWS BETWEEN …` |
+| 10 | 集合运算里的 NULL | `EXCEPT`/`INTERSECT` 中 NULL 相等 | 无对应函数 | `join(..., nulls_equal=True)` |
+| 11 | 序列端点 | `generate_series` 含 / `range` 不含 | `int_range` 不含 / `date_range` 含 | `int_range(1, 6)` |
+| 12 | 正则切分的默认值 | `string_split` 字面量 | `str.split` 默认字面量 | Polars 显式 `literal=False` |
+| 13 | 正则替换 | `regexp_replace` 默认只换第一个（`'g'` 全局） | `str.replace` 默认只换第一个（`replace_all` 全局） | 两边默认一致 |
+| 14 | 字符串聚合顺序 | `string_agg` 无 ORDER BY 时不保证 | `implode()` 保证输入顺序 | DuckDB 加 `ORDER BY` |
+| 15 | 整数求和 | BIGINT sum → HUGEINT | Int64 sum 溢出静默回绕 | 先转 Int128 / Decimal |
+| 16 | 分位数插值 | `quantile_cont` = linear | `quantile()` 默认 nearest | `interpolation="linear"` |
+| 17 | 近似 distinct | HLL | HLL | 误差方向不固定 |
 
 第 2 条还有个细节：Polars 的 `is_nan()` 对 NULL 返回 `null`（不是 `false`），别拿它直接当条件用。
 
@@ -1242,6 +1303,918 @@ Parquet SCAN [/tmp/.../dt=2024-01-02/part-0.parquet]   ← SCAN 里只剩那一�
 这一档 Polars 快约 1.7×，但绝对时间都在个位数毫秒 —— 数据量再大一些差距就被摊薄，别拿这个当选型依据。
 **真要提速就合并文件或改用分区表，别指望换个引擎能解决。**
 
+## 窗口函数
+
+`src/window_demo.py`。DuckDB 的 `OVER (...)` 和 Polars 的 `.over(...)` 看着像，语义上却有三处默认不一致 —— 而且都不是「报错」，是「安静地算出另一个数」。
+
+### 1. 默认 frame 是 RANGE 还是 ROWS
+
+DuckDB 不带 frame 的窗口**默认是 RANGE** —— 排序键相同的并列行会一起算进当前行的窗口。
+Polars 的 `cum_sum()` 是逐行累计，等价于 ROWS。
+
+7 行小表，`x` 有并列（`x=2` 有 4 行）：
+
+| 写法 | 累计和 |
+| --- | --- |
+| DuckDB `ORDER BY x`（单键，不带 frame） | `[10.0, 170.0, 170.0, 170.0, 170.0, 210.0, 280.0]` |
+| DuckDB `ORDER BY x` 显式 RANGE | 同上 |
+| DuckDB `ORDER BY x, ord`（双键，不带 frame） | `[10.0, 30.0, 60.0, 110.0, 170.0, 210.0, 280.0]` |
+| DuckDB `ORDER BY x, ord` 显式 ROWS | 同上 |
+| Polars `cum_sum().over(order_by=[x, ord])` | 同上 |
+
+`x=2` 那 4 行在 DuckDB 侧看到的都是 `10+20+30+50+60 = 170`（并列行一起进窗口）；
+Polars 那边第二行看到的是 `10+20 = 30`。
+
+**更隐蔽的一点：DuckDB 的默认值会随排序键个数变。**
+RANGE frame 只能配单个 ORDER BY 表达式，配多个直接报 `Binder Error: RANGE frames must have only one ORDER BY expression`，
+于是「ORDER BY x」和「ORDER BY x, ord」的结果不同 —— 后者退化成 ROWS。
+给排序加一个并列打破键，累计口径就悄悄变了。
+
+> **想跟 Polars 对齐，SQL 里必须显式写 `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`。**
+> 别依赖默认值 —— 它既取决于引擎版本，也取决于你写了一个还是几个排序键。
+
+Polars 侧还有一个同样不报错的坑：`cum_sum()` 不加 `over` 时按当前行序累计，
+之后 `sort('x','ord')` 只是搬动带着旧值走的行，累计量不会重算：
+
+```
+cum_sum() 不加 over，按当前行序累计: [10.0, 30.0, 60.0, 100.0, 150.0, 210.0, 280.0]
+然后再 sort('x','ord')，值不会重算 : [10.0, 30.0, 60.0, 150.0, 210.0, 100.0, 280.0]
+```
+
+### 2. frame 家族：ROWS / RANGE / GROUPS
+
+DuckDB 三种 frame 都有；Polars 侧只有 ROWS 口径的表达式。
+
+| frame | 含义 | `1 PRECEDING` 的实测结果 |
+| --- | --- | --- |
+| `ROWS` | 按行号数 | `[10.0, 30.0, 50.0, 80.0, 110.0, 100.0, 110.0]` |
+| `RANGE` | 按值比（`[当前值-1, 当前值]` 里的所有行） | `[10.0, 170.0, 170.0, 170.0, 170.0, 200.0, 70.0]` |
+| `GROUPS` | 按组数（并列行算一组） | `[10.0, 170.0, 170.0, 170.0, 170.0, 200.0, 110.0]` |
+
+Polars 侧对应的是表达式家族，而不是 frame 子句：
+
+| Polars 表达式 | 对应 SQL |
+| --- | --- |
+| `cum_sum()` | `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` |
+| `shift(n).over(...)` | `lag(x, n)` / `lead(x, n)` |
+| `rolling_*(...).over(...)` | `ROWS BETWEEN n PRECEDING AND n FOLLOWING` |
+| RANGE / GROUPS | **没有现成表达式**，得自己拼 |
+
+### 3. 分区窗口，以及 Polars 侧怎么拼出 RANGE
+
+分区累计两边都能做，口径对齐后结果一致（✅）。分区里有并列值时 RANGE 与 ROWS 照样分叉 ——
+分区 `a` 的 `x` 是 1,2,2,3：
+
+| | 实测结果 |
+| --- | --- |
+| DuckDB RANGE | `x=2` 的两行都看到 `10+20+30 = 60` |
+| DuckDB ROWS | 第二行 `10+20=30`，第三行 `10+20+30=60` |
+
+Polars 侧 RANGE 的配方：先 `group_by(分区, 排序键)` 把并列行合成一组 → 对组求和 → 逐组累计 → 贴回原始行。
+同一组里的值相等，累计点落在哪一行都一样。代价是多一次聚合 + 一次 join；DuckDB 的 RANGE 是一等公民，不用绕。
+
+另外：Polars 的 `over(..., order_by=...)` **不写 `order_by` 时窗口内顺序未定义**，
+累计类表达式（`cum_sum`）会直接算错，且不报错。
+
+### 4. 命名窗口
+
+DuckDB 的 `WINDOW w AS (PARTITION BY g ORDER BY x, ord)` 把「分区 + 排序」命名一次，
+后面 `sum(v) OVER w`、`rank() OVER w` 反复引用，共用一套 frame，口径改一处就够。
+
+Polars 没有命名窗口 —— 想共用就得把 `over('g', order_by=[...])` 抄两遍，
+改口径时很容易只改一处，然后两边悄悄对不上了。
+
+顺带对齐一下 rank：SQL 的 `rank()` 是「并列同名次、后面跳号」（= RANK），Polars 对应 `rank('min')`；
+`rank('ordinal')` 是「每行一个号」，对应 `row_number()`。
+
+### 5. QUALIFY
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 写法 | `QUALIFY rank() OVER w = 1` | `with_columns(...)` 再 `filter(...)` |
+| 结果 | 2 行 × 4 列 | 2 行 × 4 列 ✅ 一致 |
+
+Polars 有两种等价写法：`with_columns` 造出窗口列再 `filter`（两步，列名可复用），
+或直接在 `filter` 的条件里写窗口表达式（一步，能用）。
+但在 `filter` 里引用还没造出来的列会报 `ColumnNotFoundError: unable to find column "rn"`。
+
+> 差别不在能不能算，而在 DuckDB 把「窗口结果直接当过滤条件」做成了语法；
+> Polars 靠表达式的求值顺序，效果一样，写法和报错方式不一样。
+
+### 6. LAG / LEAD 与 shift
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 往前看一行 | `lag(x)` | `shift(1)` |
+| 往后看一行 | `lead(x)` | `shift(-1)` |
+| 边界 | 填 NULL | 填 NULL |
+
+7 行 × 5 列全部一致（✅）。
+
+一个容易踩的点：DuckDB 的 `lag`/`lead` 是窗口函数，**必须带 OVER**，否则报错；
+Polars 的 `shift()` 不加 `over()` 是在整张表上移位，不分区 —— 语义完全不同但不报错：
+
+```
+Polars shift(1) 不加 over： [None, 1, 2, 2, 3, 2, 2]
+```
+
+### 7. 窗口函数的代价
+
+100 万行（region 分区、order_id 排序的累计销售额）：
+
+| 引擎 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB | 102.8 | 88.4 |
+| Polars | **31.8** | 29.4 |
+
+Polars 快 **3.23×**。口径：输入已物化（Parquet 落盘、DuckDB 建表、Polars 读进内存），
+计时的只有「窗口计算 + 结果物化」这一段。窗口函数贵的主因是排序：分区越大，要排的键越多。
+
+## 聚合函数语义
+
+`src/agg_demo.py`。同名聚合函数在两个引擎里返回不同类型、不同数量、甚至不同数值的都有 —— 而且**基本都不报错**。
+
+### 1. 分位数：插值方式不一样，中位数对不上
+
+样本 `[1.0, 2.0, 3.0, 4.0]`：
+
+| 分位 | DuckDB `cont` | DuckDB `disc` | Polars 默认 | Polars `linear` |
+| --- | --- | --- | --- | --- |
+| 0.25 | 1.75 | 1.0 | 2.0 | 1.75 |
+| 0.5 | **2.5** | 2.0 | **3.0** | 2.5 |
+| 0.75 | 3.25 | 3.0 | 3.0 | 3.25 |
+
+同一个 q=0.5，DuckDB `quantile_cont` = 2.5，Polars `quantile` = 3.0 —— **直接对账会挂**。
+Polars 侧要么显式写 `interpolation="linear"`（对上 `cont`），要么 `interpolation="lower"`（对上 `disc`）。
+Polars 支持的插值：`linear` / `lower` / `higher` / `nearest` / `midpoint`。
+
+更隐蔽的一个：**DuckDB 的 `quantile_cont` 会跟着列的类型变**。
+
+| 列类型 | q=0.25 / 0.5 / 0.75 |
+| --- | --- |
+| `DOUBLE` | `[1.75, 2.5, 3.25]`（线性插值，和 numpy 一致） |
+| `DECIMAL(4,1)` | `[1.7, 2.5, 3.2]` ← 插值结果被**截断**回列的精度（scale=1） |
+
+同样的数，只是列的类型不同，25% 与 75% 分位点就各差了 0.05 —— 是**截断**不是四舍五入。
+
+### 2. 众数 mode：一个值，还是所有并列值
+
+| 数据 | DuckDB `mode(x)` | Polars `mode()` |
+| --- | --- | --- |
+| `(1,1,2)` | `Decimal('1.0')` | `[1.0]` |
+| `(1,2,3)`（次数全相同） | `Decimal('1.0')`（随便挑了一个） | `[3.0, 2.0, 1.0]`（全都算众数） |
+
+DuckDB 的 `mode()` 永远返回一个标量；Polars 的 `mode()` 返回一个 Series，装着所有出现次数最多的值，
+而且**顺序不保证**（本次是 `[3.0, 2.0, 1.0]`）。
+想要 DuckDB 的口径得自己收窄（`mode().first()`），但「挑哪一个」仍然是不确定的。
+
+### 3. arg_max / arg_min：并列时选中哪一行，没保证
+
+`s` 与 `v` 两列，`v` 最大的有并列（`'b'` 和 `'a'` 都是 10.0）：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `arg_max(s, v)` | `'b'` |
+| Polars `get(arg_max)` | `'b'` |
+| Polars `sort_by(v).last()` | `'b'` |
+
+这次两边选的是同一个（都是「碰到第一个就返回」），但**这不是规范保证** —— 输入顺序换成 `('a','b')`，两边都变成 `'a'`。
+
+要稳定就得自己加一个并列打破键，但两个引擎的「打破」方向是**相反**的：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `arg_max(s, v ORDER BY ord)` | `'b'`（并列里取排序后的第一行） |
+| DuckDB `arg_max(s, v ORDER BY ord DESC)` | `'a'`（取最后一行） |
+| Polars `sort_by(['v','ord']).last()` | `'a'`（取最后一行） |
+
+### 4. 字符串聚合：拼出来的顺序不一样
+
+`s = ['b', 'a', 'c']`：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `string_agg(s, ',')` | `'b,a,c'`（顺序**未定义**） |
+| DuckDB `string_agg(s, ',' ORDER BY s)` | `'a,b,c'`（确定） |
+| Polars `implode().list.join(',')` | `'b,a,c'`（保持输入顺序） |
+
+DuckDB 不带 `ORDER BY` 时不保证顺序（SQL 规范就是这样，实际输出取决于执行计划），Polars 的 `implode()` 保证按输入顺序。
+拿两边的结果直接比字符串会挂 —— 除非 DuckDB 侧也写 `ORDER BY`，或者两边都排序。
+
+注意 Polars 2.x 的 `implode()` 聚成的是**一个列表**（`['b','a','c']`），不是拼好的字符串 —— 要拿到字符串还得再 `.list.join(',')` 一层。
+
+### 5. 整数求和：DuckDB 升精度，Polars 静默回绕
+
+两个 `4611686018427387904` 相加（结果 `9223372036854775808`，超过 Int64 上限 `9223372036854775807`）：
+
+| 写法 | 结果 | |
+| --- | --- | --- |
+| DuckDB `sum(x)` | `9223372036854775808`（类型 HUGEINT） | ✅ 对 |
+| Polars `sum()` | `-9223372036854775808` | ❌ **静默回绕成了负数** |
+
+DuckDB 把 BIGINT 的 `sum()` 升到 HUGEINT（128 位），所以不会溢出；Polars 的 `sum()` 保持 Int64，溢出后**回绕**，不报错、不警告。
+金额类整数求和，Polars 侧要么先转 Int128/Decimal，要么自己检查量级。
+
+### 6. 谁有哪些聚合函数
+
+名单对照（两个引擎都真的调了一遍，不是照着文档抄的）：
+
+| 函数 | DuckDB | Polars |
+| --- | --- | --- |
+| `product` / 乘积 | ✅ 6.0 | ✅ 6.0 |
+| `entropy` / 熵 | ✅ 1.584962500721156 | ✅ **1.0114042647073518** ← 对不上 |
+| `kurtosis` / 峰度 | ✅ None | ✅ -1.5 |
+| `skewness` / 偏度 | ✅ 0.0 | ✅ 0.0（但 Polars 叫 `skew`） |
+| `corr` / 相关系数 | ✅ 0.9979487157886733 | ✅ 0.9979487157886733 |
+| `regr_slope` / 回归斜率 | ✅ 0.4426229508196721 | ✅ 0.4426229508196722（参数顺序是反的） |
+| `bit_and` / 按位与 | ✅ 0 | ❌ AttributeError |
+
+**`entropy` 是同名不同义的典型**：DuckDB 的是标准的以 2 为底的香农熵（`[1,2,3]` 的理论值 1.584963 ✅）；
+Polars 的 `entropy([1,1,1,1])` = 1.386294（常数列的香农熵应该是 **0**），`entropy([0,0,1])` 直接出 **NaN**，
+`entropy([7,8,9])` = 1.093390 —— 同样的频次分布换一组数值结果就变。
+它算的不是「值频次分布的熵」，两个同名函数不可互换，混用会得到对不上的数。
+
+协方差要当心：Polars 的 `pl.cov` 是**总体**口径（对上 DuckDB 的 `covar_pop`），样本口径得自己乘 `n/(n-1)`。
+DuckDB 独有 `regr_*` 这一整族回归统计，Polars 侧没有现成函数。
+
+### 7. 聚合的代价
+
+100 万行，两边做同一件事（count/sum/avg/中位数）：
+
+| 引擎 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB | **13.5** | 12.9 |
+| Polars | 20.3 | 19.9 |
+
+DuckDB 快约 **1.5×**。口径：输入已物化，计时的只有「分组聚合 + 结果物化」；
+中位数的插值口径按上面的结论调成一致。
+
+## 集合运算与去重
+
+`src/setop_demo.py`。DuckDB 有 `EXCEPT` / `INTERSECT` / `UNION`，Polars 2.x **一个都没有** —— 得自己拼，而拼的时候 NULL 的处理是最容易出错的地方。
+
+### 1. EXCEPT / INTERSECT：NULL 参与比较，而且 NULL 相等
+
+`a = [1, 2, NULL]`，`b = [1, NULL, 3]`：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `EXCEPT` | `[(2,)]` |
+| DuckDB `INTERSECT` | `[(NULL,), (1,)]` |
+| DuckDB `EXCEPT ALL` | `[(2,)]` |
+| DuckDB `INTERSECT ALL` | `[(1,), (NULL,)]` |
+
+为什么是这个结果：a 里有一个 NULL，b 里也有一个 NULL。集合运算比较的是「值是否相同」，
+DuckDB 在这里把两个 NULL 判成相同，所以 NULL 从 a 的结果里被减掉了（`EXCEPT` 里看不到它），又被算进了交集。
+对比普通比较：`NULL = NULL` 是 UNKNOWN（不是 true），`IS NOT DISTINCT FROM NULL` 才是「按值判等」—— 集合运算走的是后者那套。
+
+Polars 侧根本没有对应方法（`difference` / `intersection` / `symmetric_difference` / `set_difference` 全部 `False`）。
+
+### 2. Polars 侧怎么补出 EXCEPT / INTERSECT
+
+差集（a 里有、b 里没有的行）：
+
+| 写法 | 结果 | 对得上 DuckDB 吗 |
+| --- | --- | --- |
+| `join(how="anti")` | `[2, None]` | ❌ |
+| `filter(~is_in(...))` | `[2]` | ❌ |
+| `join(how="anti", nulls_equal=True)` | `[2]` | ✅ |
+
+交集（两边都有的行）：
+
+| 写法 | 结果 | 对得上 DuckDB 吗 |
+| --- | --- | --- |
+| `join(how="semi")` | `[1]` | ❌ |
+| `filter(is_in(...))` | `[1]` | ❌ |
+| `join(how="semi", nulls_equal=True)` | `[1, None]` | ✅ |
+
+三个写法给出三个不同的答案 —— 因为它们对 NULL 的处理各不相同：
+
+- **anti join（默认）**：NULL 不等于 NULL，a 里的 NULL 留在结果里
+- **is_in**：NULL 那一行算出来是 null，`filter` 把它当假值丢掉
+- **nulls_equal=True**：NULL 当普通值比，NULL 被减掉 —— 这个才对得上 DuckDB
+
+> **Polars 侧要用 `join(..., nulls_equal=True)` 才能复刻 DuckDB 的集合运算语义。**
+
+### 3. UNION 与 UNION ALL：去重时 NULL 怎么算
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `UNION` | `[(NULL,), (2,), (1,), (3,)]` |
+| DuckDB `UNION ALL` | `[(1,), (2,), (NULL,), (1,), (NULL,), (3,)]` |
+| Polars `concat().unique()` | `[1, 2, 3, None]` |
+| Polars `concat()` | `[1, 2, None, 1, None, 3]` |
+
+两边去重结果一致（✅，排序后比）。`UNION ALL` 两边都是 6 行（✅），重复的 NULL 也都保留。
+但如果 Polars 侧忘了 `unique()`，NULL 就会多出一个。
+
+列名不一致时 DuckDB 报 `Binder Error: Referenced column "y" not found in FROM clause!`，
+Polars 的 `concat` 要求列名一致，否则报 schema mismatch。
+
+### 4. 按列去重：保留哪一行，没有保证
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `DISTINCT ON (k) ORDER BY k, v DESC` | `a→20.0`, `b→40.0`（确定） |
+| DuckDB `DISTINCT ON (k)`（没有 ORDER BY） | `b→30.0`, `a→10.0`（**留哪行是任意的**） |
+| Polars `unique(subset=['k'], keep='first')` | `a→10.0`, `b→30.0`（取当前行序第一行） |
+
+DuckDB 的 `DISTINCT ON` 依赖外层 ORDER BY 决定留哪一行；Polars 的 `unique(subset=..., keep="first")` 留的是**当前行序**里的第一行，
+所以必须先 `sort` 到想要的顺序，再 `unique`。
+
+去重的其它口味：
+
+| 写法 | 结果 |
+| --- | --- |
+| Polars `unique(keep='first')` | `['a', 'b']` |
+| Polars `unique(keep='last')` | `['a', 'b']` |
+| Polars `unique(keep='none')` | `['b']`（把重复行全删了） |
+| DuckDB `SELECT DISTINCT` | 只保留一份（没有 `keep='none'` 这种口味） |
+
+Polars 的 `unique()` 默认**不保证保留原顺序**（`maintain_order` 默认 False），
+本次 first/last 两次恰好都返回 `['a','b']`，但那是运气不是保证 —— 要保留得显式写 `maintain_order=True`。
+DuckDB 侧对应写法是 `GROUP BY k` + `min()/max()`，或者窗口函数 `row_number()`。
+
+### 5. 集合运算的代价
+
+左右各 100 万行，右表是左表去掉一些行：
+
+| 引擎 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB `EXCEPT` | 39.5 | 38.7 |
+| Polars anti join | **36.6** | 32.6 |
+
+Polars 快 **1.08×** —— 差距很小。口径：输入已物化，计时的只有「集合运算 + 结果物化」。
+注意 `EXCEPT` 内部要去重，而 anti join 不用 —— 两边干的活并不完全一样。
+
+## 正则与字符串
+
+`src/regex_demo.py`。两个引擎的正则都是 RE2 风格（没有回溯、线性时间），所以**不支持的东西是一样的**；
+真正的差异全在**默认值**上 —— 默认值不一样，又都不报错。
+
+### 1. 两边都不支持的前瞻与反向引用（这点反而是一致的）
+
+| 正则 | 说明 | DuckDB | Polars |
+| --- | --- | --- | --- |
+| `a(?=b)` | 前瞻：后面必须跟着 b | ❌ `InvalidInputException` | ❌ `ComputeError` |
+| `a(?!b)` | 否定前瞻 | ❌ `InvalidInputException` | ❌ `ComputeError` |
+| `(a)\1` | 反向引用 | ❌ `InvalidInputException` | ❌ `ComputeError` |
+| `(?<=a)b` | 后顾 | ❌ `InvalidInputException` | ❌ `ComputeError` |
+| `(?i)ABC` | 内联标志：忽略大小写 | ✅ | ✅ |
+| `[[:alpha:]]+` | POSIX 字符类 | ✅ | ✅ |
+
+报错类型不一样，结论一样：前后瞻、后顾、反向引用一律不支持。
+
+### 2. regexp_extract / str.extract：分组编号一致，但「匹配不上」不一样
+
+两边的**分组编号口径一致**：0 = 整个匹配，1 = 第一个括号组（样例 8 行里匹配上 1 行，组 1 两边一致 ✅）。
+
+但匹配不上时表示法不同：
+
+| | 匹配不上时 |
+| --- | --- |
+| DuckDB `regexp_extract` | `('', '')` —— **空字符串** |
+| Polars `str.extract` | `{'g1': None, 'g9': None}` —— **null** |
+
+> 写 `= ''` 和写 `IS NULL` 会得到相反的结果。
+> 另外 DuckDB 的组号越界（这里是 9）也返回空串而不是报错。
+
+「找全部」：DuckDB `regexp_extract_all('a1b2c3')` → `['1','2','3']`；
+Polars `str.extract_all` → `[['1','2','3']]`（**列表列**，多包了一层）。
+
+### 3. 「整串匹配」和「子串匹配」
+
+样本 `'ORD-2024-001'`，模式 `[A-Z]{3}-[0-9]{4}-[0-9]{3}`：
+
+| 写法 | `'ORD-2024-001'` | `'xxORD-2024-001yy'` |
+| --- | --- | --- |
+| DuckDB `regexp_full_match` | True | **False** |
+| DuckDB `regexp_matches`（子串） | True | True |
+| Polars `str.contains`（子串） | True | True |
+| Polars `str.contains("^…$")` | True | **False** |
+
+**Polars 2.1 没有 `str.fullmatch`**（`hasattr` 实测 `False`）—— 整串匹配只能自己加 `^` 和 `$` 锚定。
+DuckDB 没有 `regexp_contains` 这种「只判断不返回」的名字，用 `regexp_matches`（部分）或 `regexp_full_match`（整串）。
+
+### 4. 替换：只换第一个，还是全换
+
+样本 `'a1b2c3'`，模式 `[0-9]`，替换成 `#`：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `regexp_replace`（默认） | `'a#b2c3'`（只换第一个） |
+| DuckDB `regexp_replace(..., 'g')` | `'a#b#c#'` |
+| Polars `str.replace`（默认 `n=1`） | `'a#b2c3'` |
+| Polars `str.replace_all` | `'a#b#c#'` |
+
+默认行为两边一致，但开关的位置不同：DuckDB 在第 4 个参数里传 `'g'`，Polars 用另一个函数名。
+
+「按正则」与「按字面量」：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `replace()`（字面量） | `'a-c'` |
+| DuckDB `regexp_replace()`（正则） | `'-.c'` |
+| Polars `str.replace(literal=True)` | `'a-c'` |
+| Polars `str.replace`（默认 = **正则**） | `'-.c'` |
+
+DuckDB 是两个函数分开（`replace` / `regexp_replace`），Polars 是**一个函数 + 默认走正则** —— 照名字翻译会串。
+
+### 5. 切分与位置查找
+
+样本 `'a1b2c'`，按 `[0-9]` 切分：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `string_split()` | `['a1b2c']`（字面量） |
+| DuckDB `regexp_split_to_array()` | `['a','b','c']`（正则） |
+| Polars `str.split()` | `['a1b2c']`（**字面量！**） |
+| Polars `str.split(literal=False)` | `['a','b','c']`（正则） |
+
+> **这是最容易踩的一个**：Polars 的 `str.split` 默认 `literal=True`，
+> 拿 `'[0-9]'` 去切等于找一个叫 `'[0-9]'` 的子串，切不动。
+
+找位置：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `strpos('ORD-2024-001','2024')` | `5`（字面量，**1 起数**） |
+| DuckDB `strpos('ORD-2024-001','[0-9]{4}')` | `0`（字面量找 `'[0-9]{4}'`，找不到） |
+| DuckDB `regexp_instr` | **不存在**（`CatalogException`） |
+| Polars `str.find('[0-9]{4}')` | `4`（**字节偏移，0 起数**） |
+
+DuckDB 没有正则版的位置查找；Polars 的 `str.find` 走正则但返回字节偏移。差的不只是 1，中文场景还差一个字节/字符。
+
+### 6. LIKE：通配符与转义
+
+| 值 | DuckDB `LIKE 'a_c'` | DuckDB `LIKE 'a%c'` | DuckDB `ILIKE 'abc'` |
+| --- | --- | --- | --- |
+| `'abc'` | ✅ | ✅ | ❌ |
+| `'a_c'` | ✅ | ✅ | — |
+| `'a%c'` | ❌ | ✅ | — |
+| `'ABC'` | ❌ | ❌ | ✅ |
+
+`LIKE` 的 `'_'` 匹配**恰好一个字符**（`'abc'` 也匹配 `'a_c'`）。DuckDB 用 `ESCAPE '\'` 转义下划线。
+**Polars 没有 LIKE**，常用正则代替 —— 但正则的 `.` 也只匹配一个字符（不是多字节字符），中文上要小心。
+大小写：Polars 侧没有 `ILIKE`，只能用 `(?i)` 正则。
+
+### 7. 中文、全角、Emoji：按字符还是按字节
+
+DuckDB `length()` / `strlen()` 与 Polars `str.len_chars()` / `str.len_bytes()` **完全一致**（✅ 8 行全对）：
+
+| 文本 | 字符数 | 字节数 |
+| --- | --- | --- |
+| `'emoji 😀'` | 7 | 10 |
+| `'全角ＡＢＣ'` | 5 | 15 |
+| `'小米手机'` | 4 | 12 |
+| `'Apple iPhone 15'` | 15 | 15 |
+
+一个 Emoji 在字符口径下算 1 个字符、UTF-8 下算 4 个字节；Python 自己的 `len()` 也是字符数。
+
+**但位置口径不一样（这条最容易错）**：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `strpos('订单1','1')` | `3`（第几个**字符**，1 起数） |
+| Polars `str.find('1')` | `6`（第几个**字节**，0 起数） |
+
+切片两边倒是都按字符：`substr('订单😀', 2, 2)` 与 `str.slice(1, 3)` 都得到 `'单😀'`。
+
+### 8. 正则的代价
+
+50 万行订单号：
+
+| 引擎 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB | 46.5 | 44.2 |
+| Polars | **27.3** | 27.2 |
+
+Polars 快 **1.71×**。口径：输入已物化，计时的只有「正则提取 + 结果物化」。
+
+## 增删改（DML）
+
+`src/dml_demo.py`。DuckDB 是「表」，Polars 是「不可变的 DataFrame」——
+这不只是写法差异，它决定了能不能事务、能不能 upsert、能不能原子地改数据。
+
+### 1. 两种数据模型
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 改数据 | `UPDATE` 直接改表，**状态持久** | `with_columns` 返回**新对象**，原对象一点没变 |
+| 事务 | 有（`BEGIN`/`COMMIT`/`ROLLBACK`） | **没有事务这个概念** |
+| upsert | `ON CONFLICT DO UPDATE` | 没有 |
+| 插入单行 | `INSERT` | 没有 `insert_row` |
+
+Polars 侧的 `DataFrame.update` 存在，但 docstring 里写着 **unstable**。
+
+### 2. Polars 的 `DataFrame.update`：一个静默改坏数据的坑
+
+| 坑 | 实测 |
+| --- | --- |
+| 更新方里有**重复键** | 行数从 4 变成 **5**，id=2 出现了两次 |
+| 更新方里有 df 中**不存在的键** | 被**静默忽略**（左连接语义，不是报错） |
+| API 稳定性 | docstring 里出现 `unstable` |
+
+DuckDB 那边不会出现这种行数变化：`UPDATE` 只改已有的行，不会复制行；想插新行必须走 `INSERT`，
+主键冲突会被约束直接拒掉（`Constraint Error: Duplicate key "id: 3" violates primary key constraint.`）。
+
+### 3. DELETE 和 INSERT：SQL 有语句，Polars 得拼
+
+| 引擎 | 写法 | 结果 |
+| --- | --- | --- |
+| DuckDB | `DELETE FROM sales WHERE id=3` | 剩 id 1,2,4 |
+| DuckDB | `INSERT INTO sales VALUES (...)` | 插回 4 行 |
+| Polars | `join(how="anti")` | 剩 id 1,2,4 |
+| Polars | `concat` | 插后 5 行 |
+
+两边的结构要求也一致：Polars `concat` 要求列完全一致（名字和类型都要一致），
+否则报 `ShapeError: unable to append to a DataFrame of width 3 with a DataFrame of width 2`；
+DuckDB 的 `INSERT` 报 `Binder Error: table "sales" has 3 columns but 1 values were supplied`。
+
+### 4. upsert：ON CONFLICT DO UPDATE vs 手工拼
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `INSERT ... ON CONFLICT DO UPDATE` | `[(1,10.0),(2,200.0),(3,300.0),(4,400.0)]` |
+| Polars 手工拼（anti join + 左连接 coalesce） | 同上 ✅ |
+
+`DO NOTHING` 口味（DuckDB 有，Polars 拼起来更绕）：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `ON CONFLICT DO NOTHING` | `[(1,10.0),(2,20.0)]` |
+| Polars 拼（保留原表 + 只并入新键） | 同上 ✅ |
+
+> `DO NOTHING` 的语义是「**冲突的保留旧值，新的照插**」，不是「整批不插」—— 用 `unique(keep='first')` 凑是凑不出来的。
+
+DuckDB 还有一条 Polars 完全没有的路：`UPDATE ... FROM`（拿另一张表来改），
+实测 `UPDATE u ... FROM adj` 得到 `[(1,110.0),(2,200.0),(3,600.0),(4,400.0)]`。
+Polars 侧只能自己 join 出要改的行再 update。
+
+### 5. UPDATE 里的子查询：按更新前的快照算一次
+
+| | 值 |
+| --- | --- |
+| 更新前 `sum(v)` | 499500 |
+| 更新后 `sum(v)` | 499999500 |
+| 若每行都加上更新前的和 | `499500 + 1000 × 499500 = 499999500` |
+| 实测 | ✅ **等于该值** |
+
+这是「**Halloween 问题**」：经典的 `UPDATE ... SET x = x + (SELECT sum(x) ...)` 会因为边算边改而算错。
+DuckDB 在这里按更新前的快照算一次，所以结果是对的。
+Polars 侧没有 UPDATE 语句，等价写法是纯表达式，天然没有这个问题：`(s + s.sum()).sum()` = 499999500。
+
+### 6. RETURNING 和事务
+
+`RETURNING` 把改动过的行直接返回，不用再查一遍：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `UPDATE ... RETURNING` | `[(1, 106.0)]`（只返回**被改动**的行） |
+| DuckDB `DELETE ... RETURNING` | `[(4, 'delta')]` |
+| Polars | 所有操作都返回新 DataFrame，天然就是「RETURNING」—— 但语义不同 |
+
+事务实测：
+
+| 序列 | 结果 |
+| --- | --- |
+| `BEGIN` → `UPDATE` → `ROLLBACK` | `[(1,)]`（改动被丢掉） |
+| `BEGIN` → `UPDATE` → `COMMIT` | `[(3,)]`（改动生效） |
+
+Polars 侧带 commit/rollback/transaction 的方法：`[]`。
+Polars 的 `LazyFrame` 有 collect/写文件，但那是「**物化**」，不是「事务」——
+需要原子性就得自己在外面套（写临时文件 → 原子替换）。
+
+### 7. 改完之后行序还在不在
+
+DuckDB `UPDATE` 10 万行后前 5 行的 `i` = `[0, 1, 2, 3, 4]`（行序保持住了 ✅）。
+但 SQL 本身不承诺行序 —— 换个查询计划、换个版本都可能变，所以正式查询一律要带 `ORDER BY`。
+
+Polars 侧结论不一样：行序是数据的一部分，但要小心哪些算子会重排。
+
+| 算子 | 行序 |
+| --- | --- |
+| 原始 | `['b','a','b']` |
+| `group_by` 之后 | `['a','b']` ← **重排了** |
+| `update` 之后 | `['b','a','b']` ← 保持 |
+
+> Polars 里「行序」不是查询的副产品，而是要自己用 `sort` 固定的。
+> `join` 默认也不保证行序，要固定得显式写 `maintain_order="left"`。
+
+### 8. 批量 UPDATE 的代价
+
+100 万行，其中 1/3 会被改：
+
+| 引擎 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB `UPDATE` | 11.5 | 11.0 |
+| Polars 表达式 | **4.3** | 4.0 |
+
+**这两个数字不能直接比大小**：
+
+- DuckDB 的 `UPDATE` 包含**写回存储**：读旧块 → 改 → 写新块（含 WAL）
+- Polars 这边只是算出一个新 DataFrame，**没有写回任何东西**
+- 表的重建（`CREATE OR REPLACE TABLE`）在计时之外
+
+真正该比的量是「同样的一件事」，而不是「两种模型各自的代价」：
+DuckDB 写完的数据在磁盘上，Polars 的结果只在内存里。
+
+## Schema 演进
+
+`src/schema_demo.py`。改 schema 在两个引擎里是两件完全不同的事：DuckDB 改的是磁盘上的表，Polars 造的是内存里的新对象。
+
+### 1. ALTER TABLE vs 造新表
+
+| 操作 | DuckDB | Polars |
+| --- | --- | --- |
+| 加列 | `ALTER TABLE t ADD COLUMN amount DOUBLE DEFAULT 0` | `with_columns(pl.col('id') * 10).alias('id10')` |
+| 删列 | `ALTER TABLE t DROP COLUMN amount` | `drop('name')` |
+| 改名 | `ALTER TABLE t RENAME COLUMN name TO label` | `rename({'name': 'label'})` |
+| 改类型 | `ALTER TABLE t ALTER COLUMN label TYPE VARCHAR` | `with_columns(pl.col('id').cast(pl.Int64))` |
+
+DuckDB 改完表就落盘了，进程退出数据还在；Polars 的 DataFrame 只活在内存里，
+除非 `write_parquet` / `write_database`。Polars 侧的 `alter` 类 API：`[]`（一个都没有）。
+
+### 2. 标识符大小写：DuckDB 不敏感，Polars 敏感
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `SELECT ID, NAME FROM c`（表建的是 `Id`/`Name`） | ✅ 查得到 |
+| Polars `df.select("ID")`（列名是 `Id`） | ❌ `ColumnNotFoundError` |
+| Polars `df.select("Id")` | ✅ |
+
+DuckDB 的不敏感只针对**标识符**（表名、列名），字符串常量照常区分大小写：`SELECT 'ID' = 'id'` → `False`。
+
+> 迁移时最容易踩的一类：上游给的字段名是 `User_ID` / `user_id` / `USER_ID`，
+> DuckDB 一视同仁，Polars 一字不差。写 SQL 和写 Polars 表达式时得**各自记一份**。
+
+### 3. 类型转换失败：报错还是填 NULL
+
+| 写法 | 行为 |
+| --- | --- |
+| DuckDB `'abc'::INTEGER` | ❌ 报错 |
+| DuckDB `TRY_CAST('abc' AS INTEGER)` | ✅ → NULL |
+| Polars `cast(pl.Int64)`（默认 strict=True） | ❌ 报错 |
+| Polars `cast(pl.Int64, strict=False)` | ✅ → NULL |
+
+两边的「宽松转换」开关都在，但**默认都是报错** —— 这是好事，静默变 NULL 更容易坑人。
+
+### 4. 读一批 schema 不一致的 parquet
+
+三种情况 × 四种配置：
+
+| 情况 | DuckDB 默认 | DuckDB `union_by_name=true` | Polars 默认 | Polars `missing_columns='insert'` |
+| --- | --- | --- | --- | --- |
+| 后一个文件**少**一列 | ❌ `InvalidInputException` | ✅ 缺的填 NULL | ❌ 报错 | ✅ 缺的填 NULL |
+| 后一个文件**多**一列 | ⚠️ **静默丢掉**多出来的那列 | ✅ 并起来 | ❌ 报错 | ❌ 仍报错 |
+| 同一列**类型**不同 | ❌ `ConversionException` | ✅ 提升成 VARCHAR | ❌ 报错 | ❌ 仍报错 |
+
+三条要记住的：
+
+1. DuckDB 默认遇到「少一列」会报错，但遇到「多一列」是**静默丢掉**多出来的那列 —— 最危险的不是报错，是不报错。
+2. Polars 默认两种情况都报错，并且错误信息会提示该用哪个参数。
+3. 两边的「放宽」开关**不是同一个**：DuckDB 是 `union_by_name=true`（一个开关管缺列 + 多列 + 类型），
+   Polars 是 `missing_columns='insert'`（只管缺列；多列和类型不一致仍然报错）。
+
+### 5. 拼表：Polars 的 concat 默认严格，DuckDB 会隐式转类型
+
+| 情况 | DuckDB | Polars 默认 | Polars 放宽 |
+| --- | --- | --- | --- |
+| `INTEGER` + `DOUBLE` | ✅ 自动提升到 DOUBLE | ❌ 报错 | `how="diagonal_relaxed"` ✅ |
+| 列名不同 | ✅ 取第一个 SELECT 的列名 | ❌ `schema mismatch` | `how="diagonal"` ✅（缺的填 NULL） |
+
+### 6. 改 schema 的代价
+
+100 万行两列表：
+
+| 操作 | 中位数 (ms) |
+| --- | --- |
+| DuckDB `ALTER ADD COLUMN` | 5.62 |
+| DuckDB `ALTER DROP COLUMN` | **0.37** |
+| DuckDB `ALTER COLUMN TYPE` | 5.01 |
+| Polars 加常量列 `pl.lit` | **0.11** |
+| Polars 加计算列 `v*2` | 1.40 |
+| Polars `cast` 一列 | 0.09 |
+| Polars `drop` 一列 | 0.09 |
+
+Polars 加常量列比加计算列快 **13.0×**，因为 `pl.lit` 是**广播**，底层只存一个标量。
+
+**这两组数字量的不是同一件事**：DuckDB 量的是「持久化改表」（要写元数据、写 WAL，改类型还要重写整列），
+Polars 量的是「内存里造一个新表」（不落盘）。
+
+## 时间轴与序列生成
+
+`src/timeseries_demo.py`。生成序列、补齐空档、按粒度截断 —— 这几件事两个引擎都有 API，
+但**端点算不算、类型是什么、覆盖到哪**，默认值全不一样。
+
+### 1. 序列的端点算不算 —— 同一句「1 到 5」，三种答案
+
+| 写法 | 终点包含？ | `1` 到 `5` 的结果 |
+| --- | --- | --- |
+| DuckDB `generate_series(1, 5, 1)` | ✅ **含** | `[1,2,3,4,5]` |
+| DuckDB `range(1, 5, 1)` | ❌ 不含 | `[1,2,3,4]` |
+| Polars `int_range(1, 6)` | ❌ 不含 | `[1,2,3,4,5]` |
+| Polars `date_range(2024-01-01, 2024-01-05, '1d')` | ✅ **含** | 5 个日期 |
+
+三条要记住的：
+
+- DuckDB 内部就有两套：`generate_series` 含终点，`range` 不含。
+- Polars 的 `int_range` 不含终点，`date_range` 含终点 —— **同一套 API 里两个口径**。
+- 迁移时最容易漏的就是这个差一：`int_range(1, 5)` 只有 4 个数，
+  要和 DuckDB 的 `generate_series(1, 5, 1)` 对齐，得写 `int_range(1, 6)`。
+
+### 2. 两边各有哪些时间类型
+
+| DuckDB | Polars |
+| --- | --- |
+| `DATE` | `Date` |
+| `TIMESTAMP` | `Datetime(time_unit='us'\|'ns', time_zone=None)` |
+| `TIMESTAMP WITH TIME ZONE` | `Datetime(time_unit='us', time_zone='Asia/Shanghai')` |
+| `INTERVAL` | `Duration(time_unit='us')` |
+
+DuckDB 的 `generate_series` 在时间上有个坑：**起点是 DATE 时结果是 TIMESTAMP**（不是 DATE）。
+和 DATE 列 JOIN 时会走隐式类型转换，能对上但不报错 —— 别以为两边类型一样。
+
+时区换算（同一个瞬时点，两边都能换算）：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `AT TIME ZONE 'UTC'` | `2024-01-01 00:00:00` |
+| DuckDB `AT TIME ZONE 'Asia/Shanghai'` | `2024-01-01 08:00:00` |
+| Polars `replace_time_zone('UTC')` | `2024-01-01 00:00:00+00:00` |
+| Polars `convert_time_zone('Asia/Shanghai')` | `2024-01-01 08:00:00+08:00` |
+
+DuckDB 叫 `AT TIME ZONE`，Polars 叫 `convert_time_zone`；`replace_time_zone` 是「贴标签」，`convert_time_zone` 才是「换显示」。
+
+### 3. 补齐缺失的时间段：upsample 只补「中间」
+
+原始数据只有 `2024-01-01`（v=1）和 `2024-01-04`（v=4）：
+
+| 写法 | 补出来的范围 | 行数 |
+| --- | --- | --- |
+| DuckDB 生成完整轴 + LEFT JOIN | 01-01 ~ **01-05** | 5 |
+| Polars `upsample` | 01-01 ~ **01-04** | **4** |
+| Polars 自己 join 一条完整轴 | 01-01 ~ 01-05 | 5 ✅ |
+
+`upsample` 只补了 01-01 到 01-04 **中间**的空档，最后一格 01-05 没有 —— 数据里没有，`upsample` 也不造。
+
+> 两条路：Polars 的 `upsample` 更快（不用自己造轴），但「补齐的时间轴范围」得自己定；
+> DuckDB 那边范围本来就是 SQL 的一部分。
+
+### 4. 按粒度截断：month_start 的名字骗人
+
+起点 `2024-03-15 13:45:30`：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `date_trunc('month', …)` | `2024-03-01 00:00:00` |
+| DuckDB `date_trunc('day', …)` | `2024-03-15 00:00:00` |
+| Polars `dt.truncate('1mo')` | `2024-03-01 00:00:00` |
+| Polars `dt.truncate('1d')` | `2024-03-15 00:00:00` |
+| Polars `dt.month_start()` | `2024-03-01 13:45:30` ← **时分秒还在！** |
+
+`truncate` 会把时分秒清零；`month_start` 只把日期挪到 1 号，时间原样保留。
+要「当月第一天零点」得用 `truncate('1mo')`，**别用 `month_start`**。
+
+Date 列上截断，返回类型还不一样：
+
+| | 结果 | 类型 |
+| --- | --- | --- |
+| DuckDB `date_trunc('month', DATE)` | `2024-03-01 00:00:00` | **TIMESTAMP**（DATE 被提升） |
+| Polars `dt.truncate('1mo')` on Date | `2024-03-01` | **Date** |
+
+拿结果去跟 DATE 列 JOIN 时行为会不一样（一个要隐式转换，一个正好匹配）。
+
+### 5. 间隔加减：月份在 Polars 里不是 Duration
+
+起点 `2024-03-15 13:45:30`：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `TIMESTAMP + INTERVAL 1 DAY` | `2024-03-16 13:45:30` |
+| DuckDB `TIMESTAMP + INTERVAL 1 MONTH` | `2024-04-15 13:45:30` |
+| Polars `x + pl.duration(days=1)` | `2024-03-16 13:45:30` |
+| Polars `x + pl.duration(months=1)` | ❌ `TypeError: duration() got an unexpected keyword argument 'months'` |
+| Polars `x.dt.offset_by('1mo')` | `2024-04-15 13:45:30` |
+
+> 「加一个月」在 Polars 里必须走 `dt.offset_by()` —— Duration 只有天/时/分/秒这些固定单位，
+> 月份长度不固定，进不了 Duration。DuckDB 的 `INTERVAL 1 MONTH` 直接就是日历月。
+
+两点之差两边一致：`date_diff('day', '2024-01-01', '2024-03-01')` = 60，
+`(b - a).dt.total_days()` = 60。
+
+### 6. 时间轴的代价
+
+100 万行事件（每行一个时间戳）：
+
+**按天聚合**
+
+| 引擎 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB | **10.5** | 9.9 |
+| Polars | 24.7 | 22.0 |
+
+DuckDB 快约 **2.3×**（DuckDB / Polars = 0.43×）。
+
+**生成 100 万个小时点的时间轴**
+
+| 引擎 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB `generate_series` | 17.6 | 17.3 |
+| Polars `datetime_range` | **4.0** | 3.8 |
+
+Polars 快 **4.45×**。口径：输入已物化，计时的只有「按天聚合 + 结果物化」和「生成时间轴」。
+注意 DuckDB 的 `generate_series` 是**列表函数**，聚合时还得再 `unnest` 一次，
+这里为了两边做同一件事，用 `count(*)` 只测生成本身的成本。
+
+## 近似计算 vs 精确
+
+`src/approx_demo.py`。两个引擎都有 HyperLogLog（distinct 计数）和分位数 sketches。
+省内存的代价是「**答案不保证对**」—— 而且错的方向不固定。
+
+### 1. 同一个问题，两个答案
+
+100 万行、全部互不相同 → 正确答案就是 1,000,000：
+
+| 写法 | 结果 | 误差 |
+| --- | --- | --- |
+| DuckDB `count(DISTINCT id)` | 1,000,000 | 精确 |
+| DuckDB `approx_count_distinct(id)` | 982,272 | **-1.77%**（低估） |
+| Polars `n_unique()` | 1,000,000 | 精确 |
+| Polars `approx_n_unique()` | 1,008,747 | **+0.87%**（高估） |
+
+两个引擎的近似值都不是「精确值的小数版本」，而是**另一个数**。
+HLL 是概率结构，**没有「只多不少」的保证** —— 别指望近似值是个上界。
+
+### 2. 误差有多大：换个基数再看一遍
+
+| 基数 | DuckDB 近似值 | Polars 近似值 |
+| --- | --- | --- |
+| 1,000 | 978（-2.20%） | 1,002（+0.20%） |
+| 100,000 | 99,467（-0.53%） | 99,974（-0.03%） |
+| 1,000,000 | 982,272（-1.77%） | 1,008,747（+0.87%） |
+
+结论不是「谁更准」，而是：
+
+- 两个引擎的近似 distinct 误差都在**百分之几以内**，量级差不多。
+- **方向不固定**：这次 DuckDB 低估、Polars 高估，换个基数可能反过来。
+- **误差不随基数单调变小** —— 「基数够大就准」是常见印象，这三组数据不支持。
+
+> 拿近似值做「是否超过某个阈值」的判断要留余量；
+> 拿它和另一个近似值比大小则更危险（两个误差可能不同向）。
+
+### 3. 近似分位数：误差是「值」上的，不是「排名」上的
+
+| 分位 | 精确值 | DuckDB 近似 | Polars 近似 |
+| --- | --- | --- | --- |
+| 0.01 | 10000.0 | 9999 | 9996 |
+| 0.1 | 99999.9 | 100000 | 100256 |
+| 0.5 | 499999.5 | 504556 | 500075 |
+| 0.9 | 899999.1 | 899301 | 900031 |
+| 0.99 | 989999.0 | 990000 | 989996 |
+
+近似分位数返回的是一个**具体的值**，但这个值可能不在原始数据里
+（DuckDB 的 t-digest 会插值，Polars 的 KLL 返回采样出来的原值）。
+
+这一轮的分位数最大误差：DuckDB **-0.91%**，Polars **-0.26%**；
+同一批数据上 distinct 计数的误差是 **-1.77%**。
+
+**sketch 是随机的**：同一个查询连跑两次，数字也会变。
+所以别拿两次运行的近似值对账，也别指望某个分位一定比另一个准。
+
+Polars 单独提供 `req_lo` / `req_hi` 两种算法，是给尾部用的 ——
+默认的 `auto` 会在分位落在 `[0.05, 0.95]` 之外时自动切算法。
+
+### 4. 分布统计：histogram 和 value_counts
+
+| | DuckDB `histogram(b)` | Polars `value_counts()` |
+| --- | --- | --- |
+| 返回 | MAP：`{桶: 计数}` | 两列的表：值 + 计数 |
+| 本次 | 10 个桶，各 10000 | 10 行，各 10000 |
+
+两边都能给出**精确**的频数分布（DuckDB 的 `histogram` 在高基数时才是抽样近似）。
+Polars 没有 `histogram` 函数，但 `value_counts` + `group_by` 一样能用。
+
+想要「精确的 top-k」就别用近似函数 —— 近似函数省的是**内存**，不是时间。
+
+### 5. 值不值：省了多少时间，换了多少精度
+
+500 万行，值域 250 万（每个值平均出现两次），真实基数 2,500,000：
+
+| 实现 | 中位数 (ms) | 结果 | 误差 |
+| --- | --- | --- | --- |
+| DuckDB `count(DISTINCT)` | 54.7 | 2,500,000 | +0.00% |
+| DuckDB `approx_count_distinct` | **4.6** | 2,416,105 | **-3.36%** |
+| Polars `n_unique()` | 55.7 | 2,500,000 | +0.00% |
+| Polars `approx_n_unique()` | 28.3 | 2,518,495 | +0.74% |
+
+DuckDB 的近似计数比精确快约 **11.9×**，Polars 的快约 **2.0×**。
+
+- 精确计数的成本随**基数**（不是行数）增长，内存放不下就得退化。
+- 近似计数是常数内存，代价是答案有误差。
+- 两个引擎的近似实现不同（都是 HLL，但参数和修正策略不一样），误差方向也不同 —— 别把两个近似值直接比大小。
+- 真要精确，就把基数控制在能放下的范围，别拿近似值凑。
+
 ## 目录结构
 
 ```
@@ -1289,6 +2262,14 @@ duckdb-polars-demo/
 │   ├── tz_demo.py          # 日期时间与时区：精度 / 会话时区 / 夏令时 / Parquet 往返
 │   ├── order_demo.py       # 排序稳定性：NULL 位置 / 并列顺序 / LIMIT 后果
 │   ├── partition_demo.py   # 多文件与分区表：glob / schema 冲突 / 分区裁剪
+│   ├── window_demo.py      # 窗口函数：默认 frame / frame 家族 / 命名窗口 / QUALIFY
+│   ├── agg_demo.py         # 聚合语义：分位数插值 / 众数 / arg_max 并列 / 整数溢出
+│   ├── setop_demo.py       # 集合运算与去重：NULL 参与比较 / UNION / DISTINCT ON
+│   ├── regex_demo.py       # 正则与字符串：分组编号 / 切分 / 位置 / 字节与字符
+│   ├── dml_demo.py         # 增删改：UPDATE / upsert / 子查询快照 / 事务
+│   ├── schema_demo.py      # Schema 演进：ALTER TABLE / 大小写 / 读不一致的 schema
+│   ├── timeseries_demo.py  # 时间轴与序列生成：端点语义 / 补齐空档 / 截断 / 间隔
+│   ├── approx_demo.py      # 近似 vs 精确：HLL 误差 / 近似分位数 / 值不值
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     └── bench.sh            # 一键跑完整流程
@@ -1331,3 +2312,11 @@ duckdb-polars-demo/
 - Polars `write_parquet`：<https://docs.pola.rs/api/python/stable/reference/polars/api/polars.DataFrame.write_parquet.html>
 - Polars `sort`（`maintain_order`）：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.sort.html>
 - Polars `n_unique`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.n_unique.html>
+- DuckDB 窗口函数：<https://duckdb.org/docs/stable/sql/functions/window_functions>
+- DuckDB 正则表达式：<https://duckdb.org/docs/stable/sql/functions/regular_expressions>
+- DuckDB 集合运算：<https://duckdb.org/docs/stable/sql/query_syntax/setops>
+- DuckDB ALTER TABLE：<https://duckdb.org/docs/stable/sql/statements/alter>
+- DuckDB 近似聚合函数：<https://duckdb.org/docs/stable/sql/functions/aggregate_functions>
+- Polars `over`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.over.html>
+- Polars `upsample`：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.upsample.html>
+- Polars `approx_quantile`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.approx_quantile.html>
