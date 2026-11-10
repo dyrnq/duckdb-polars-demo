@@ -55,22 +55,8 @@ ENGINES = ("duckdb", "polars")
 
 # ---------------------------------------------------------------- 机器状态
 
-
-def load1() -> float:
-    """1 分钟平均负载（/proc/loadavg 的第一个数）。"""
-    with open("/proc/loadavg", encoding="utf-8") as fh:
-        return float(fh.read().split()[0])
-
-
-def describe_machine() -> str:
-    """机器负载的一句话描述 —— 数字被谁压着，必须一起看。"""
-    cpus = os.cpu_count() or 1
-    ld = load1()
-    if ld > cpus:
-        return f"{cpus} 核，load1 = {ld:.1f}（> 核数 → 机器正被别人占着，数字是「有竞争时」的）"
-    if ld > cpus * 0.6:
-        return f"{cpus} 核，load1 = {ld:.1f}（偏高，测量结果会偏保守）"
-    return f"{cpus} 核，load1 = {ld:.1f}（空闲）"
+load1 = common.load1
+describe_machine = common.describe_machine
 
 
 # ---------------------------------------------------------------- 造数
