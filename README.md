@@ -31,6 +31,19 @@
 
 实测环境：Python 3.13.5、DuckDB 2.0.0、Polars 2.1.0、8 核 x86_64 Linux。
 
+两个平台都能跑，但有几处「量机器状态」的代码要换实现 —— `/proc` 是 Linux 独有的：
+
+| 测什么 | Linux | macOS |
+| --- | --- | --- |
+| 机器负载 load1 | `/proc/loadavg` | `os.getloadavg()`（底层是 sysctl） |
+| 子进程峰值内存 | `/proc/self/status` 的 `VmHWM` | `resource.getrusage` 的 `ru_maxrss`（那边单位是**字节**，不是 KiB） |
+| 进程当前 RSS | `/proc/self/statm` | 同上，退回到峰值 |
+| 物理内存 | `/proc/meminfo` 的 `MemTotal` | `os.sysconf("SC_PHYS_PAGES")` |
+
+负载读不到时（比如在容器里、`/proc` 没挂载），demo 会**明说「读不到」**，
+而不是报一个假的 0.0 —— 「量不到」和「机器很闲」是两回事，
+后者会直接影响那些性能结论到底能不能信。
+
 ## 快速开始
 
 ```bash
@@ -3959,7 +3972,8 @@ lf.collect(streaming=True)
 ### 6. 谁在管内存：峰值 RSS 实测
 
 每个实现单独跑在独立子进程里，用 `/proc/self/status` 的 `VmHWM` 报它自己占了多少
-（不能用 `ru_maxrss`：Linux 上它会被子进程从父进程继承，测出来会一排相同）。
+（不能用 `ru_maxrss`：Linux 上它会被子进程从父进程继承，测出来会一排相同；
+macOS 没有 `/proc`，那边才退回 `ru_maxrss`）。
 基线（只 import 引擎）：DuckDB 66.0 MB · Polars 55.8 MB。
 
 | 实现 | 峰值 RSS (MB) | 减去基线 | 结果行数 |

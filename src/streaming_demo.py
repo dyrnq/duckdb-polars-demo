@@ -58,8 +58,9 @@ def current_rss_mb() -> float:
             pages = int(fh.read().split()[1])
         return pages * resource.getpagesize() / 1024 / 1024
     except OSError:
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return peak / 1024
+        # macOS 没有 /proc，退回峰值 —— 单位换算在 common 里统一做了
+        # （那边 ru_maxrss 是字节，Linux 上是 KiB）
+        return common.ru_maxrss_mb()
 
 
 class RssSampler:

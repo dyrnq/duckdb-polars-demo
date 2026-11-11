@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -56,6 +57,7 @@ ENGINES = ("duckdb", "polars")
 # ---------------------------------------------------------------- 机器状态
 
 load1 = common.load1
+load1_text = common.load1_text
 describe_machine = common.describe_machine
 
 
@@ -283,7 +285,7 @@ def main() -> None:
         for engine, threads in combos:
             row[(engine, threads)] = run_worker(engine, threads, args.repeat)
         rounds.append(row)
-        print(f"  第 {r + 1}/{args.rounds} 轮完成（当时 load1 = {load1():.1f}）")
+        print(f"  第 {r + 1}/{args.rounds} 轮完成（当时 load1 = {load1_text()}）")
 
     agg = aggregate(rounds)
 
@@ -419,7 +421,10 @@ def main() -> None:
         print(f"    {common.pad(engine, 8)}{best_t} 线程（{detail}）")
     print()
     print(f"  · 机器状态：{describe_machine()}")
-    if load1() > (os.cpu_count() or 1):
+    # 负载读不到时（NaN）不报警 —— 上面那句「机器状态」里已经说了读不到，
+    # 这里再编一个「高负载」出来才是假的
+    ld = load1()
+    if not math.isnan(ld) and ld > (os.cpu_count() or 1):
         print("    ⚠ 负载 > 核数：这些加速比是「和别人抢 CPU 时」测到的。")
         print("      多线程引擎在这种条件下最吃亏（线程越多，抢不到的时间越多），")
         print("      想看引擎真实上限，等机器空闲时再跑一遍。")

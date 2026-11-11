@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import math
+import os
+import sys
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -141,20 +143,56 @@ def compare_frames(
 
 
 # ---------------------------------------------------------------- 机器状态
+#
+# README 里写的是「Linux / macOS」，所以凡是碰平台专有的东西都得有回退路径：
+# /proc 是 Linux 独有的，ru_maxrss 两边的单位还不一样。
+#
+# 一条原则：**读不到就说读不到**。拿一个假的数字（比如 0.0）去充数，
+# 等于把「我量不到」说成「机器很闲」—— 后者会直接影响那些性能结论的可信度。
 
 
 def load1() -> float:
-    """1 分钟平均负载（/proc/loadavg 的第一个数）。"""
-    with open("/proc/loadavg", encoding="utf-8") as fh:
-        return float(fh.read().split()[0])
+    """1 分钟平均负载。
+
+    Linux 走 /proc/loadavg（内核给的值，截断到两位小数）；
+    macOS / BSD 没有这个文件，走 os.getloadavg()（底层是 sysctl）。
+    两个都读不到就返回 NaN ——「读不到」和「负载是 0」不是一回事，
+    describe_machine() 会照实说读不到，不会假装机器是空闲的。
+    """
+    try:
+        with open("/proc/loadavg", encoding="utf-8") as fh:
+            return float(fh.read().split()[0])
+    except OSError:
+        pass
+    try:
+        return os.getloadavg()[0]
+    except (AttributeError, OSError):
+        return float("nan")
+
+
+def load1_text() -> str:
+    """负载的显示形式 —— 读不到就明说读不到，不显示成一个假的 0.0。"""
+    ld = load1()
+    return "读不到" if math.isnan(ld) else f"{ld:.1f}"
+
+
+def ru_maxrss_mb() -> float:
+    """resource.getrusage 的 ru_maxrss，换算成 MB。
+
+    两边单位不一样：Linux 上是 KiB，macOS 上是**字节**（差 1024 倍）。
+    """
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / 1024 / 1024 if sys.platform == "darwin" else peak / 1024
 
 
 def describe_machine() -> str:
     """机器负载的一句话描述 —— 这台是共享开发机，数字被谁压着必须一起看。"""
-    import os
-
     cpus = os.cpu_count() or 1
     ld = load1()
+    if math.isnan(ld):
+        return f"{cpus} 核，load1 读不到（不是 Linux/macOS，或者 /proc 没挂载）"
     if ld > cpus:
         return f"{cpus} 核，load1 = {ld:.1f}（> 核数 → 机器正被别人占着，数字是「有竞争时」的）"
     if ld > cpus * 0.6:

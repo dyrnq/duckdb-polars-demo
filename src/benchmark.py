@@ -14,7 +14,6 @@ import argparse
 import json
 import os
 import platform
-import resource
 import statistics
 import sys
 import time
@@ -29,10 +28,7 @@ import polars_demo
 
 def peak_rss_mb() -> float:
     """进程峰值 RSS（MB）。ru_maxrss 是单调高水位，不会随查询结束回落。"""
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":  # macOS 返回字节，Linux 返回 KiB
-        return peak / 1024 / 1024
-    return peak / 1024
+    return common.ru_maxrss_mb()
 
 
 def timeit(fn, repeat: int, warmup: int) -> list[float]:

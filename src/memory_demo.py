@@ -47,6 +47,8 @@ LIMIT_LADDER = (10, 20, 30, 40, 50, 60, 80, 100)
 # 峰值读的是 /proc/self/status 的 VmHWM（**当前地址空间**的峰值）。
 # 别用 resource.getrusage 的 ru_maxrss：Linux 上子进程 fork 之后会**继承**
 # 父进程的 ru_maxrss，父进程之前占过多少，子进程就报多少 —— 测出来会是一排相同的数。
+# （macOS 没有 /proc，那边用 posix_spawn 起子进程、不存在这个继承问题，
+#   所以回退到 ru_maxrss 是安全的 —— 注意那边 ru_maxrss 的单位是**字节**。）
 #
 # 最后一个参数是 temp_directory：DuckDB 默认的临时目录是 `.tmp`（相对于当前工作目录），
 # 不指走的话它会往仓库根目录里写东西。
@@ -102,12 +104,19 @@ else:
     n = lf.collect(engine=mode).height
     effective = "-"
 
-peak_kb = 0
-with open("/proc/self/status") as fh:
-    for line in fh:
-        if line.startswith("VmHWM:"):
-            peak_kb = int(line.split()[1])
-print(f"{n}|{peak_kb / 1024:.1f}|{effective}")
+peak_mb = 0.0
+try:
+    with open("/proc/self/status") as fh:
+        for line in fh:
+            if line.startswith("VmHWM:"):
+                peak_mb = int(line.split()[1]) / 1024
+except OSError:
+    # macOS 没有 /proc：退回 ru_maxrss（那边不存在「子进程继承父进程峰值」的问题）
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_mb = peak / 1024 / 1024 if sys.platform == "darwin" else peak / 1024
+print(f"{n}|{peak_mb:.1f}|{effective}")
 """
 
 
@@ -154,12 +163,18 @@ def parse_size(text: str) -> float:
 
 
 def system_memory_gib() -> float:
-    """机器的物理内存（GiB）。"""
-    with open("/proc/meminfo", encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("MemTotal:"):
-                return int(line.split()[1]) / 1024 / 1024
-    return 0.0
+    """机器的物理内存（GiB）。Linux 读 /proc/meminfo，macOS 走 sysconf。"""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except OSError:
+        pass
+    # macOS / BSD 没有 /proc/meminfo，用 sysconf 问系统要同样两个数
+    pages = os.sysconf("SC_PHYS_PAGES")
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    return pages * page_size / 1024**3
 
 
 def peak_rss(mode: str, src: str, mem: str, groups: int, spill: str) -> tuple[int, float, str]:
@@ -588,7 +603,8 @@ def scenario_who_controls_memory(src: Path, spill: Path, limit_mb: int) -> None:
     print(f"数据：parquet {src.stat().st_size / 1e6:.1f} MB")
     print("测法：每个实现单独起一个子进程，跑同一个聚合，")
     print("      用 /proc/self/status 的 VmHWM（当前地址空间的内存峰值）报它自己占了多少。")
-    print("      （不能用 ru_maxrss：Linux 上它会被子进程从父进程继承，测出来会一排相同。）")
+    print("      （不能用 ru_maxrss：Linux 上它会被子进程从父进程继承，测出来会一排相同；")
+    print("        macOS 没有 /proc，那边才退回 ru_maxrss。）")
 
     _, base_duck, _ = peak_rss("base-duckdb", str(src), "-", GROUPS, str(spill))
     _, base_polars, _ = peak_rss("base-polars", str(src), "-", GROUPS, str(spill))
