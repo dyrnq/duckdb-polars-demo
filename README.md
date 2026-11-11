@@ -195,6 +195,8 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
+> **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
+
 两个平台各存各的 artifact（`demo-output-ubuntu-latest` / `demo-output-macos-latest`），别混着看 —— macOS 上没有 `/proc`，机器状态的读法不一样（`os.getloadavg()` / `ru_maxrss` / `os.sysconf`），报出来的负载数字跟 Linux 本来就不可比。
 
 ## 数据模型

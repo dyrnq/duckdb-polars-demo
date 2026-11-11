@@ -84,6 +84,35 @@ DEMOS=(
   "fault_demo|--rows $ROWS --repeat $REPEAT"
 )
 
+# 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。
+# 这种漏法是静默的（CI 照样绿），所以在这里直接拦下来：
+# 加了 demo 就往清单里补一行，顺手定一下它的规模开关。
+#
+# sql.py 是例外：它要传一条 SQL 进去，是交互工具不是 demo。
+SKIP_LIST="sql"
+
+listed=$(printf '%s\n' "${DEMOS[@]}" | cut -d'|' -f1)
+missing=""
+for f in src/*.py; do
+  name=$(basename "$f" .py)
+  grep -q '__main__' "$f" || continue
+  case " $SKIP_LIST " in *" $name "*) continue ;; esac
+  if ! printf '%s\n' "$listed" | grep -qx "$name"; then
+    missing="$missing $name"
+  fi
+done
+
+if [ -n "$missing" ]; then
+  echo "❌ 这些脚本能直接跑，但不在 ci_demos.sh 的清单里，CI 不会跑它们："
+  for name in $missing; do
+    echo "     src/${name}.py"
+  done
+  echo
+  echo "   把它们加进上面 DEMOS 数组（顺便定一下规模开关："
+  echo "   --rows / --repeat / --repeats / --rounds / --files / --trades / --quotes）。"
+  exit 1
+fi
+
 failed=0
 total=0
 : > "$OUT/summary.tsv"
