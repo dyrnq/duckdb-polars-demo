@@ -19,6 +19,8 @@
 | 文件布局 | 多文件与分区表：schema 冲突、分区裁剪、往返保真 |
 | 性能 | 相同数据规模下的耗时对比；结果等价性校验 |
 | 语义覆盖面 | 窗口 / 聚合 / 集合运算 / 正则 / 增删改 / Schema / 时间轴 / 近似计算 —— 每个都有一份实测对账 |
+| 形状与能力 | 多维聚合 / 透视重塑 / 嵌套类型 / 查询计划 / 采样 / 约束 / DDL / 内存 —— 引擎能做什么、不能做什么 |
+| 边界与容错 | 算术边界 / 存在性查询 / 递归计算 / 坏数据 —— 出错时是「炸掉」还是「安静地算错」 |
 
 ## 环境要求
 
@@ -92,6 +94,18 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `schema_demo.py` | Schema 演进：ALTER TABLE、标识符大小写、类型转换、读不一致的 schema、拼表 |
 | `timeseries_demo.py` | 时间轴与序列生成：端点语义、时间类型、补齐空档、截断、间隔加减 |
 | `approx_demo.py` | 近似计算 vs 精确：HLL 误差方向与量级、近似分位数、histogram、值不值 |
+| `arith_demo.py` | 数值与算术边界：除法语义、取模符号、舍入规则、整数溢出、除以零 |
+| `groupsets_demo.py` | 多维聚合：GROUPING SETS / ROLLUP / CUBE，以及 Polars 侧的手工复刻 |
+| `pivot_demo.py` | 透视与重塑：PIVOT / UNPIVOT 的形状、缺失组合填充、往返保真 |
+| `nested_demo.py` | 嵌套类型：LIST / STRUCT / MAP 与 DuckDB 2.0 的 lambda 语法变更 |
+| `plan_demo.py` | 查询计划：EXPLAIN 的两种形状、投影裁剪与过滤下推 |
+| `sample_demo.py` | 采样与随机：system / bernoulli / reservoir、种子可复现性 |
+| `constraint_demo.py` | 约束与完整性：PK / FK / CHECK / NOT NULL、序列 |
+| `ddl_demo.py` | 视图、宏与持久化对象：CREATE VIEW / MACRO / SEQUENCE，物化视图的缺席 |
+| `memory_demo.py` | 内存上限与落盘：memory_limit、temp_directory、流式引擎 |
+| `exists_demo.py` | 存在性查询与半连接：EXISTS / IN / NOT IN 与 semi / anti join |
+| `recursive_demo.py` | 递归 CTE 与迭代计算：WITH RECURSIVE 与 Polars 侧的替代写法 |
+| `fault_demo.py` | 容错模式与坏数据：ignore_errors / store_errors / try_cast |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -122,6 +136,18 @@ uv run python src/dml_demo.py --rows 2000000 --repeat 5
 uv run python src/schema_demo.py --rows 2000000 --repeat 5
 uv run python src/timeseries_demo.py --rows 2000000 --repeat 5
 uv run python src/approx_demo.py --rows 10000000 --repeat 5
+uv run python src/arith_demo.py --rows 5000000 --repeat 5
+uv run python src/groupsets_demo.py --rows 2000000 --repeat 5
+uv run python src/pivot_demo.py --rows 2000000 --repeat 5
+uv run python src/nested_demo.py --rows 2000000 --repeat 5
+uv run python src/plan_demo.py --rows 2000000 --repeat 5
+uv run python src/sample_demo.py --rows 5000000 --repeat 5
+uv run python src/constraint_demo.py --rows 2000000 --repeat 5
+uv run python src/ddl_demo.py --rows 2000000 --repeat 5
+uv run python src/memory_demo.py --rows 2000000 --repeat 5
+uv run python src/exists_demo.py --rows 2000000 --repeat 5
+uv run python src/recursive_demo.py --rows 2000000 --repeat 5
+uv run python src/fault_demo.py --rows 2000000 --repeat 5
 ```
 
 用 DuckDB 交互式探索数据：
@@ -306,6 +332,57 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 | 81 | 加一个月 | `INTERVAL 1 MONTH` 就是日历月 | `pl.duration()` **没有 months** | Polars 侧用 `dt.offset_by("1mo")` |
 | 82 | 近似 distinct | `approx_count_distinct`（HLL），本轮**偏低** | `approx_n_unique`（HLL），本轮**偏高** | 误差方向不固定，别比大小 |
 | 83 | 近似分位数 | `approx_quantile`（t-digest） | `approx_quantile`（KLL / REQ，可选算法） | 随机 sketch，每次运行结果都不同 |
+| 84 | 负数整除与取模 | `//` **向零截断**（`-7//3` = -2）；`%` 是**截断余数**（`-7%3` = -1），跟 C 一致 | `//` **向下取整**（`-7//3` = -3）；`%` 是 **floor mod**（`-7%3` = 2），跟 Python 一致 | 两边各自对齐了不同的「事实标准」，负数参与时结果**不是差 1 的关系** |
+| 85 | 除法不是整除 | `7/2` = **3.5**（`/` 永远浮点，`typeof` 是 DOUBLE） | `7/2` = 3.5 | 两边一致；但 DuckDB **不**像 Postgres 那样整除，要整数除法得写 `//` |
+| 86 | 舍入规则 | `round` **四舍五入远离零**（`round(2.5)` = 3，`round(-2.5)` = -3），对齐 Excel | `round` **银行家舍入**（`round(2.5)` = 2，`round(-2.5)` = -2），对齐 Python | 账单场景必须显式选一边，差 1 分就是差 1 分 |
+| 87 | 整数溢出 | **报错** `OutOfRangeException: Overflow in addition of INT32` | **静默绕回**（Int32 最大值 + 1 = -2147483648） | Polars 侧改用 Decimal，或在写库前自己检查量级 |
+| 88 | 整数除零 | **报错** `InvalidInputException`（`try()` / `SET error_on_division_by_zero=false` 可变 NULL） | 返回 **NULL**，不报错 | DuckDB 当场炸、Polars 安静传播 —— 迁移时最容易漏的一类 |
+| 89 | 截断取整 | 有 `trunc(x)` / `trunc(x, n)` | **没有**同名函数 | `cast(pl.Int64)`（向零截断）或 `floor()`（向下），负数上两者不同 |
+| 90 | NaN 的比较 | `nan = nan` 为 True，`nan > 1` 为 True | 同左 | 两边一致，但都**不是** IEEE 语义（IEEE 说 NaN ≠ NaN） |
+| 91 | 多维小计 | `ROLLUP` / `CUBE` / `GROUPING SETS` 全支持 | **三个都没有** | Polars 侧只能两次 `group_by` + `concat` 手工拼 |
+| 92 | 小计的占位 NULL | `GROUPING(g)` 能区分「占位」和「真 NULL」 | **没有 `GROUPING()`** | 信息在拼 `concat` 时就丢了，只能自己加一列 `level` 标记 |
+| 93 | PIVOT 的缺失组合 | 填 **NULL** | `sum` 填 **0**、`max` 填 NULL；**没有 `fill_value` 参数** | 语义不同：`WHERE 服饰 IS NOT NULL` 两边给出不同的地区集合 |
+| 94 | PIVOT 的行序 | **不保证**（实测连跑 20 次出现 20 种顺序） | `maintain_order=True`，稳定 | DuckDB 侧对账前必须先 `ORDER BY` |
+| 95 | 多列 PIVOT 的列名 | `a_x`（下划线拼接） | `{"a","x"}`（元组字符串）；`column_naming='combine'` 是 `v_{"a","x"}` | 只能自己 `rename` |
+| 96 | UNPIVOT 的 NULL | 简化语法**丢 NULL**（12 格 → 7 行）；`UNPIVOT INCLUDE NULLS` 才留 | **永远全留** | DuckDB 侧先看用的是哪种语法 |
+| 97 | `ignore_errors` | **丢整行**（实测 8 行物理数据只剩 7 行） | **保留行、只把坏字段置 NULL**（仍是 8 行） | Polars 侧要再丢一次空行才能对上 |
+| 98 | 坏行记账 | `store_rejects=true` + `reject_errors` 表（行号 / 列名 / 原始行 / 错误类型） | **没有** | 想记账只能用 DuckDB |
+| 99 | 脏 CSV 的类型推断 | 嗅探到脏值会**把整列降成 VARCHAR**，不报错 | 同样降成 String，不报错 | 两边一致但危险 —— 显式给 schema |
+| 100 | 嵌套类型的构造方式 | **字面量**（`SELECT [1,2,3]`），类型由值推出来 | **dtype 声明**（`dtype=pl.List(pl.Int64)`） | 少写 dtype → Polars 把它当 Struct，`.map.keys()` 全不能用 |
+| 101 | MAP 的 dtype | `MAP{...}` 字面量，一定是 map | 光给 list of dict **不够**，必须 `dtype=pl.Map(...)` | 漏写就是 Struct，`.map.*` 全部报 InvalidOperationError |
+| 102 | 空列表求和 | `list_sum([])` → **NULL** | `list.sum()` → **0** | 差一个值不是差一个数：DuckDB 给的是 NULL，聚合时污染整列 |
+| 103 | 列表里的 NULL 成员判定 | `list_contains([1,NULL,3], NULL)` → **NULL** | `list.contains(None)` → **True** | 三值逻辑 vs 布尔；Polars 把 UNKNOWN 压成了 True |
+| 104 | lambda 语法 | DuckDB 2.0 **废弃 `x ->`**，必须 `lambda x: x*2`，否则 binder 报错 | 没有 lambda，对应物是 `pl.element()` | 1.x 迁 2.0 是**编译期就炸**；逃生口 `SET lambda_syntax='ENABLE_SINGLE_ARROW'` |
+| 105 | 列表归约函数 | 有 `list_reduce` / `list_position` | **两个都没有** | 自己 fold，或者退回 `explode` 之后用普通算子 |
+| 106 | EXPLAIN 默认给什么 | **物理计划**（盒式图，默认 `physical_only`） | **优化后**的算子树（缩进树，`optimized=True` 是默认） | Polars 想看优化前要显式 `optimized=False`；DuckDB 要改 `PRAGMA explain_output` |
+| 107 | EXPLAIN 会不会执行 | `EXPLAIN` 不执行，`EXPLAIN ANALYZE` **会执行** | `explain()` 不执行 | 大表上别随手 ANALYZE —— 它是真的把查询跑一遍 |
+| 108 | 运行时指标 | profiling JSON 有 `io.total_bytes_read`（实测查 2 列 = 查 12 列的 **7.1%**） | **一个都没有** | Polars 只能自己套 `time.perf_counter()`，拿不到引擎内部数字 |
+| 109 | 算子的算法选择 | 计划里写明 `Perfect Hash Group By` / `Hash Join` / `Piecewise Merge Join` | 永远只写 `AGGREGATE` / `INNER JOIN` | 「会不会退化」这个问题，只有 DuckDB 的计划能回答 |
+| 110 | 逐节点计时 | —— | `profile()` 在 2.0 **已移除**；`show_graph()` 还要 matplotlib | Polars 侧能看的只有 `explain()` 那几行文本 |
+| 111 | 默认采样方法 | `USING SAMPLE` 默认 **system（块采样）** | `sample()` 是 **reservoir** 口径 | 小表上 DuckDB 只给 **0 行或全量**，中间值一个都不出现 |
+| 112 | 采样行数准不准 | system 波动大（10 万行请求 10%，实测 **4,096 ~ 20,480**）；reservoir **精确命中** | 精确命中 | 想要确定行数只能写 `reservoir`，别用默认值 |
+| 113 | 采样 + 离散行数 | `bernoulli(100 ROWS)` → **ParserException** | `sample(n=100)` 正常 | bernoulli 只能按比例；报错原文里直接点名了替代方案 |
+| 114 | 随机种子 | `setseed()` 只管 `random()`，**管不住采样** | `seed=` 跟着调用走 | DuckDB 采样要复现得写 `USING SAMPLE 10% (bernoulli, 42)` |
+| 115 | 随机函数 | 只有 `random()`，**没有 `rand()` 这个别名** | **一个都没有**（只能退回 numpy） | 随机数从「引擎内部」搬到了「Python 进程里」，能做的事少一截 |
+| 116 | 约束 | PK / UNIQUE / NOT NULL / CHECK / FK **五种全支持**，写入时引擎强制执行 | **零个 assert API**，只有 `is_duplicated` / `null_count` / `n_unique` 这些原语 | 迁移时最危险的不是 API 对不上，是「少写一行，坏数据静默进去」 |
+| 117 | 约束的持久性 | 写在 `.duckdb` 文件里，**换进程换连接都还在** | 检查是**一次函数调用**，这次调了下次忘了就凭空消失 | DuckDB 一次投入长期生效；Polars 每个写入点都要重复投入 |
+| 118 | 序列 | `CREATE SEQUENCE` + `nextval()`，跨连接全局唯一，能当列默认值 | **没有序列**；`with_row_index()` 只是**当批次的行号**（从 0 开始、每次重数） | 重跑一次批次 id 全变 → 外键、增量同步、幂等写入全乱 |
+| 119 | `NOT IN` 遇 NULL | **一行都不剩**（三值逻辑 UNKNOWN，WHERE 只放行 TRUE） | `~is_in()` 正常返回（UNKNOWN 被压成 FALSE） | `NOT IN (子查询)` **一律改 `NOT EXISTS`**；加 `IS NOT NULL` 补救无效（NULL 在右表） |
+| 120 | 成员判定的三值逻辑 | IN 在 SELECT 列表里给 TRUE / FALSE / **NULL** | 只给 TRUE / FALSE | 需要 UNKNOWN 得自己补 —— Polars 侧没有现成的三值逻辑 |
+| 121 | 计划里的连接类型 | `EXISTS`→SEMI、`NOT EXISTS`→ANTI、`IN` 在 WHERE→SEMI、在 SELECT 列表→**MARK** | 没有对应物 | 同一个 `IN` 放 WHERE 和放 SELECT 列表，**改写结果不一样** |
+| 122 | 递归 | `WITH RECURSIVE` 一句 SQL | **没有**，只能逐层 join 或 `map_elements` | `map_elements` 版的 depth 是 **Int64**，DuckDB 递归 CTE 是 **Int32** |
+| 123 | 递归的收敛 | `UNION`（去重）= 求不动点，**会停**；`UNION ALL` 不会停 | 循环自己数轮数 | 从 Postgres 抄过来默认是 `UNION`；**抄反了的后果不是结果错，是跑不完** |
+| 124 | 递归的迭代上限 | **没有内置上限**（`max_expression_depth` 跟这事无关） | 循环是自己的，`range(1000)` / `break` 都是现成护栏 | DuckDB 侧必须自己在递归项里写 `WHERE depth < N` |
+| 125 | 命名持久对象 | 视图 / 宏 / 序列 / 触发器都是**数据库级**，写进 `.duckdb` 文件 | **没有「命名对象」这个概念** | Polars 的 LazyFrame 只是个变量名，不是对象名 |
+| 126 | 视图存的是什么 | 存 **SQL 文本**（不是结果），EXPLAIN 里**没有 VIEW 节点** | 存**执行计划** | 两边都是「配方」，但 DuckDB 的配方能落盘，Polars 的不能 |
+| 127 | 物化视图 | **没有** `CREATE MATERIALIZED VIEW`（ParserException 在 `MATERIALIZED` 这个 token 上） | 没有（只能 `write_parquet`） | 替代品是 CTAS 或定时覆盖写 parquet，刷新逻辑自己写 |
+| 128 | 触发器 | **有**，但只实现了子集：`AFTER ... FOR EACH STATEMENT` 可用，`BEFORE ... FOR EACH ROW` → NotImplementedException | **没有** | 「DuckDB 不支持触发器」这句话在 2.0 上不准确 —— 是「只实现了子集」 |
+| 129 | Python UDF 的持久性 | **连接级**，重连后 `CatalogException`（宏还在，UDF 没了） | 进程内的普通函数 | 跨进程要活就用宏；UDF 的真正代价是 DuckDB 对它**逐行**调用 |
+| 130 | 内存上限 | `SET memory_limit='50MB'`（回显成 **47.6 MiB**，DuckDB 认十进制） | **没有任何旋钮**（`pl.Config` 里带 mem 的设置项 = `[]`） | Polars 侧得自己套 cgroup / 容器限额 |
+| 131 | 溢写落盘 | `SET temp_directory='...'`，超了自动落盘（临时文件**用完即删**） | 没有 | Polars 只能靠流式引擎**降低峰值**，但降不了上限 |
+| 132 | 超限时的失败方式 | `OutOfMemoryException`（进程内可捕获，报错里带解法，**连接还能接着用**） | **没有内存异常类**，真不够时 Rust runtime abort 整个进程 | 「跑一半被 kill」在生产环境里最难查 |
+| 133 | 线程数与内存上限 | `memory_limit` 是全局预算，但**每线程各自持有缓冲区** → 8 线程反而 OOM，4 线程能跑完 | —— | 内存不够先调 `SET threads`，不是先调大上限（DuckDB 自己的报错第一条建议就是这个） |
+| 134 | `memory_limit` 的作用域 | **连接级**，新连接完全不受影响（连文件库重开也不记得） | —— | 同一个 Python 进程 `duckdb.connect()` 两次 = 两个互不相关的世界 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -314,6 +391,14 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 第 21~25 条在 `NULL 与三值逻辑`、第 26~27 条在 `金额与 Decimal`、第 28~29 条在 `JOIN 全景`、
 第 30~33 条在 `写入路径与事务`、第 34~36 条在 `CSV 读写与往返保真`、第 37~41 条在 `日期时间与时区`、
 第 42 条在 `排序稳定性`、第 43~47 条在 `多文件与分区表`、第 48 条在 `自定义函数（UDF）` 里展开。
+第 49~83 条在 `窗口函数`、`聚合函数语义`、`集合运算与去重`、`正则与字符串`、`增删改（DML）`、
+`Schema 演进`、`时间轴与序列生成`、`近似计算 vs 精确` 里展开；
+第 84~90 条在 `数值与算术边界` 里展开；第 91~92 条在 `多维聚合：GROUPING SETS / ROLLUP / CUBE`、
+第 93~96 条在 `透视与重塑：PIVOT / UNPIVOT`、第 97~99 条在 `容错模式与坏数据` 里展开；
+第 100~105 条在 `嵌套类型：LIST / STRUCT / MAP`、第 106~110 条在 `查询计划：EXPLAIN 与投影裁剪`、
+第 111~115 条在 `采样与随机`、第 116~118 条在 `约束与完整性`、
+第 119~121 条在 `存在性查询与半连接`、第 122~124 条在 `递归 CTE 与迭代计算`、
+第 125~129 条在 `视图、宏与持久化对象`、第 130~134 条在 `内存上限与落盘` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -368,6 +453,25 @@ con.register("t", polars_df)  # Polars -> DuckDB
 | 15 | 整数求和 | BIGINT sum → HUGEINT | Int64 sum 溢出静默回绕 | 先转 Int128 / Decimal |
 | 16 | 分位数插值 | `quantile_cont` = linear | `quantile()` 默认 nearest | `interpolation="linear"` |
 | 17 | 近似 distinct | HLL | HLL | 误差方向不固定 |
+| 18 | 多维小计 | `ROLLUP` / `CUBE` / `GROUPING SETS` | 三个都没有 | 两次 `group_by` + `concat` 手工拼 |
+| 19 | 小计的占位 NULL | `GROUPING()` 可区分占位与真 NULL | 没有 | 自己加一列 `level` 标记 |
+| 20 | PIVOT 的缺失组合 | 填 **NULL** | 填 **0**（`sum`） | 语义不同，`IS NOT NULL` 过滤结果不同 |
+| 21 | PIVOT 的行序 | 不保证 | 保证 | DuckDB 侧 `ORDER BY` |
+| 22 | UNPIVOT 的 NULL | 简化语法丢 / `INCLUDE NULLS` 留 | 全留 | DuckDB 侧用 `INCLUDE NULLS` |
+| 23 | `ignore_errors` | 丢整行 | 坏字段置 NULL，行还在 | Polars 侧再丢一次空行 |
+| 24 | 坏行记账 | `reject_errors` 表 | 没有 | —— |
+| 25 | `NOT IN` 的 NULL | 右表有一个 NULL 就**返回空集** | `~is_in()` 正常返回 | 改成 `NOT EXISTS` |
+| 26 | 约束 | PK / UNIQUE / NOT NULL / CHECK / FK **五种全支持** | **零个 assert API** | 自己用 `is_duplicated` 等原语拼 |
+| 27 | 序列 | `CREATE SEQUENCE` + `nextval()` | 没有 | 手工维护 offset（一致性没引擎兜底） |
+| 28 | 递归 | `WITH RECURSIVE` | 没有 | 逐层 join / `map_elements` |
+| 29 | 命名持久对象 | 视图 / 宏 / 序列 / 触发器都是**数据库级** | **没有这个概念** | —— |
+| 30 | 物化视图 | **没有** `CREATE MATERIALIZED VIEW` | 没有 | CTAS 或定时覆盖写 parquet |
+| 31 | 内存上限 | `SET memory_limit='50MB'` | **没有** | 自己套 cgroup / 容器限额 |
+| 32 | 默认采样 | **system（块采样）**，小表上非 0 即全 | reservoir，精确命中 | DuckDB 侧显式写 `reservoir` |
+| 33 | 随机函数 | `random()`（**没有 `rand()`**） | **一个都没有** | 退回 numpy |
+| 34 | lambda | 2.0 废弃 `x ->`，必须 `lambda x:` | 没有 lambda | 对应物是 `pl.element()` |
+| 35 | EXPLAIN 默认给什么 | **物理计划** | **优化后**的算子树 | —— |
+| 36 | 流式 collect | —— | `streaming=True` 在 2.0 **已移除** | `collect(engine="streaming")` |
 
 第 2 条还有个细节：Polars 的 `is_nan()` 对 NULL 返回 `null`（不是 `false`），别拿它直接当条件用。
 
@@ -2215,6 +2319,1720 @@ DuckDB 的近似计数比精确快约 **11.9×**，Polars 的快约 **2.0×**。
 - 两个引擎的近似实现不同（都是 HLL，但参数和修正策略不一样），误差方向也不同 —— 别把两个近似值直接比大小。
 - 真要精确，就把基数控制在能放下的范围，别拿近似值凑。
 
+## 数值与算术边界
+
+`src/arith_demo.py`。同一个算式，两个引擎给出**不同的数** —— 而且多数是「静默地不一样」。
+这一节讲的是：哪些差异会**算错数**，哪些会**安静地算错**。
+
+### 1. 除法：DuckDB 的 `/` 不是整数除法
+
+| 表达式 | DuckDB | Polars |
+| --- | --- | --- |
+| `7 / 2` | 3.5 | 3.5 |
+| `7 // 2` | 3 | 3 |
+| `-7 / 2` | -3.5 | -3.5 |
+| `-7 // 2` | **-2** | **-4** |
+| `7 % 2` | 1 | 1 |
+| `-7 % 2` | **-1** | **2** |
+
+`SELECT typeof(7/2)` 是 **DOUBLE**、`typeof(7//2)` 是 **INTEGER** ——
+DuckDB 的 `/` 永远是浮点。从 Postgres/MySQL 迁过来的人最容易在这里错：
+Postgres 的 `7/2` 是 `3`，DuckDB 是 `3.5`。
+
+两边的 `//` 和 `%` 对**负数**的定义也不同：
+
+- DuckDB 向**零截断**（跟 C/C++/Java 一致）：`-7//3` = -2，`-7%3` = -1
+- Polars 向**下取整**（跟 Python 一致）：`-7//3` = -3，`-7%3` = 2
+
+→ 负数参与整除/取模时，两边的结果**不是差 1 的关系，是完全不同的一套数**。
+
+### 2. 舍入：2.5 到底进位还是平局
+
+| 待舍入值 | DuckDB `round` | Polars `round` |
+| --- | --- | --- |
+| 0.5 | 1 | **0** |
+| 1.5 | 2 | 2 |
+| 2.5 | **3** | **2** |
+| 3.5 | 4 | 4 |
+| -0.5 | -1 | **-0** |
+| -1.5 | -2 | -2 |
+| -2.5 | **-3** | **-2** |
+
+两边用的是**两套舍入规则**：DuckDB 是**四舍五入（half away from zero）**，
+Polars 是**银行家舍入（half to even）**。前者对齐 Excel 的 `ROUND`，后者对齐 Python 内置 `round`。
+
+→ 这不是谁对谁错，是**两边各自对齐了不同的「事实标准」**。
+但账单、金额汇总这类场景，差 1 分就是差 1 分 —— 迁移时必须显式选一边。
+
+上取整 / 下取整两边一致（`ceil(-2.1)` = -2，`floor(-2.1)` = -3）。
+
+### 3. 整数溢出：DuckDB 报错，Polars 悄悄绕回
+
+```
+DuckDB: SELECT 2147483647 + 1
+  -> OutOfRangeException: Out of Range Error: Overflow in addition of INT32 (2147483647 + 1)!
+
+Polars: pl.Series([2147483647], dtype=pl.Int32) + 1
+  -> -2147483648        （正确答案 2147483648）
+```
+
+Int64 同理（`9223372036854775807 + 1` → `-9223372036854775808`），UInt8 也一样（255 + 1 → 0）。
+
+这是本 demo 里**最危险**的一条：
+
+- DuckDB **报错** —— 错在最早的地方，堆栈直接指到出问题的表达式。
+- Polars **静默绕回**（wrap-around）—— 错得很远：加法没错，**求和之后**才发现总额是负的。
+
+实务影响：金额/计数用 Int32 累加，跑到 21 亿就翻负；用 Int64 累加，同一个洞在更远处等着。
+想要「溢出即报错」的语义，Polars 侧要么改用 Decimal，要么在写库之前自己检查量级 —— 没有开关能把它变成 DuckDB 那样。
+
+### 4. 除以零：一边报错，一边给你 NULL
+
+| 表达式 | DuckDB | Polars |
+| --- | --- | --- |
+| `1 / 0` | inf | inf |
+| `0.0 / 0.0` | nan | nan |
+| `1 // 0` | **InvalidInputException（报错）** | **None** |
+| `1 % 0` | **InvalidInputException（报错）** | **None** |
+
+DuckDB 的报错原文：
+
+> Invalid Input Error: Division by zero in expression (1 // 0). Use TRY(...) to return NULL for
+> this expression, or SET error_on_division_by_zero=false to return NULL for all divisions by zero.
+
+→ 三种「除零」语义并存：浮点除法两边都给 inf/nan（符合 IEEE 754）；
+**整数除法 DuckDB 报错，Polars 给 NULL**。
+Polars 的 NULL 会一路传播，最后在某个不相干的地方变成「某列全是空」。
+
+迁移时最容易漏的就是这个：**DuckDB 会当场炸，Polars 会安静地传播** ——
+代码在 DuckDB 上跑得好好的，改成 Polars 之后不报错了，但结果是错的。
+
+顺带一提 NaN：两边都认为 `nan = nan` 为 True、`nan > 1` 为 True —— 一致，但**都不是** IEEE 语义。
+
+### 5. 截断取整：DuckDB 有 trunc，Polars 没有
+
+DuckDB 有 `trunc(x)` / `trunc(x, n)`（`trunc(2.7)` = 2，`trunc(-2.7)` = -2）；
+Polars **没有**同名函数。最接近的是 `cast(pl.Int64)`（**向零**截断）或 `floor()`（向下）——
+负数上两者不一样（`floor(-2.7)` = -3）。
+
+### 6. 算术的代价：取模比加减贵多少
+
+200 万行整数（`sum(v)` 的真值两边一致）：
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果 |
+| --- | --- | --- | --- |
+| DuckDB `sum(v)` | 1.3 | 1.3 | 1,000,001,983,749 |
+| DuckDB `sum(v % 7)` | 4.0 | 3.3 | 5,999,986 |
+| Polars `sum(v)` | 1.0 | 0.8 | 1,000,001,983,749 |
+| Polars `(v % 7).sum()` | 7.5 | 7.5 | 5,999,986 |
+
+
+口径：输入已物化成 parquet，两边读的是同一份数据；计时的只有「对这一列做一次聚合并求和」
+这一步（不含读盘）。重复次数取中位数，机器是共享开发机，单次数字会有抖动。
+
+解读：
+
+- 取模是**不可省的整数运算**，比单纯求和贵一截 —— 差的这部分就是 `%` 本身的成本，两边都要付。
+- 真正的差别在**语义**：DuckDB 的 `%` 会检查溢出，Polars 不会。
+  Polars 少做的那点检查，换来的是场景 3 里那个静默绕回。
+- 所以别为了「快一点」去 Polars 那边省溢出检查 —— 那个洞在 21 亿次累加之后才爆，
+  到时候查起来比慢一点贵多了。
+
+## 多维聚合：GROUPING SETS / ROLLUP / CUBE
+
+`src/groupsets_demo.py`。DuckDB 原生支持多维小计，**Polars 完全没有** ——
+`group_by` 只有一层，想要「明细 + 小计 + 总计」得自己拼。
+
+### 1. 先把共同语言定下来
+
+同样的 `GROUP BY region` / `group_by('region')`，两边结果**完全一致**（对账 ✅ 3 行 × 3 列）。
+连类型都有小差别（DuckDB 的 `sum(INTEGER)` 是 HUGEINT，落到 Arrow 是 DECIMAL；Polars 保持 Int64），
+但数值口径一样。
+
+所以下面所有差异，**都只来自「多级」这两个字**，不是聚合本身的事。
+
+### 2. ROLLUP：一条 SQL 出三层小计
+
+`GROUP BY ROLLUP(region, category)` 在 7 行明细上输出 **11 行** = 7 行明细 + 3 行地区小计 + 1 行总计，
+用到的 grouping set 组合是 **3 种**：`[(region, category), (region), ()]`。
+
+- n 个维度列 → **n+1** 个 grouping set（1 列 2 个、2 列 3 个、3 列 4 个）。
+- **输出行数由数据决定**（这里是 11 行），不是跟数据无关的固定值。
+- **小计行靠 NULL 占位**：地区小计那行 `category` 是 NULL，总计那行两列都是 NULL。
+
+### 3. CUBE：比 ROLLUP 多出来的那一层交叉小计
+
+`CUBE(region, category)` 是 **4** 个 grouping set（`(a,b)`、`(a)`、`(b)`、`()`），
+n 个维度列 → **2^n** 个 set。同一张表输出 **15 行** —— 比 ROLLUP 多的 4 行是「品类小计」：
+`region` 是 NULL、`category` 有值（每个品类全国总共卖了多少）。ROLLUP 里根本没有这一层。
+
+行数会膨胀：明细 7 行 → ROLLUP 11 行 → CUBE 15 行。维度越多，CUBE 的组数**指数级增长**
+（3 个维度 8 组、4 个维度 16 组）—— 所以报表里很少直接用 CUBE，而是先想清楚要哪几组。
+
+### 4. GROUPING SETS：自己点名要哪几组
+
+`GROUP BY GROUPING SETS ((region), (category))` 只要「地区小计」和「品类小计」，
+**不要明细、不要总计** —— 输出 7 行、2 组。
+
+它是 ROLLUP / CUBE 的**底层原语**（ROLLUP 就是特殊的 GROUPING SETS）。学会这一种，三种就都懂了。
+
+### 5. GROUPING()：占位 NULL 和真 NULL，长得一模一样
+
+这是本 demo 里**最反直觉**的一条。造一张 `region` 和 `category` 都真有 NULL 的表：
+
+| 层级 | region | category | amount |
+| --- | --- | --- | --- |
+| 明细 | 华东 | 数码 | 100 |
+| 明细 | NULL | 数码 | 50 |
+| 明细 | NULL | NULL | 7 |
+| 地区小计 | 华东 | NULL | 100 |
+| 地区小计 | NULL | NULL | 57 |
+| 总计 | NULL | NULL | 157 |
+
+**三行的 region 和 category 都是 NULL**，分别是明细行、地区小计、总计 —— 光看数据分不出来。
+
+用 `WHERE region IS NULL` 去捞小计行更糟：会捞出 **4 行**（2 行明细 + 1 行地区小计 + 1 行总计），
+**该排除的明细行一条没排掉**。
+
+`GROUPING(g)` 才能分清（返回 BIGINT 的 0/1）：
+
+| 层级 | `grouping(region)` | `grouping(category)` |
+| --- | --- | --- |
+| 明细 | 0 | 0 |
+| 地区小计 | 0 | 1 |
+| 总计 | 1 | 1 |
+
+→ `GROUPING(g)` 回答的是「这行的 g 是**占位符**吗」，不是「g 是不是 NULL」。
+真的 NULL 值 → `GROUPING()` = 0（它就是个普通的分组）；小计占位 → `GROUPING()` = 1。
+
+**Polars 没有 `GROUPING()`**。这不是「少个函数」的问题，是**信息本身丢了** —— 占位信息在拼 `concat`
+的那一刻就没了，只能自己额外带一列 `level` 标记。
+
+### 6. Polars 侧：手工复刻 ROLLUP
+
+```python
+cols     = ["region", "category", "amount"]
+detail   = df.group_by(["region", "category"]).agg(pl.col("amount").sum())
+subtotal = (df.group_by("region").agg(pl.col("amount").sum())
+              .with_columns(pl.lit(None, dtype=pl.String).alias("category")))
+total    = (df.select(pl.col("amount").sum().alias("amount"))
+              .with_columns(pl.lit(None, dtype=pl.String).alias("region"))
+              .with_columns(pl.lit(None, dtype=pl.String).alias("category")))
+result   = pl.concat([detail.select(cols), subtotal.select(cols), total.select(cols)],
+                      how="vertical")
+```
+
+对账上是过的（✅ 11 行 × 3 列全部一致），但代价是：**两次聚合 + 一次 concat + 手工补占位列**，
+而且**丢掉了一维信息**（哪些 NULL 是占位）。
+
+「DuckDB 一行 SQL vs Polars 十五行 Python」不是玩笑 —— 每加一个维度，Polars 要多一次 `group_by`。
+
+### 7. 代价：多级小计两边各要多久
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果行数 |
+| --- | --- | --- | --- |
+| DuckDB `GROUP BY region, category` | 17.1 | 16.1 | 30 |
+| Polars `group_by(region, category)` | 8.2 | 8.1 | 30 |
+| DuckDB `GROUP BY ROLLUP(...)` | 18.2 | 15.0 | 36 |
+| Polars 手工复刻 ROLLUP | 14.1 | 13.4 | 36 |
+
+口径：输入已物化成 parquet，两边读的是同一份数据；
+计时的只有「分组聚合 + 拿到完整结果表」这一步（不含读盘）。
+两边最终产出的都是同一个 `pl.DataFrame`（DuckDB 那边走 Arrow 转换，
+Polars 那边是原生的），产出的行数也已经对过账。
+前两行做的是**同一件事**（只要明细），可以直接比大小；
+后两行产出的**结果集也相同**，但**过程不同**：
+DuckDB 一条 SQL 一次扫完，Polars 侧要两次 `group_by` + 一次 `concat`，
+所以后两行比的是「为了同样的结果各要付出多少」，不是「同样的活谁快」。
+重复次数取中位数，机器是共享开发机，单次数字会有抖动。
+
+**别拿 ROLLUP 的两行去比「算法谁更优」** —— 一个是原生能力，一个是手工模拟，
+测的是「要不要自己实现」，不是「实现得好不好」。
+
+真正该记住的是场景 5 那条：**省下来的代码，省不掉信息**。
+Polars 侧就算跑得赢，也一样分不出「占位 NULL」和「真 NULL」。
+
+## 透视与重塑：PIVOT / UNPIVOT
+
+`src/pivot_demo.py`。两边都有原生语法，但**输出的东西不是同一个东西** ——
+差异不止在列名，还在「没有数据」这件事怎么表示。
+
+### 1. 形状：列名一样，顺序不一样，行序更不一样
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 列名 | 键的**值**：`数码`、`家居`…… | 同左 ✅ |
+| 列顺序 | 按键值排序 | 按数据里的出现顺序 |
+| 行序 | **不保证** | `maintain_order=True`，是稳的 |
+
+DuckDB 的 `PIVOT` 里没有 `ORDER BY`，行序由聚合算子决定 —— 实测同一连接**连跑 20 次就出现了
+20 种不同的地区顺序**。Polars 加 `sort_columns=True` 就能把列序跟 DuckDB 对上。
+
+→ **DuckDB 侧任何对账都必须先 ORDER BY**（或者排序后再比），否则对出来的差异全是假的。
+
+### 2. 缺失组合：一个填 NULL，一个填 0
+
+| 写法 | 「华东 × 服饰」（数据里没有这个组合） |
+| --- | --- |
+| DuckDB `USING sum(amount)` | **NULL** |
+| Polars `aggregate_function="sum"` | **0** |
+| Polars `aggregate_function="max"` | NULL |
+
+3 × 4 = 12 个格子里，**DuckDB 有 5 个空格子，Polars 一个都没有**。
+
+而且 **Polars 的 `pivot()` 没有 `fill_value` 参数** —— 填充值是聚合函数的副产品：
+`sum` 填 0，`max` / `first` 填 NULL，你选不了。
+
+这带来的后果不是显示层的差别，是**语义的差别**：
+
+```
+WHERE 服饰 IS NOT NULL
+  DuckDB: ['华北']
+  Polars: ['华东', '华北', '华南']
+```
+
+在 DuckDB 那边这个条件是「这个地区卖过服饰」，在 Polars 那边是「这个地区有服饰这一行」——
+后者永远为真。报表里「有销量的地区」这种筛选，两边会给出**不同的地区集合**。
+
+### 3. 列的集合：两边都能钉死
+
+DuckDB 用 `PIVOT ... ON category IN (数码, 家居, 服饰, 食品, 美妆)`，
+Polars 用 `pivot(on_columns=[...])` —— 都能让「数据里没出现过的美妆」也占一列。
+
+**但列齐了不等于值齐了**：上面那个对账 ❌ 的原因就是「美妆」那一列，DuckDB 给 NULL、Polars 给 0。
+
+### 4. 多列 pivot：列名格式根本对不上
+
+| | 列名 |
+| --- | --- |
+| DuckDB | `a_x`、`a_y`、`b_x`、`b_y` |
+| Polars | `{"a","x"}`、`{"a","y"}`、`{"b","x"}`、`{"b","y"}` |
+| Polars `column_naming='combine'` | `v_{"a","x"}`（值名 + 元组） |
+
+这不是能靠参数对齐的 —— Polars 没有「用下划线拼接元组」这个选项，要对上只能自己 `rename`。
+
+**多列 pivot 是「列名格式」这条差异第一次露头的地方**：单列 pivot 时两边列名一样，
+多列 pivot 时两边各写各的 → 迁移时凡是用了多列 pivot，**输出表的列名大概率要改**。
+
+### 5. UNPIVOT：DuckDB 自己有两种语法，NULL 行为相反
+
+| 写法 | 12 个格子变成几行 |
+| --- | --- |
+| DuckDB 简化语法 `UNPIVOT t ON ... INTO NAME c VALUE v` | **7 行**（丢掉 NULL 行） |
+| DuckDB 标准语法 `FROM t UNPIVOT INCLUDE NULLS (...)` | **12 行** |
+| Polars `df.unpivot(...)` | **12 行** |
+
+简化语法**连 `INCLUDE NULLS` 都写不了**：
+
+```
+ParserException: Parser Error: syntax error at or near "INCLUDE"
+```
+
+→ **口径要对齐，先看语法**：DuckDB 侧写哪个语法决定了 NULL 的去留；
+Polars 侧没有开关，永远是「全留」。
+
+### 6. 往返：PIVOT → UNPIVOT 能不能还原
+
+起点是 7 行的长表：
+
+| | 往返后的行数 | 对账 |
+| --- | --- | --- |
+| DuckDB（简化 UNPIVOT） | 7 行 | ✅ 与原始长表一致 |
+| DuckDB（`INCLUDE NULLS`） | 12 行 | 多出来的 5 行是 **NULL** |
+| Polars | 12 行 | ❌ 多出来的 5 行是 **0** |
+
+**两边的往返都不完全无损，但丢的东西不一样**：
+
+- DuckDB（简化 UNPIVOT）把缺失的组合**直接扔了** —— 看起来还原了，
+  其实是因为它把「没有这条数据」和「这条数据是 0」混为一谈了。
+- Polars 把缺失的组合**变成 0 留下来** —— 凭空多出几行零。
+- 真正正确的是 DuckDB 的 `INCLUDE NULLS`：12 行里 7 行有值、5 行是 NULL，信息一点没丢。
+
+→ **「填 0」这个默认值是有代价的**：它把三值逻辑（NULL / 0 / 有值）压成了两值逻辑，
+往返一次之后你就再也分不清「没数据」和「数据是 0」了。
+这是本 demo 里最隐蔽的一条 —— **它不报错，只是默默改了你的数据**。
+
+### 7. 代价：宽表 pivot 的代价
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果行数 |
+| --- | --- | --- | --- |
+| DuckDB `PIVOT`（列集合跟着数据） | 81.5 | 75.4 | 200 |
+| Polars `pivot`（列集合跟着数据） | 66.9 | 53.3 | 200 |
+| DuckDB `PIVOT ... IN (12 个品类)` | 68.2 | 65.7 | 200 |
+| Polars `pivot(on_columns=12 个品类)` | 39.8 | 30.3 | 200 |
+
+口径：输入已物化成 parquet，两边读的是同一份数据；
+计时的只有「长表 → 宽表」这一步（不含读盘）；
+两边最终产出的都是同一个 `pl.DataFrame`（DuckDB 那边走 Arrow 转换）。
+**但两边的输出不是同一个东西**：DuckDB 的缺失组合是 NULL、Polars 的是 0，
+所以这四个数字**只能比耗时，不能比结果**，也没有对账可言。
+前两行是同一件事（列集合跟着数据走），后两行是同一件事（列集合钉死），
+各自内部可比，跨组不可比。
+重复次数取中位数，机器是共享开发机，单次数字会有抖动。
+
+**真正该记住的不是谁快，而是这四个数字不能拿来比大小**：
+两边输出的内容不一样（NULL vs 0），场景 2 已经证明这会一路影响到 `IS NOT NULL` 过滤和往返。
+**口径不对齐，性能数字再好看也没意义。**
+
+## 容错模式与坏数据
+
+`src/fault_demo.py`。同一个开关名 `ignore_errors`，两边**读出来的行数不一样** ——
+而且两边都不报任何错。
+
+### 1. 一份脏 CSV 有四种坏法
+
+| 坏法 | 例子 | 属于哪一类 |
+| --- | --- | --- |
+| 类型不对 | `amount = N/A` | 字段能解析，类型转不过去 |
+| 空值 | `amount` 是空的 | 两边都读成 NULL，不算错 |
+| 字段数不对 | 多一列 / 少两列 | 行本身的结构不合法 |
+| 引号没闭合 | `"引号没闭合` | 解析器在行中间就乱了 |
+
+**这四种错误，容错开关不是一把统一的钥匙。**
+
+### 2. 不给 schema：两边都「悄悄降级」
+
+DuckDB 的 `sniff_csv` 和 Polars 的类型推断**都**把 `amount` 降成文本，
+两边**都没报错** —— 但这一列已经不是整数了：
+
+```
+DuckDB sum(amount) -> BinderException: No function matches ... 'sum(VARCHAR)'
+Polars  sum(amount) -> InvalidOperationError: `sum` operation not supported for dtype `str`
+```
+
+一致，但一致得很危险。脏数据上正确的做法是**显式给 schema**，别让推断替你做决定。
+
+### 3. 给了 schema：两边各报各的错
+
+| | 报错 |
+| --- | --- |
+| DuckDB | `ConversionException`：**第几行** + **原始行长什么样** |
+| Polars | `ComputeError`：**哪一列** + **文件里的第几个字节**，行号要自己数 |
+
+实务上的差别：几百万行的文件，DuckDB 的报错能直接定位到行；Polars 只能定位到列，剩下的得自己二分查找。
+
+### 4. ignore_errors：一边跳行，一边置空
+
+同一份 8 行物理数据的 CSV：
+
+| 行数口径 | DuckDB | Polars |
+| --- | --- | --- |
+| 文件里的物理行数 | 8 | 8 |
+| 引擎自己报的「行数」 | `count(*)` → 8 | `height` → 8 |
+| **你实际拿到的行数** | **7** | **8** |
+| 那一行坏数据 | 整行丢掉 | 保留，`amount` 变成 null |
+
+- **DuckDB 的 `ignore_errors` 是「丢整行」**：坏行连同它其他字段一起消失。
+- **Polars 的 `ignore_errors` 是「把坏字段置 NULL」**：行还在。
+
+顺带一个更坑的：**DuckDB 侧的 `count(*)` 单独查走的是 CSV 解析器的物理行数口径**。
+实测 `SELECT *` 只有 7 行，`count(*)` 却报 8；加上 `WHERE amount IS NOT NULL` 才是 7。
+（这条只对「字段解析成功、类型转换失败」的行成立 —— 字段数不对的行不计入。）
+Polars 没这个问题，`df.height` 就是真的行数。
+
+### 5. 对账：Polars 补一刀，两边就对上了
+
+在 Polars 侧再丢一次空行（7 行），跟 DuckDB 对账 **✅ 7 行 × 4 列全部一致**。
+
+但这个补丁有两个前提：
+
+- **这一列本来不能有合法的 NULL** —— Polars 把「值写坏了」和「值本来就是空的」都变成 null，之后分不出来。
+- **补的这一刀是额外的开销**（场景 8 量了）。
+
+→ 换句话说：**Polars 的容错是「保数据」，DuckDB 的容错是「保数据 + 记账」**。
+想要记账就用 DuckDB 的 `reject_errors`；想要两边结果一样，就得自己补刀。
+
+### 6. 坏行去哪了：store_rejects 与 reject_errors
+
+DuckDB 侧的参数叫 **`store_rejects`**（不是 `store_errors`），
+坏行记在 **`reject_errors`** 表里，带行号、列名、原始行、错误类型：
+
+| 行号 | 列名 | error_type |
+| --- | --- | --- |
+| 3 | None | `TOO MANY COLUMNS` |
+| 6 | note | `MISSING COLUMNS` |
+| 7 | note | `UNQUOTED VALUE` |
+
+`error_type` 是枚举，7 个取值：`CAST`、`MISSING COLUMNS`、`TOO MANY COLUMNS`、`UNQUOTED VALUE`、
+`LINE SIZE OVER MAXIMUM`、`INVALID ENCODING`、`INVALID STATE`。
+
+两个要注意的：
+
+- 这个表在同一个连接里是**累加**的 —— 实测读之前 3 行，再读一次之后 6 行。
+  想知道「这一批文件坏了多少行」要用 `rejects_scan` / `scan_id` 过滤，别直接 `count(*)`。
+- `SET errors_as_json=true` 只改**抛出来的异常消息**的格式，
+  不改表里的 `error_message`（仍是人读文本，如 `Expected Number of Columns: 4 Found: 5`）。
+  想要机器可读，得自己解析 `error_type` 那一列。
+
+### 7. 容错的边界
+
+| 情况 | DuckDB | Polars |
+| --- | --- | --- |
+| 字段数不对 | `ignore_errors` **能兜住**，坏行全记进 `reject_errors` | 照样抛 `ComputeError: found more fields than defined in 'Schema'` |
+| 想绕过 | —— | `truncate_ragged_lines=True`，但语义是**截断**（扔掉多出来的值继续读），不是跳过这一行 |
+| 引号没闭合 | 记进 `reject_errors` | 解析器级错误，两个开关都救不了 |
+| 文件不存在 | `IOException` | `FileNotFoundError` |
+
+→ **容错开关管的是「行内容」，管不了「文件找不到」** —— 加 `ignore_errors` 都不变。
+
+实务上：脏数据能靠 `ignore_errors` 兜住，行格式不统一（列数不一致）得靠上游统一。
+
+### 8. 代价：跳坏行 vs 全量读入
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 读出行数 | amount 求和 |
+| --- | --- | --- | --- | --- |
+| DuckDB 容错读（流式聚合） | 62.2 | 54.3 | 1,980,000 | 198,000,000,000,000 |
+| DuckDB 容错读（CTAS 物化） | 118.1 | 93.5 | 1,980,000 | 198,000,000,000,000 |
+| Polars 容错读（`read_csv` 物化） | 60.0 | 51.2 | 2,000,000 | 198,000,000,000,000 |
+| Polars 容错读 + 丢空行 | 78.2 | 74.3 | 1,980,000 | 198,000,000,000,000 |
+
+口径：
+
+- 两边读的是**同一个** CSV 文件、同一份 schema、都把 amount 转成整数、
+  都用容错模式、最后都做一次求和 —— 同一件事。
+  计时的**包含读盘和解析**。文件在第一轮预热后已经在 OS 页缓存里，两边读同一份缓存。
+- **四行的执行模型不一样，绝对值不直接可比**，要比的是同组内部的差：
+  - 第 1 行是 DuckDB 的「查询式」用法：`read_csv` 流式扫描 + 聚合，不物化整表。
+  - 第 2 行是「把 CSV 导成表」的用法：CTAS 落成一张真表，再聚合。
+  - 第 3、4 行是 Polars 的「读成 DataFrame」用法：eager 模式必然物化。
+  - 第 1 行 vs 第 3 行：一个是流式聚合、一个是物化成 DataFrame 再算，
+    **这两个数字不能直接比大小**；真正该比的是第 2 行 vs 第 3 行（都物化）。
+  - 第 3 行 vs 第 4 行：多了一遍全列过滤 —— 输出跟 DuckDB 对齐要付的代价。
+- 重复次数取中位数，机器是共享开发机，单次数字会有抖动。
+
+- **汇总值一样，行数不一样**：坏行在两边都不贡献数值，所以 `sum` 完全相同；
+  但 DuckDB 少了几行、Polars 一行没少 —— **查聚合看不出问题，查行数就看出来了**。
+- **那 1% 的坏行，在时间上根本不是主角** —— 真正的差距在两个引擎解析/物化的实现上。
+- → 所以这个语义差异**靠 benchmark 是发现不了的，只能靠对账**。
+- **「少读 1% 的行」也不等于「更快」**：省掉的是「把坏行放进结果」这一步，
+  行还是要解析、还是要判定坏不坏。
+
+## 嵌套类型：LIST / STRUCT / MAP
+
+`src/nested_demo.py`。三种嵌套类型两边都能用，但**「怎么写」完全不同** ——
+DuckDB 的类型是**值的语法**，Polars 的类型是**列的声明**。
+
+### 1. 一边是字面量，一边是 dtype
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| LIST | `[1, 2, 3]` → `INTEGER[]` | `dtype=pl.List(pl.Int64)` → `List(Int64)` |
+| STRUCT | `{'a': 1, 'b': 'x'}` → `STRUCT(a INTEGER)` | `dtype=pl.Struct({...})` → `Struct({'a': Int64, ...})` |
+| MAP | `MAP{'k': 1, 'j': 2}` → `MAP(VARCHAR, INTEGER)` | `dtype=pl.Map(pl.String, pl.Int64)` → `Map(String, Int64)` |
+
+DuckDB 写个 `[1,2,3]` 就是 LIST，类型由值推出来，`typeof()` 能随时问。
+Polars 必须在构造时就把 dtype 说清楚，而且**没有 `typeof()` 这种运行时反查**的入口。
+
+MAP 两边都最别扭：Polars **光给一个 list of dict 是不够的**，
+少写 `dtype=pl.Map(...)` 的话它会变成 Struct，之后 `.map.keys()` 直接报
+``InvalidOperationError: `map.keys` requires a Map dtype, got `struct[2]```。
+
+### 2. LIST 函数：能对上的那部分，和对不上的那部分
+
+DuckDB 2.0 里有 **92** 个 `list_` / `map_` / `struct_` 开头的函数（运行时现算）；
+Polars 把它们收进 `.list` 命名空间。常用的：
+
+| DuckDB | Polars | 说明 |
+| --- | --- | --- |
+| `list_sum(l)` | `list.sum()` | 空列表：NULL vs 0 |
+| `list_avg(l)` | `list.mean()` | |
+| `list_len(l)` / `len(l)` | `list.len()` | DuckDB 还有 `len()` 简写 |
+| `list_distinct(l)` | `list.unique()` | |
+| `list_slice(l, o, n)` | `list.slice(o, n)` | DuckDB 不支持负索引 |
+| `list_contains(l, x)` | `list.contains(x)` | NULL 语义不同 |
+| `list_transform(l, lambda)` | `list.eval(expr)` | Polars 收的是**表达式** |
+| `list_reduce(l, lambda)` | （没有） | Polars 要自己 fold |
+
+三处对不上：
+
+**求和的入口不一样**（最容易敲错的一个）：
+
+```
+df['v'].sum()      -> InvalidOperationError: `sum` operation not supported for dtype `list[i64]`
+df['v'].list.sum() -> [6, 9]
+```
+
+`Series.sum()` 是**整列**求和，撞上 list dtype 直接报错；`Series.list.sum()` 才是「逐个 list 求和」。
+这两个名字只差一个 `.list`，报错信息却完全没提 list。
+
+**空列表**：DuckDB `list_sum([])` → **NULL**；Polars `list.sum()` → **0**。
+只要有一个 list 是空的，两边的总和就会差一个值 —— 而且 DuckDB 那边是 NULL（**不是 0**），聚合时会把整列污染掉。
+
+**NULL 元素**：DuckDB `list_contains([1,NULL,3], NULL)` → **NULL**（三值逻辑）；
+Polars `list.contains(None)` → **True**。
+
+DuckDB 还有个 Polars 没有的能力：lambda 能**内联进 SQL 表达式**。
+Polars 的对应物是 `pl.element()` 表达式 —— `list.eval(pl.element() * 2)`，
+但它只能作用在列上，条件逻辑得在外面套一层。
+
+### 3. DuckDB 2.0 的 lambda 箭头语法：1.x 迁 2.x 必踩
+
+DuckDB 1.x 的写法 `SELECT list_transform([1,2,3], x -> x*2)` 在 2.0 上是**编译期就炸**：
+
+```
+BinderException:
+  Binder Error: Deprecated lambda arrow (->) detected. Please transition to the new lambda
+  syntax, i.e.., lambda x, i: x + i, before DuckDB's next release.
+  Use SET lambda_syntax='ENABLE_SINGLE_ARROW' to revert to the deprecated behavior.
+```
+
+正确写法是 **`lambda` 关键字 + 冒号**：`lambda x: x*2`。
+还能带第二个参数（下标）：`lambda x, i: x + i` —— 这在 Polars 里没有对应物。
+
+`SET lambda_syntax='ENABLE_SINGLE_ARROW'` 是 DuckDB 留的后门，但报错原文自己也说了
+「before DuckDB's next release」。
+
+→ 这一条是**纯粹的破坏性变更**，跟语义对不对没关系：好处是不会静默出错；
+坏处是升级当天所有用到 lambda 的查询全挂。改法是机械的，`->` 换成 `lambda ... :`。
+
+Polars 侧**没有这个问题** —— 它压根没有 lambda 语法，从 DuckDB 迁过去反而是简化。
+
+### 4. STRUCT：字段访问和「拆成列」
+
+DuckDB：`s.a` 取字段、`s.*` 摊平成列、`unnest(s)` 摊平成列、`struct_pack(x := 1)` 造结构体。
+Polars：`df['s'].struct.field('a')` 取字段、`df.unnest('s')` 摊平成列。
+
+拆成列之后对账 **✅ 2 行 × 3 列全部一致**。
+
+但 `unnest` **一个词两种语义**：
+
+- DuckDB `unnest(struct)` 摊平成**列**（行数不变），`unnest(list)` 炸成**多行**（行数变多）——
+  同一个动词，行为两套，写 SQL 时特别容易看串。
+- Polars 分得很清：`struct.unnest()` / `list.explode()`。
+
+拆多个 struct 列时，Polars 把字段名**直接铺开，不加前缀** —— 两个 struct 有同名字段时会撞车。
+
+### 5. MAP：键值访问，以及「Polars 的 MAP 得显式声明」
+
+DuckDB 一整套 `map_keys` / `map_values` / `map_extract` / `map_contains` / `map_entries`；
+Polars 的 `.map` 命名空间只有 6 个方法，没有 `map_concat`、没有 `map_from_entries`。
+
+`map_entries` 两边形状一模一样，可以直接对账 **✅ 1 行 × 1 列全部一致**。
+
+**键序两边都是插入顺序**，不是排序后的顺序 —— 有些数据库的 MAP 是按键排序的，DuckDB 不是。
+
+→ MAP 是三个嵌套类型里**最难对应**的一个。更实际的迁移路径是把 MAP 当成
+「键列 + 值列」拆开存，两边都能用普通算子处理。
+
+### 6. 嵌套类型在 Parquet 里的往返：三种类型都活下来了
+
+这是好消息：LIST / STRUCT / MAP **两个方向都能完整往返**
+（DuckDB 写 → Polars 读、Polars 写 → DuckDB 读），对账 **✅ 1 行 × 3 列全部一致**，
+MAP 也一样（DuckDB 读回来是真正的 `MAP(VARCHAR, BIGINT)`）。
+
+→ 之前那些「DuckDB 是字面量、Polars 是 dtype」的差异，在文件格式这一层全部消失。
+**嵌套类型迁移的最优解常常是：别在内存里折腾类型，直接落 parquet 再读。**
+唯一要留意的是**元素类型**（DuckDB 写的 INT32 对上 Polars 的 Int32，但两边自己造数时默认可能不同）。
+
+### 7. 代价：把一个 list 列炸开要花多少时间
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 炸开行数 |
+| --- | --- | --- | --- |
+| DuckDB `unnest(tags)` | 26.2 | 26.0 | 10,000,000 |
+| Polars `explode(tags)` | 93.9 | 93.3 | 10,000,000 |
+
+口径：数据已物化成 parquet，两个引擎读的是**同一个文件**；
+计时的这一步包含「读 parquet + 解码 list 列 + 炸开 + 计数」的全过程，不包含造数。
+DuckDB 侧走 `unnest()`（SQL 里的行展开），Polars 侧走 `explode()`（DataFrame 方法），
+做的**是同一件事**：把每行的 list 拆成多行并数出总行数。
+重复次数取中位数，机器是共享开发机，单次数字会有抖动。
+
+炸开 list 列是**行数放大**操作 —— 每个 list 有几个元素，结果表就长几倍。
+跟宽表 join 是同一类风险：中间结果可能比输入大一个量级。
+
+如果只是想「每个 list 的元素和」，别炸开 —— DuckDB 的 `list_sum()` 和 Polars 的 `list.sum()`
+都是一趟扫完，不产生放大后的中间结果。
+
+## 查询计划：EXPLAIN 与投影裁剪
+
+`src/plan_demo.py`。两个引擎都有计划，但**计划没法对读**，而且**只有一边能证明它做了什么**。
+
+### 1. 同一个查询，两边的 EXPLAIN 长得完全不一样
+
+DuckDB 给的是**盒式图**（默认就是**物理计划**）：
+
+```
+╭─ Projection ──────────────────────╮
+│ Projections: CAST(#0 AS BIGINT),  │
+│              #1                   │
+╰─────────────────┬─────────────────╯
+╭─ Perfect Hash Group By ───────────╮
+│ Groups: #0                        │
+│ Aggregates: sum(#1)               │
+╰─────────────────┬─────────────────╯
+...
+╭─ Seq Scan ──────┴─────────────────╮
+│ Table: memory.main.t              │
+│ Projections: g, v                 │
+│ Filters: id < 500                 │
+╰───────────────────────────────────╯
+```
+
+Polars 给的是**缩进树**（画的是**算子树**，没有物理算子这一层）：
+
+```
+AGGREGATE[maintain_order: false]
+  [col("v").sum().alias("sum(v)")] BY [col("g")]
+  FROM
+  simple π 2/2 ["g", "v"]
+    FILTER col("id") < 500
+    FROM
+      simple π 3/3 ["g", "v", "id"]
+        DF ["id", "g", "v"]; PROJECT */3 COLUMNS
+```
+
+两边的计划**没有一一对应的节点**：DuckDB 的 `Projection` 在 Polars 里是 `π`；
+DuckDB 把过滤塞进扫描节点（`Filters: id < 500`），Polars 在内存表上是独立的一行 `FILTER`。
+
+→ **别指望两边能对照着读**。计划长得像不算数，**结果能对账才算数**（脚本里每次都配一次对账）。
+
+### 2. 投影裁剪：两边都裁，但只有一边能证明
+
+12 列宽表、10 万行，只查 2 列：
+
+| | 计划里写的 | 实际读盘 |
+| --- | --- | --- |
+| DuckDB | `Projections: id, v` | **953,441 字节** |
+| DuckDB（查全 12 列） | 全部 12 列 | **13,435,510 字节**（只查 2 列是它的 **7.1%**） |
+| Polars | `PROJECT 2/12 COLUMNS` | **没有数字可给** |
+
+Polars 侧 `explain()` 只给计划文本，没有 IO 计数器；`collect()` 返回的 DataFrame
+也不带任何元数据。
+
+→ 那句 `PROJECT 2/12` 是一句**承诺**，不是一个**观测**。
+调优的时候 DuckDB 能直接拿「读盘字节数」当反馈信号，Polars 只能靠「改代码再测一遍」间接验证。
+
+### 3. 过滤下推：过滤被塞进了哪一步
+
+DuckDB 优化**前**的计划里，过滤是一个独立的 `Filter` 节点；优化**后**它被塞进了扫描节点
+（`Projections` 和 `Filters` 写在同一个 `Read Parquet` 节点里）—— 少一次中间结果物化。
+
+Polars 优化前是独立的 `FILTER`，优化后变成扫描节点里的 `SELECTION:` 一行。语义一样，**画法**不一样。
+
+### 4. 两边的默认值不一样：看计划的前提不同
+
+- Polars `explain()` 的默认就是**优化后**的（`optimized=True`），想看优化前必须显式写 `optimized=False`。
+- DuckDB 的默认是 **`physical_only`**（直接给物理计划），
+  `PRAGMA explain_output='all'` 能一次拿到三份：未优化 / 已优化 / 物理。
+
+→ **「计划」这个词在两边指的不是一回事**，看计划不能跨引擎比对。
+
+### 5. 聚合：DuckDB 会告诉你它选了哪种算法，Polars 不会
+
+| 分组键 | DuckDB | Polars |
+| --- | --- | --- |
+| 小值域整数（7 组） | `Perfect Hash Group By` | `AGGREGATE[maintain_order: false]` |
+| 大值域整数（10 万组） | `Hash Group By` | `AGGREGATE[maintain_order: false]` |
+| 字符串键（50 组） | `Hash Group By` | `AGGREGATE[maintain_order: false]` |
+
+DuckDB 的计划**暴露了算法选择**，而**选哪个取决于数据的值，不取决于 schema**。
+Polars 三种数据给出**字面上完全一样**的节点名 —— 你看不出它内部会走哪条路。
+
+顺带注意 `maintain_order: false`：**两边聚合结果的行序都不保证**，想要稳定行序都得显式 `ORDER BY`。
+
+### 6. Join：节点名完全对不上
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 等值连接 | `Hash Join` | `INNER JOIN:` |
+| 非等值连接 | `Piecewise Merge Join` | `INNER JOIN:` |
+| 笛卡尔积 | `Cross Product` | —— |
+
+DuckDB 里 LEFT / INNER / SEMI 是同一个节点加一行 `Join Type:`，Polars 里是三个不同的节点名。
+但 DuckDB 一定会告诉你**用的什么算法**，Polars 只写 `INNER JOIN` ——
+底下是 hash join 还是 merge join，计划里一个字都没有。
+
+→ **「看计划判断 join 会不会退化」这件事，只有 DuckDB 做得到。**
+
+### 7. 前提：谁有计划、计划里有什么、看不到什么
+
+- **Polars 只有 LazyFrame 有计划** —— eager 的 DataFrame 是已经算完的结果，没有计划可言
+  （想看得先 `.lazy()`）。DuckDB 没这个区分，SQL 本来就是惰性的。
+- **DuckDB 的 `EXPLAIN` 不执行查询，`EXPLAIN ANALYZE` 会执行** ——
+  后者会给出 `Total Time` / `Data Read` / `Row Groups Scanned`，别在大表上随手用。
+- Polars 侧两个想「看细节」的入口在 2.x 都没了：`profile()` 在 2.0 被**移除**；
+  `show_graph()` 还在，但要额外的 matplotlib。
+- **Polars 没有任何运行时指标**：`collect()` 返回一个光秃秃的 DataFrame，
+  拿不到「读了几个字节」「扫了多少行」这种引擎内部数字。
+
+→ DuckDB 的 EXPLAIN 是一条**完整的诊断链**（计划 → 三种粒度 → 实测 → 机器读得懂的 JSON），
+Polars 的 EXPLAIN 是**一段文本**。DuckDB 能一路查到底，Polars 只能在「计划对不对」这一层打转。
+
+### 8. 代价：投影裁剪到底值多少时间
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果 |
+| --- | --- | --- | --- |
+| DuckDB 只读 1 列 | 12.1 | 10.7 | 2,999,998,500,000 |
+| DuckDB 读全部 12 列 | 147.8 | 131.8 | 17,475,795,107,475 |
+| Polars 只读 1 列 | 14.1 | 12.7 | 2,999,998,500,000 |
+| Polars 读全部 12 列 | 178.0 | 156.2 | 17,475,795,107,475 |
+
+口径：数据已物化成 parquet，两个引擎读的是**同一个文件**（268,644,289 字节）；
+「只读 1 列」和「读全部 12 列」在两边指的是**同一件事**：
+把要读的列读出来做聚合（数值列求和、字符串列求长度和），区别只在读几列。
+计时包含「打开文件 + 读 parquet + 解码 + 聚合」的全过程。
+DuckDB 侧每次都重新 parse + bind SQL；Polars 侧每次都重新 scan + collect，
+两边都是「从零跑一遍这条查询」的口径。
+重复次数取中位数，机器是共享开发机，单次数字会有抖动。
+
+差距的大小取决于「被丢掉的列」有多宽 —— 一列窄的 int 和一列宽的 string，省下来的字节数差着量级。
+所以**列的顺序和选列**在宽表上比想象中值钱。
+
+反过来，「我只 select 了几列」这句话在两个引擎里都是**真的** ——
+不需要担心 `select *` 把整张表拖下来，前提是别在后面又 `SELECT *` 回去。
+
+## 采样与随机
+
+`src/sample_demo.py`。DuckDB 的 `USING SAMPLE` **默认不是逐行抽样**，Polars 2.1 **连随机函数都没有**。
+
+### 1. 默认采样在小表上返回 0 行 —— 或者全部
+
+1000 行的表请求 10%，同一句 `SELECT count(*) FROM small USING SAMPLE 10%` 跑 100 次：
+
+| 采样行数 | 出现次数 |
+| --- | --- |
+| 0 | **85** |
+| 1,000 | 15 |
+
+**中间值一个都没有出现过** —— 「100 行」这个正确答案根本不在结果里。
+
+换几个比例（每个跑 20 次）：
+
+| 比例 | 结果 |
+| --- | --- |
+| 10% | 0 行 ×17、1,000 行 ×3 |
+| 50% | 0 行 ×10、1,000 行 ×10 |
+| 90% | 0 行 ×3、1,000 行 ×17 |
+| 100% | 1,000 行 ×20 |
+
+Polars 侧同样的操作**永远给 100 行**（`floor(1000 × 0.1)`）。
+
+→ DuckDB 的默认方法是 **system（块采样）**：1000 行的表只有一个数据块，
+整块被选中就是 1000 行，没被选中就是 0 行 —— **必然二选一，不是偶发**。
+报表里写「抽 10% 看趋势」，在 DuckDB 上可能拿到 0 行、也可能拿到全量，
+而且这两种情况在**同一句 SQL** 下会随机切换，谁也没法从代码上看出区别。
+
+### 2. 三种采样方法：想要确切行数只有一种能给你
+
+10 万行表上请求 10%（目标 1 万），各跑 20 次：
+
+| 采样方法 | 实测行数区间 | 偏差 |
+| --- | --- | --- |
+| `system`（默认） | 4,096 ~ 20,480 | **+104.8%** |
+| `bernoulli` | 9,775 ~ 10,186 | +1.9% |
+| `reservoir` | **10,000 ~ 10,000** | **+0.0%** |
+
+1000 行的小表上：
+
+| 采样方法 | 实测行数 | 精确命中目标 100？ |
+| --- | --- | --- |
+| `system` | 0 ~ 1,000 | ❌ 非 0 即全 |
+| `bernoulli` | 87 ~ 109 | ❌ 按二项分布抖动 |
+| `reservoir` | 100 ~ 100 | ✅ 每次都是 100 |
+
+- **system**：按数据块抽样，**你没法拿它的行数做任何推断**。
+- **bernoulli**：逐行独立掷骰子，行数服从二项分布（σ = √(n·p·(1-p))）。
+  1000 行取 10% 时 σ ≈ 9.5（**±28%**），10 万行时 σ ≈ 95（±2.8%）——
+  **样本越小行数越不准**，这是统计学不是 DuckDB 的毛病。
+- **reservoir**：蓄水池算法，**每次都精确命中目标行数**，是三个里唯一能拿来做「抽 N 行看」的。
+
+Polars 的 `sample(fraction=...)` 属于 reservoir 这一类 → **两边对齐的口径是 reservoir，
+不是 DuckDB 的默认值**。
+
+### 3. system 抽的是连续片段，不是分散的随机行
+
+10 万行表（id 就是行号）上实测：
+
+| 采样方法 | 采到的行数 | 连续段数 | 最大间隙 |
+| --- | --- | --- | --- |
+| `system` | 12,288 | **5** | **30,721** |
+| `bernoulli` | 10,066 | 9,054 | 90 |
+
+system 采到的 12,288 行只由 **5 段连续区间**拼成（2,048 / 2,048 / 4,096 / 2,048 / 2,048 行），
+段与段之间的间隙高达 30,721 行。bernoulli 采出来的行散在整个表上。
+
+→ 这条比「行数不准」更危险，因为**它不报错**。
+把表看成「按时间先后追加的日志表」，system 采到的每一段都是**一个连续的时间窗口**，
+中间整段的时间数据一个都没抽到 —— 比例是对的（10%），但抽到的不是「均匀撒在时间轴上的 10%」。
+
+**做统计推断/画分布图，必须显式写 `bernoulli` 或 `reservoir`。**
+
+### 4. 按行数采样
+
+| 写法 | 结果 |
+| --- | --- |
+| `USING SAMPLE 10 ROWS` | ✅ 10 行（但不保证精确，走默认 system） |
+| `USING SAMPLE reservoir(100 ROWS)` | ✅ 100 行 |
+| `USING SAMPLE bernoulli(100 ROWS)` | ❌ **ParserException** |
+| `df.sample(n=10, seed=42)` | ✅ 10 行（永远精确） |
+
+bernoulli 拒绝离散行数，报错原文就摆在明面上：
+
+> Sample method Bernoulli cannot be used with a discrete sample count, either switch to reservoir
+> sampling or use a sample_size
+
+取整规则也不同：999 行取 10%，DuckDB `reservoir` 给 **100** 行（round），Polars 给 **99** 行（floor）。
+差一行不致命，但**做行数对账时**得先统一口径。
+
+### 5. 可复现性：`setseed` 管不住采样
+
+| 写法 | 两次是否一致 |
+| --- | --- |
+| DuckDB `setseed(0.42)` + `random()` | ✅ 一致 |
+| DuckDB `setseed(0.42)` + `USING SAMPLE 10%` | ❌ **不一致** |
+| DuckDB `USING SAMPLE 10% (bernoulli, 42)` | ✅ 一致（连选中的 id 集合都一样） |
+| Polars `df.sample(seed=42)` | ✅ 一致 |
+
+→ 想要「可复现」，两边的钥匙**不在同一个地方**：
+
+- DuckDB 的 `SELECT setseed(0.42)` 作用在 **`random()` 这类随机函数**上，
+  对 `USING SAMPLE` **完全无效**。采样要复现，种子得写在**方法后面** ——
+  这是 2.0 才有的语法，1.x 没有。
+- Polars 的种子直接跟着调用走（`df.sample(..., seed=42)`），
+  另有全局的 `pl.set_random_seed(42)`，管的是 shuffle 之类。
+
+迁移时最容易漏的是 DuckDB 这条：**照抄 `setseed` 以为整个查询可复现**，
+结果采样那一段每次都不一样 —— 而且它自己不会告诉你。
+
+### 6. 随机函数：Polars 2.1 里一个都没有
+
+| | DuckDB | Polars 2.1 |
+| --- | --- | --- |
+| `random()` | ✅ | ❌ 表达式层和 Series 层都没有 |
+| `rand()` | ❌ `CatalogException: Scalar Function with name rand does not exist!` | ❌ |
+
+Polars 侧想生成随机数只能退回 numpy：`np.random.default_rng(42).random(1000)`。
+
+分布本身两边一致（20 万个 [0,1) 均匀数分 10 个桶，逐桶对账 ✅ 容差 5%），
+差别在**能不能在查询内部用**：
+
+- DuckDB 把随机数做成**一等公民**：`ORDER BY random()`、`CASE WHEN random() < 0.1` 都能写，
+  整个查询在引擎内部完成。
+- Polars 做不到「一行 SQL 里的随机条件」这种写法。
+
+→ **随机数从「引擎内部」搬到了「Python 进程里」**，能做的事一下子少了一截。
+
+### 7. 代价：采样并没有比全表扫描便宜多少
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果 | 性质 |
+| --- | --- | --- | --- | --- |
+| DuckDB `count(*)`（元数据） | 0.6 | 0.6 | 2,000,000 行 | 不扫表 |
+| DuckDB `count(*) WHERE v>0` | 1.2 | 1.1 | 1,999,998 行 | 基准 |
+| DuckDB `system 10%` | 0.8 | 0.7 | 208,896 行 | 采样 |
+| DuckDB `bernoulli 10%` | 3.7 | 3.7 | 199,553 行 | 采样 |
+| DuckDB `reservoir 10%` | 29.6 | 26.4 | 200,000 行 | 采样 |
+| Polars `filter(v>0).height` | 0.9 | 0.9 | 1,999,998 行 | 基准 |
+| Polars `sample(fraction=0.1)` | 8.2 | 7.9 | 200,000 行 | 采样 |
+
+口径：输入已物化成 parquet，两边读的是**同一个文件**；
+DuckDB 侧先 `CREATE TABLE ... AS SELECT * FROM read_parquet(...)`，
+Polars 侧先 `pl.read_parquet(...)` —— 数据都已驻留内存。
+计时的只有「扫描 / 采样」这一步，**不含读盘**。
+两边的「真扫全表」基准是**同一件事**：扫完所有行、过滤 v>0、计数
+（DuckDB 是 `count(*) WHERE v>0`，Polars 是 `filter(v>0).height`），两边结果相同。
+重复次数取中位数，机器是共享开发机，单次数字会有抖动。
+⚠️ 两边做的**不是同一件事**：DuckDB 侧采样在引擎内部完成（采完直接在引擎里聚合），
+Polars 侧的 `sample()` 会**真的构造出一个新的 DataFrame**（把 10% 的行物化到 Python 侧）。
+所以跨引擎的那两行**不能直接比大小**；真正该比的是**同一引擎内部**
+「采样」与「真扫全表」的比值。
+
+- DuckDB 的 `count(*)`（不带 WHERE）走**元数据优化**，根本不扫表 ——
+  所以它那一行**不能当成「全表扫描」的基准**，真基准是带 WHERE 的那一行。
+- system 采样是全场最快的：没被选中的块直接跳过，连数据都不用读 ——
+  这就是场景 1/3 那两个坑的来源，**便宜是拿「统计上不可信」换的**。
+- bernoulli 要逐行掷骰子，reservoir 还要维护一个跟样本一样大的蓄水池 ——
+  在 DuckDB 侧这两个方法**比同引擎的全表扫描还贵**。
+  → **最精确的那个方法（reservoir）反而最贵**，精确性是要付钱的。
+
+→ 所以「先采样再过滤」并不能加速查询：采样的开销和读全表是同一个量级，
+唯一例外是 system，而它恰恰是统计上不可信的那个。
+**在 DuckDB 里采样是「给下游一个更小的数据集」的手段，不是查询加速手段。**
+真想少读数据，条件过滤（`WHERE`）配合 zone map 才是正道。
+
+## 约束与完整性
+
+`src/constraint_demo.py`。DuckDB 的约束是**声明式的、写在 DDL 里、跟着文件走**；
+Polars 2.1 **没有约束这个概念** —— 不是「不一样」，是「压根没有」。
+
+### 1. DuckDB 会当场拒绝：五种约束的真实报错原文
+
+| 约束 | 报错 |
+| --- | --- |
+| PRIMARY KEY | `Duplicate key "id: 1" violates primary key constraint.` |
+| UNIQUE | `Duplicate key "v: 10" violates unique constraint.` |
+| NOT NULL | `NOT NULL constraint failed: c_nn.v` |
+| CHECK | `CHECK constraint failed on table "c_ck" with expression CHECK((v > 0))` |
+| FOREIGN KEY | `Violates foreign key constraint because key "id: 999" does not exist in the referenced table` |
+
+**报错里带着具体的键值**：主键冲突告诉你哪个键、值是多少；CHECK 失败会把**表达式本身**打出来
+（不用回去翻 DDL）；NOT NULL 精确到列名，外键精确到缺失的键。
+
+关键在于：**这些错误发生在写入的那一刻** —— 坏数据根本没有落盘的可能，
+也就没有「下游发现数据不对」的那一天。UPDATE 也一样被拦（不是只在 INSERT 时看）。
+
+约束登记在系统表里查得到（`duckdb_constraints()`）。
+
+### 2. Polars 2.1 里一个约束 API 都没有
+
+```
+df.assert_unique()      -> AttributeError: 'DataFrame' object has no attribute 'assert_unique'
+df.assert_no_nulls()    -> AttributeError: ...
+df.assert_null_count()  -> AttributeError: ...
+df.validate()           -> AttributeError: ...
+```
+
+DataFrame / Series / Expr 上带 `assert` 的方法：**一个都没有**。
+
+Polars 给的是**检查用的原语**，不是**断言**：`is_duplicated()` / `null_count()` / `n_unique`。
+把它们拼成约束是你自己的活儿，失败时报的是**你自己抛的异常**
+（脚本里是 `ValueError: 主键冲突：id = [2, 2, 3, 3, 3]`）——
+报错内容、报错时机、要不要报错，全都归你，也就意味着**可能压根不报错**。
+
+对账：两边各自找出「哪些 id 重复了」，结果 **✅ 2 行 × 2 列全部一致**
+→ **查坏行的能力两边都有**（算法一样，结果一样）；差的是**谁替你查、什么时候查**。
+
+一个容易踩的坑：`is_duplicated()` 在 DataFrame 和 Series 上含义不同 ——
+`df.is_duplicated()` 判的是**整行**重复（表里 id 明明重复了，它却全 False），
+`df['id'].is_duplicated()` 才是判这一列。
+
+→ 迁移时最危险的不是「API 名字对不上」，是**「少写一行代码，坏数据就静默进去了」**。
+
+### 3. DuckDB 的约束活在文件里，Polars 的检查活在一次调用里
+
+DuckDB 侧：约束写进 `.duckdb` 文件，**换个连接照样拦**（换进程、换机器也一样）。
+
+Polars 侧：检查只是**你调了一次的那个函数**。脚本里演示了第二条**没有调用检查**的写入路径 ——
+坏数据就这么进去了。
+
+→ 差别的本质是**约束存在哪一层**：
+
+- DuckDB 的约束在**存储层**，跟着文件走，你没法「绕过」它（除非故意去改表定义）。
+- Polars 的检查在**调用层**，这次调用了、下次忘了，约束就凭空消失，**没有任何痕迹**。
+
+实务上的差别：**DuckDB 是一次投入、长期生效**（写进 DDL 就行）；
+**Polars 是每个写入点都要重复投入**，而且加漏了没人知道。
+表有 5 个写入路径，你就要写 5 遍检查 —— 忘了第 5 遍，第 5 个路径就开始产坏数据。
+
+### 4. 序列：DuckDB 的 nextval vs Polars 的 with_row_index
+
+DuckDB 侧：
+
+```sql
+SELECT nextval('s')                -- 1
+SELECT nextval('s'), nextval('s')  -- 2, 3
+SELECT currval('s')                -- 3
+CREATE SEQUENCE s_step START 10 INCREMENT 5   -- 10, 15, 20 …
+CREATE SEQUENCE s_cyc START 1 MINVALUE 1 MAXVALUE 3 CYCLE
+```
+
+序列还能直接当列的默认值（`DEFAULT nextval('s')`）—— 插入的人**根本不需要知道 id 这件事存在**。
+而且它是**跨连接**的：连接 1 取到 100 → 关掉 → 重连后取到 101。
+
+Polars 侧**没有序列**。最接近的两样东西 `df.with_row_index('id')` 和 `pl.int_range(0, df.height)`
+给的都是**当批次的行号**：从 0 开始、每次调用都从头数 —— 既不全局唯一，也不持久。
+
+→ 差别不在「能不能生成 ID」，在「**谁来保证不重复**」。
+DuckDB 的 `nextval()` 是**引擎保证的全局唯一**；Polars 侧要全局唯一就得自己维护 offset，
+而那个 offset 的一致性**完全没有引擎替你兜底**。
+
+迁移时最容易出错的一步：把 `DEFAULT nextval('s')` 换成 `with_row_index()`，
+看着「id 有了」，但**重跑一次批次 id 就全变了** —— 外键、增量同步、幂等写入全靠 id。
+
+### 5. 代价：约束的钱花在索引上，不在检查上
+
+写入侧（每次先 DELETE 再 INSERT，计时只覆盖 INSERT）：
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果 |
+| --- | --- | --- | --- |
+| DuckDB INSERT 无约束 | 12.5 | 12.0 | 2,000,000 行 |
+| DuckDB INSERT + NOT NULL | 12.0 | 11.2 | 2,000,000 行 |
+| DuckDB INSERT + CHECK | 13.5 | 12.6 | 2,000,000 行 |
+| DuckDB INSERT + **PRIMARY KEY** | **862.7** | 861.2 | 2,000,000 行 |
+| Polars `write_parquet`（无校验） | 37.5 | 36.7 | 2,000,000 行 |
+| Polars `write_parquet` + 查唯一性 | 141.6 | 134.6 | 重复 id 0 个 |
+
+写入侧的计时**包含读 parquet**：INSERT 的语句体里就是 `read_parquet(...)`，
+所以 DuckDB 那几行的数字 = 读盘 + 写入 + 约束校验（+ 索引维护）。
+Polars 那两行 = 写一个 parquet 文件（数据早就读进内存了，**不含读盘**）。
+每次 INSERT 前都先 DELETE（不计时），保证表是空表、约束检查不被已有数据干扰。
+
+查询侧（同一个查询，跑在有约束和没约束的表上）：
+
+| 查询 | 无约束 (ms) | PRIMARY KEY (ms) |
+| --- | --- | --- |
+| `count(*)` | 0.61 | 0.59 |
+| `sum(v)` | 1.08 | 1.01 |
+| `where id = ?` | 0.78 | 0.76 |
+| `group by id` | 608.80 | 642.31 |
+
+查询侧的计时不含读盘（表已经在 DuckDB 里了）。
+
+四张表的列名、列类型、列顺序完全一致，**只差约束子句**（脚本里把 `CREATE TABLE` 语句打出来可自核）。
+
+- **NOT NULL 和 CHECK 几乎是免费的** —— 只是逐行比一个条件，没有额外的数据结构要维护。
+- **PRIMARY KEY 贵一大截**，贵在**索引**上，不在「检查重复」上：每插一行都要更新一棵 ART 索引树。
+
+→ 「加约束」的真实成本模型是：**要不要索引**，而不是「要不要检查」。
+只想要「数据别写错」→ NOT NULL + CHECK 几乎不要钱；
+想要「能按 id 快速查、能防重复」才需要付 PRIMARY KEY 的钱。
+
+⚠️ Polars 那两行跟 DuckDB 那几行**不是同一件事**：
+DuckDB 的 INSERT 是「往**带约束的表**里写」，约束校验和索引维护都在计时里；
+Polars 的 `write_parquet` 是「写一个文件」，**没有任何校验**，
+第二行只是额外跑了一次**事后**的唯一性查询（不在写入路径上）。
+所以这两组的数字**不能直接比大小**。
+
+查询侧基本不受影响（`count(*)` / `sum(v)` / 点查 / group by 在有约束和没约束的表上耗时基本一样）——
+**约束是写入时的代价，不是查询时的代价**。
+
+### 6. 能力对照
+
+| 能力 | DuckDB | Polars 2.1 |
+| --- | --- | --- |
+| 主键 / 唯一 / 非空 / CHECK / 外键 | ✅ 建表时声明 | ❌ 无 API，手工拼 |
+| 写入时强制检查 | ✅ 引擎自动 | ❌ 得自己记得调 |
+| 约束随文件持久化 | ✅ 换进程也在 | ❌ 检查是一次调用 |
+| 全局唯一自增 ID | ✅ `CREATE SEQUENCE` | ❌ 无，只能手工 offset |
+| 坏行定位 | ✅ 报错带键值 | ✅ 手工查（结果一致） |
+
+→ 实务上的选择很明确：
+
+- 数据要落库、要跨进程共享、要长期可靠 → **用 DuckDB 管约束**，把 Polars 当计算层。
+- 数据只在内存里转一圈、错了重跑就行 → Polars 自己拼检查也够用，
+  但要接受「检查只在你记得写的时候才存在」。
+
+最后一句提醒：约束的价值不在「拦住一次坏数据」，在于**让坏数据连数据库都进不去**。
+这个差别，只有真正的存储层才给得起。
+
+## 存在性查询与半连接
+
+`src/exists_demo.py`。这一段的结论只有一句，但它是 SQL 里最容易出事的一处：
+**`NOT IN` 和 `NOT EXISTS` 在有 NULL 时不是一回事**。
+
+### 1. 先把三件事对齐
+
+左表 `l`（id = 1, 2, 3）、右表 `r`（id = 2, 4）：
+
+| 语义 | DuckDB | Polars | 结果 |
+| --- | --- | --- | --- |
+| 在右表里找得到 | `WHERE EXISTS (...)` | `join(how='semi')` | `[2]` |
+| 在右表里找不到 | `WHERE NOT EXISTS (...)` | `join(how='anti')` | `[1, 3]` |
+| 成员判定（不筛行） | `id IN (SELECT id FROM r)` | `is_in(r['id'])` | `[False, True, False]` |
+
+- **半连接只保留左表的列** —— 两边都一样，右表的列拿不到，要带过来得再 JOIN 一次。
+- **半连接不会放大行数** —— 右表键重复时，普通 JOIN 会把左表每行放大到 3 行，
+  半连接则每行最多出现一次。做「存在性判断」时这是必须的语义。
+- **成员判定不筛行**，它给每一行打一个 TRUE / FALSE / NULL 标记。
+
+### 2. 右表混进一个 NULL，`NOT IN` 一行都不剩
+
+左表 `l`：id = 1, 2, 3, NULL；右表 `r`：id = 2, 4, **NULL**（只多了这一个 NULL）：
+
+| 写法 | 结果 |
+| --- | --- |
+| `WHERE id NOT IN (SELECT id FROM r)` | `[]` |
+| `WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.id = l.id)` | `[1, 3, NULL]` |
+| `WHERE id IN (SELECT id FROM r)` | `[2]` |
+| `WHERE id IS NOT NULL AND id NOT IN (SELECT id FROM r)` | `[]` |
+| `WHERE id NOT IN (SELECT id FROM r WHERE id IS NOT NULL)` | `[1, 3]` |
+
+- **`NOT IN` 塌成空集**：右表里只要有**一个** NULL，`x NOT IN (2, 4, NULL)` 在三值逻辑下
+  既不是 TRUE 也不是 FALSE，是 UNKNOWN；`WHERE` 只放行 TRUE → 一行都不剩。
+  注意它连左表那行 id=NULL 也没放过。
+- **`IN` 反而没事**：`x IN (2, 4, NULL)` 对没匹配上的 x 是 UNKNOWN，被 WHERE 滤掉；
+  有匹配的还是 TRUE 照样留下 —— 命中的行一个不少。问题**只出在 `NOT IN`**（以及 `NOT = ANY`）。
+- **「加个 `id IS NOT NULL` 补救」救不回来**：NULL 在**右表**里，滤左表没用。
+  真能用的只有两条：改成 `NOT EXISTS`，或者把右表的 NULL 显式滤掉。
+- Polars 的 `join(how='anti')` 对齐的是 **NOT EXISTS**（实测 `[1, 3, NULL]`）；
+  `filter(~is_in(r['id']))` 给 `[1, 3]`，**不等价于 NOT IN**。
+
+### 3. 三值逻辑在 SELECT 列表里长什么样
+
+左表 id = 1, 2, 3, NULL，右表 id = 2, 4, NULL：
+
+| id | IN | NOT IN | ANY | ALL |
+| --- | --- | --- | --- | --- |
+| 1 | NULL | NULL | NULL | FALSE |
+| 2 | TRUE | FALSE | TRUE | FALSE |
+| 3 | NULL | NULL | NULL | FALSE |
+| NULL | NULL | NULL | NULL | NULL |
+
+- 判定结果是 **TRUE / FALSE / NULL（UNKNOWN）** 三种。右表带 NULL 时，
+  没匹配上的行拿到的不是 FALSE 而是 NULL。
+- **`WHERE` 里 NULL 判定和 FALSE 判定没区别**（都被滤掉），
+  **但在 `SELECT` 列表里区别很大**：换成 `CASE WHEN ... THEN 1 ELSE 0 END`
+  会把 UNKNOWN 当成 0 算进去；而 `count(m)` 又会把 NULL 直接跳过 ——
+  实测 `count(*)`=4、`count(m)`=1、`sum(CASE WHEN m THEN 1 ELSE 0 END)`=1，
+  同一列、换个聚合方式数字就变了。
+- `ANY` 是「存在一个相等」，`ALL` 是「全部相等」：右表为空时 `ANY` 是 FALSE、`ALL` 是 TRUE
+  （空集上 ALL 恒真），而 `NOT IN` 相反 —— 空子查询时它把所有行都放出来。
+- `id = ALL (...)` 在右表带 NULL 时几乎全是 NULL，因为「NULL = NULL」在 SQL 里不是 TRUE。
+
+### 4. 执行计划：相关子查询被改写成了半连接
+
+| 写法 | DuckDB 改写出来的连接类型 |
+| --- | --- |
+| `WHERE EXISTS (...)` | `Join Type: SEMI` |
+| `WHERE NOT EXISTS (...)` | `Join Type: ANTI` |
+| `WHERE id IN (子查询)` | `Join Type: SEMI` |
+| `WHERE id NOT IN (子查询)` | `Join Type: MARK` |
+| `SELECT` 列表里的 `id IN (子查询)` | `Join Type: MARK` |
+
+DuckDB 2.0 里相关子查询**不是**逐行执行的相关循环：优化前是 `Dependent Join`，
+优化后变成 `Comparison Join` + `Join Type: SEMI`，物理计划才落成 `Hash Join`。
+
+- 同一个 `IN`，放在 `WHERE` 里是 SEMI、放在 `SELECT` 列表里是 MARK ——
+  差别不是写法上的洁癖，是「要不要保留 UNKNOWN」决定的。
+- `MARK` 出现在 `NOT IN` 时还多一个 `NOT SUBQUERY` 过滤器。
+- 注意节点名是 `Join Type: SEMI` 这种**连接类型**，不是一个叫 `MARK_JOIN` 的独立算子。
+
+### 5. Polars 的 `is_in` 不复现 SQL 的三值逻辑
+
+| id | DuckDB `IN` | Polars `is_in` |
+| --- | --- | --- |
+| 1 | NULL | FALSE |
+| 2 | TRUE | TRUE |
+| 3 | NULL | FALSE |
+| NULL | NULL | NULL |
+
+对账结果（左边 DuckDB，右边 Polars）：
+
+| 对照 | 结果 |
+| --- | --- |
+| `EXISTS` ↔ `join(how='semi')` | ✅ 1 行 × 1 列全部一致 |
+| `NOT EXISTS` ↔ `join(how='anti')` | ✅ 2 行 × 1 列全部一致 |
+| 带 NULL 的 `NOT EXISTS` ↔ `anti` | ✅ 3 行 × 1 列全部一致 |
+| 带 NULL 的 `NOT IN` ↔ `~is_in` | ❌ 行数不一致：duckdb=0, polars=2 |
+
+- **半连接这一族两边完全对齐**，带不带 NULL 都一致。迁移时用半连接对半连接可以放心。
+- **`NOT IN` 这一族对不上**：Polars 的 `is_in` 只回答「在不在」，把 UNKNOWN 直接压成了 FALSE。
+- → **迁移规则**：`NOT IN (子查询)` 一律改成 `NOT EXISTS`；
+  `IN (子查询)` 在 `WHERE` 里两边等价，但要拿布尔列（放 `SELECT` 列表里）
+  就得自己补 UNKNOWN —— Polars 侧没有现成的三值逻辑。
+- Polars 2.x 里 `is_in` 对「同 dtype 的 Series」会发 DeprecationWarning，
+  要写 `r['id'].implode()` 才回到旧行为。
+
+### 6. 代价：五种写「在不在」的方式
+
+数据：左表 200,000 行，右表约十分之一（每 10 个 id 命中 1 个）。
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 命中行数 |
+| --- | --- | --- | --- |
+| DuckDB `EXISTS` 相关子查询 | 10.4 | 9.7 | 200,000 |
+| DuckDB `IN (子查询)` | 9.7 | 9.5 | 200,000 |
+| DuckDB `SEMI JOIN` | 10.8 | 9.1 | 200,000 |
+| Polars `join(how='semi')` | 9.8 | 7.9 | 200,000 |
+| Polars `filter(is_in(...))` | 5.7 | 4.8 | 200,000 |
+
+口径：两个 parquet 在计时前已物化 —— DuckDB 侧是内存表 `big_l` / `big_r`，
+Polars 侧是内存里的 DataFrame，所以计时**不含读盘**。
+五行做的**是同一件事**：数出左表里有多少行能在右表找到对应的 id，
+右表在两边都是同一份数据（约左表的十分之一），没有 NULL。
+DuckDB 侧的子查询每次都要重新扫右表建哈希表，Polars 侧的 `is_in` 每次
+也要把右表打包成 list —— 两边都付了「准备右表」这笔钱，账是平的。
+
+解读：
+
+- **DuckDB 那三行的差距很小** —— 优化器已经把 `EXISTS` 和 `IN` 都改写成了同一个半连接，
+  `EXISTS` 并没有「多跑一遍子查询」。如果你的 EXPLAIN 里 `EXISTS` 真的落成了
+  `Dependent Join`，那才要担心。
+- 所以在 DuckDB 上，写 `EXISTS` 还是写显式 `SEMI JOIN` **不影响性能**，只影响可读性 ——
+  显式写 `SEMI JOIN` 能让「这里是半连接、不会放大行数」这件事写进 SQL 里。
+- **Polars 那两行走的不是一条路**：`join(how='semi')` 是哈希半连接，
+  要把右表建成哈希表、再按左表的行序吐出来；`is_in` 是「右表做成一个集合、逐行查表」
+  —— 它不做连接，只做成员判定，所以不用管列、也不用管行序。
+- 真正的结论不是「谁快」，而是**两边都要先把右表压成一份可查的结构**；
+  而且它是**每次查询都要重建**的 —— DuckDB 侧重建的是哈希表，Polars 侧重建的是那个集合。
+
+## 递归 CTE 与迭代计算
+
+`src/recursive_demo.py`。DuckDB 有 `WITH RECURSIVE`，Polars 没有 ——
+但**这不是「一个能做、一个不能做」的差别**，而是「谁来数层数」的差别。
+
+### 1. 层级遍历：一句 SQL vs 一段 Python 循环
+
+组织架构表（9 个节点、4 层），DuckDB 的写法：
+
+```sql
+WITH RECURSIVE chain(id, name, depth, path) AS (
+  SELECT id, name, 0, name FROM emp WHERE mgr IS NULL      -- 锚点
+  UNION ALL                                                 -- 迭代
+  SELECT e.id, e.name, c.depth+1, c.path || ' > ' || e.name
+  FROM emp e JOIN chain c ON e.mgr = c.id                    -- 递归项
+) SELECT * FROM chain
+```
+
+Polars 侧是一段 Python 循环：每一轮 join 出下一层，再拼回去。
+
+对账：✅ **9 行 × 4 列全部一致**，连 `depth` 列的类型都一致（两边都是 INT32）。
+
+→ 能力差距在这里还看不出来（两边都能做对）。真正拉开差距的是下一节：路径不止一条的时候。
+
+### 2. 路径枚举：递归的行数是路径数，不是节点数
+
+DAG（8 个节点、9 条边，交付组有两个上级）→ 递归吐出了 **9 条路径**。
+
+换成「斐波那契阶梯」（节点 i 的上级是 i-1 和 i-2）：
+
+| 层数 | 递归出的路径数 |
+| --- | --- |
+| 5 | 12 |
+| 10 | 143 |
+| 15 | 1,596 |
+| 20 | 17,710 |
+| 25 | 196,417 |
+
+→ 深度只涨了 5，路径数涨了一个数量级。递归 CTE 本身没问题，
+但它把「路径」这件事**显式物化**出来了，组合爆炸是数据结构的性质，不是引擎的锅。
+
+Polars 的逐层 join 同样能枚举出全部路径（✅），但代价是**循环次数和路径数一起涨**，
+Python 侧要一遍遍 concat。
+
+→ **实践建议**：能用「祖先-后代对」表达的问题（谁能影响谁），
+别去枚举路径 —— 场景 4 的传递闭包就是干这个的，行数少得多。
+
+### 3. 执行模型：EXPLAIN 里那个 `Rec CTE` 节点
+
+物理计划里有一个 `Rec CTE` 节点，它下面挂着一个 `Rec CTE Scan` ——
+那是「上一轮的结果」被物化出来的地方，每一轮迭代都从这张临时表读，再算出下一轮。
+
+`EXPLAIN ANALYZE` 里同一个节点叫 `Recursive CTE`（带 `Recursive CTE Scan`）；
+静态计划里是缩写 `Rec CTE`。
+
+`explain_output='all'` 给三份计划，能看到优化的过程：
+优化前根节点是 `CTE`（里面套着一个 `Rec CTE`），优化后根节点是 `Projection`，
+到物理计划 `Rec CTE` 直接当根 —— 而且 `Comparison Join` 在物理阶段换成了 `Hash Join`。
+`Rec CTE Scan` 只在物理计划里出现：它是运行时物化的那张临时表。
+
+→ 代价的形状由此确定：**迭代轮数 = 数据的层数**。
+层数少（宽而浅的树）就快，层数多就慢 —— 而且每轮都要把中间结果物化一遍。
+
+### 4. `UNION ALL` 还是 `UNION`：差别就是「会不会收敛」
+
+传递闭包（谁是谁的祖先，含自己）：
+
+| 写法 | 行数 |
+| --- | --- |
+| `UNION ALL`（不去重） | 26 |
+| `UNION`（跨轮去重） | 25 |
+
+其中不同的 (祖先, 后代) 组合有 25 对 —— `UNION ALL` 多出来的 1 行就是重复的推导路径。
+对账 DuckDB `UNION` 闭包 ↔ Polars 闭包：✅ **25 行 × 2 列全部一致**。
+
+→ `UNION` / `UNION ALL` 的区别在这里是**能不能停下来**的区别：
+
+- `UNION ALL`：每轮输出全部追加，不管跟之前重不重复。
+- `UNION`：**跨轮去重** —— 算出来的值集合没变就不再产生新行，
+  于是递归变成了「求不动点」，可以停下来。
+
+→ **迁移规则**：从别的方言搬过来的递归 CTE，第一件事是确认 `UNION` 还是 `UNION ALL` ——
+Postgres 里 `UNION`（去重）是默认，`UNION ALL` 要手写；反过来抄很容易抄反，
+而**抄反的后果不是结果错，是跑不完**。
+
+### 5. 反直觉：数据里有环时，递归不会自己停
+
+| 情况 | 实测 |
+| --- | --- |
+| `UNION ALL` + 环 | 跑满 3 秒阈值仍未结束，被 `interrupt()` 中断 |
+| `UNION`（去重）+ 环，输出列不变 | 收敛，结果 `[(1,), (2,)]` |
+| `UNION`（去重）+ 环，输出列每轮都变（带 depth） | 跑满 3 秒阈值仍未结束，被 `interrupt()` 中断 |
+
+→ 这是本 demo 里**最危险**的一条：
+
+- **DuckDB 2.0 的递归 CTE 没有内置的迭代次数上限。**
+  上面第一行实测：带环的 `UNION ALL` 递归跑满了本 demo 自己设的 3 秒窗口还没停
+  （这不是 DuckDB 的超时 —— 引擎压根没有这个机制）。
+  换成真业务数据就是**一条跑不完的查询**，而且它不会报错、不会超时，
+  只会一直占着 CPU 和内存。
+- 唯一沾点边的 `max_expression_depth` 跟这事**没关系** ——
+  它管的是解析器里的表达式嵌套深度，不是递归轮数。
+- `UNION` 能收敛，是因为去重之后**值集合不再变化**。
+  但只要输出列里带一个每轮都变的东西（比如 depth），去重就失效了，照样跑不完。
+- → **实践建议**：递归 CTE 里**自己写上限** —— 在递归项上加 `WHERE c.depth < 100`
+  （拿层级/步数当护栏），或者用 `UNION`（去重）+ 不变的输出列，让它自己收敛。
+- Polars 侧反而更好防：循环是你自己写的，`for _ in range(1000)` 或者
+  `if level.height == 0: break` 都是现成的护栏。
+
+### 6. Polars 的两种替代写法
+
+对账：逐层 join ✅ 9 行 × 4 列全部一致；`map_elements` ✅ 9 行 × 4 列全部一致。
+`depth` 列的类型：DuckDB Int32 / 逐层 join Int32 / **`map_elements` Int64**。
+
+- **逐层 join**：Python 开销是「层数」级别的 —— 一层一次向量化 join，中间结果是 DataFrame。
+- **`map_elements`**：Python 开销是「节点数 × 树高」级别的 ——
+  每个节点都要沿 mgr 一路走到根，每一步都是一次 Python 字典查找和循环。
+  好处是它**天然是个函数**，不用管循环、不用管收敛；坏处是完全没法向量化。
+- → **选型**：层级浅、节点多 → 逐层 join；层级深、节点少 → `map_elements`；
+  层级和数据都大 → 回到 DuckDB。
+
+### 7. 代价
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 行数 |
+| --- | --- | --- | --- |
+| DuckDB `WITH RECURSIVE`（UNION ALL） | 64.3 | 59.4 | 2,000,000 |
+| DuckDB `WITH RECURSIVE`（UNION 去重） | 585.4 | 513.0 | 2,000,000 |
+| Polars 逐层 join 循环 | 379.6 | 325.0 | 2,000,000 |
+| Polars `map_elements` | 8372.4 | 8301.2 | 2,000,000 |
+
+内存放大：这棵树高 20 层
+
+| 列 | 字符数 |
+| --- | --- |
+| `name`（每个节点一个名字） | 22,888,896 |
+| `path`（每个节点一整条路径） | 454,530,759 ≈ `name` 的 **19.9 倍** |
+
+（Polars 逐层 join 算出来的 `path` 列同样是 454,530,759 个字符。）
+
+口径：树在计时前已物化 —— DuckDB 侧是内存表 `tree`，
+Polars 侧是内存里的 DataFrame，所以计时**不含读盘**。
+四行做的**是同一件事**：算出每个节点的 depth 和 path，
+输出同样多的行（表里「行数」那列），结果也逐行相同。
+两行 DuckDB 的区别只有 `UNION ALL` 和 `UNION`（去重），
+这棵树里每条路径都不同，所以去重不会改变结果，只改变代价。
+计时不含建树，也不含 Polars 侧 DataFrame 的第一次读入。
+重复次数取中位数，机器是共享开发机，单次数字会有抖动。
+
+解读：
+
+- **DuckDB 的递归 CTE 只迭代「树高」次** —— 轮数只跟深度有关，跟节点数无关。
+- **两行 DuckDB 的差值就是「去重」的代价** —— `UNION` 要维护一个已经见过的值的集合，
+  每一轮都要往里查、往里插。场景 4 里说 `UNION` 换来的是「会收敛」，这里就是它的账单。
+- **Polars 逐层 join 的轮数跟 DuckDB 一样**，但每一轮都要过一遍 Python。
+- **`map_elements` 是「每个节点一次 Python 调用」**，总代价是 O(节点数 × 树高)；
+  逐层 join 是 O(树高) 次向量化 join —— 两行的差距就是「每节点一次」的代价。
+- **内存放大在 path 列上**：递归 CTE 每轮都要把上一轮的 path 物化一遍，
+  树越深放大越狠（换成一条链会放大成平方级）。
+  → 深度信息能预计算就预计算，别在递归里一路拖着字符串走。
+
+## 视图、宏与持久化对象
+
+`src/ddl_demo.py`。这一段问的是「哪些东西活得比一个进程长」——
+DuckDB 的答案和 Polars 的答案几乎不重叠。
+
+### 1. 视图：存进 `.duckdb` 文件，重连之后还在
+
+```sql
+CREATE VIEW v_big AS SELECT id, region, amount FROM sales WHERE (amount >= 100);
+```
+
+关掉连接、重新打开同一个 `.duckdb` 文件，再查 —— 结果一致，
+`duckdb_views()` 里还有同名视图：**视图是数据库级的，不是连接级的**。
+
+Polars 侧最接近「视图」的是 LazyFrame，但它跟 DuckDB 的视图差着三样东西：
+**没有名字、只在内存里、进程退出就没了**。
+（Polars 2.1 有 `LazyFrame.serialize()`，能存下的是**执行计划**，
+不是一段你能读懂、能改的 SQL 文本，也没法在数据库里注册。）
+
+### 2. 反直觉：视图存的是「配方」不是「结果」
+
+查 `v_big` 的执行计划，再把视图的 SQL 原样展开手写一遍，看两次的计划 ——
+**两段计划逐字符相同**（`True`），计划里提到 VIEW 的地方 **0 处**，
+只有一行 `Filters: amount >= 100.0` —— 视图里那句 WHERE 被**原样贴进**了查询计划。
+
+→ **DuckDB 的视图不是「存下来的结果」，是「存下来的 SQL 文本」。**
+每次查它，底下的表都要重新扫一遍 —— 视图**不省任何计算**，只省打字。
+所以「建了视图查询就快了」是错觉：DuckDB 里快的是**物化成一张真表**（场景 5）。
+
+Polars 的 LazyFrame 恰恰相反：它是**惰性计划**，collect 之前一行都不算，
+但也没有名字 —— 两边都是「配方」，DuckDB 的配方能存进文件，Polars 的不能。
+
+### 3. 宏：带参数的 SQL 函数，同样能落盘
+
+| 宏 | 形态 | 实测 |
+| --- | --- | --- |
+| `add_tax(x, rate)` | 标量宏 | `add_tax(100, 0.1)` → 110.0 |
+| `add_bonus(x, bonus=10)` | 标量宏 + 默认参数 | `add_bonus(5)` → 15，`add_bonus(5, 99)` → 104 |
+| `tbl_top(n)` | 表宏（返回一张表） | 能直接参与 JOIN |
+
+宏混在 `duckdb_functions()` 里，用 `function_type` 区分（`macro` / `table_macro`）——
+DuckDB 2.0 没有 `duckdb_macros()` 这张表。重连之后宏还在。
+
+Polars 对应的是**普通 Python 函数**：区别是 Python 函数活在一个进程里，
+没有名字、不能被 SQL 文本引用；而 DuckDB 的宏写在 `.duckdb` 文件里，任何连接都能调。
+
+### 4. 序列：`nextval` 的号是连续的，跨连接接着往下发
+
+同一个连接里连发两个号：1, 2；`duckdb_sequences()` 里 `last_value=2`。
+关掉连接、重连，再 `nextval` 一次 → **3**（号存在数据库文件里，重连不会从头开始）。
+
+Polars 侧没有序列，也没有 `nextval`。要一列连续 ID 的常见两种做法
+（`df.with_row_index('n')`、`pl.int_range(1, n+1)`）都只是**当场算出来的一个列**，
+不是数据库对象：没有「下一个号」的概念。
+
+### 5. DuckDB 2.0 没有物化视图
+
+```
+CREATE MATERIALIZED VIEW mv AS SELECT count(*) c FROM sales
+-> ParserException: Parser Error: syntax error at or near "MATERIALIZED"
+```
+
+解析器在 `MATERIALIZED` 这个词上就断了 —— 不是「不支持」而是「不认识」，
+连这串 token 都不是语法。
+
+替代方案：直接物化成一张真表（CTAS）或者 `COPY ... TO parquet`（覆盖写，不是追加），
+刷新逻辑要自己写。DuckDB 没有「这是物化视图」的标记 —— 物化之后视图和表就分不出来了。
+
+### 6. 反直觉：DuckDB 2.0 其实**有**触发器 —— 但只实现了子集
+
+| 触发器 | 结果 |
+| --- | --- |
+| `AFTER INSERT ... FOR EACH STATEMENT` | ✅ 能建，插一行后 audit 表里有 1 条 |
+| `BEFORE ... FOR EACH ROW` | ❌ `NotImplementedException: BEFORE FOR EACH ROW triggers are not yet supported` |
+
+触发器也能在 `duckdb_triggers()` 里看到，重连之后还在 —— 也是数据库级的持久对象。
+
+→ 所以「DuckDB 不支持触发器」这句话在 2.0 上是**不准确**的 ——
+准确的说法是：**只实现了触发器的一个子集**。
+Polars 连这个子集都没有 —— 不是「功能少一点」，是整个「数据库替你执行」这件事在 Polars 里不存在。
+
+### 7. 持久化的边界
+
+| 对象 | 落在哪 | 重连后还在吗 |
+| --- | --- | --- |
+| `CREATE TABLE` / `VIEW` | `.duckdb` 文件 | 在 |
+| `CREATE MACRO` / `SEQUENCE` | `.duckdb` 文件 | 在 |
+| `CREATE TRIGGER` | `.duckdb` 文件 | 在 |
+| Python UDF | 连接内存 | **不在**（重连后 `CatalogException: Scalar Function with name py_double does not exist!`） |
+| `SET memory_limit` / `threads` | 连接内存 | **不在** |
+
+→ **写进 catalog 的东西跨进程，写进连接状态的东西不跨进程。**
+
+选宏还是选 Python UDF，就看你想让它活多久：宏是纯 SQL 表达式，跨进程跨连接都能用，
+别的工具（CLI、DBeaver）也能调；Python UDF 能做宏做不了的事（调 HTTP、读文件、跑正则引擎），
+但它绑在这个进程上 —— 而且 DuckDB 对 Python UDF 是**逐行**调用的，
+慢得不是一个量级 —— 这才是它真正的代价，不是「不能持久化」。
+
+### 8. 代价：视图每次重算，物化算一次
+
+| 实现 | 定义成本 (ms) | 单次查询 (ms) | N 次总计 (ms) |
+| --- | --- | --- | --- |
+| DuckDB 视图 | 0.6 | 9.6 | 48.7 |
+| DuckDB 物化表 (CTAS) | 9.1 | 0.6 | 12.2 |
+| Polars LazyFrame | 0.0 | 14.2 | 70.8 |
+| Polars 物化 parquet | 15.1 | 0.5 | 17.7 |
+
+对账（5 次重复后取最后一次结果）：DuckDB 视图 vs DuckDB 物化表 / Polars LazyFrame /
+Polars 物化 parquet —— 三次都是 **✅ 7 行 × 3 列全部一致**。
+
+**回本点**：物化表定义一次要 9.1 ms，每次查询比视图省 9.0 ms ——
+查 2 次以后，物化才比视图划算。
+
+口径：输入是同一份 parquet，四种实现算的是同一个聚合
+（按 region 分组、过滤 amt > 100、算条数和求和），结果已对账一致。
+「定义成本」= 建一次对象的时间；「单次查询」= 拿到结果一次的时间，
+两边都**包含读 parquet**。「N 次总计」= 定义成本 + 单次查询 × 重复次数，取中位数。
+Polars LazyFrame 的「定义成本」接近 0，是因为它本来就是惰性的 ——
+表达式只被记下来，一行数据都还没算。
+DuckDB 的物化表存在 `.duckdb` 文件里、Polars 的物化写在 parquet 文件里 —— 两者是对等的。
+
+解读：
+
+- **视图不省计算，只省打字。** 视图那一行的「单次查询」跟 LazyFrame 那一行是同一量级。
+- 真正省时间的是**物化**：把「扫 + 过滤 + 聚合」做一次存下来，之后每次查询只剩下读结果。
+- 所以「要不要物化」是个纯算术题：**物化成本 ÷ 每次省下的时间 = 回本点**。
+  查得少就别物化，查得多就值得。
+- DuckDB 2.0 没有 `CREATE MATERIALIZED VIEW` 这条命令，
+  但上面这四行数字说明：**这件事你本来就得自己做** ——
+  在别的数据库里你靠一条 DDL 声明，在 DuckDB 里你靠一张真表。
+
+## 内存上限与落盘
+
+`src/memory_demo.py`。这一段是**两边最不对等**的地方：
+DuckDB 有一套能兑现的内存预算机制，Polars 压根没有这套机制。
+
+### 1. `memory_limit` 是个预算，不是一堵墙
+
+刚连上时的默认值：`current_setting('memory_limit')` → **100.3 GiB**，
+物理内存 125.5 GiB —— 默认上限就是**物理内存的 80%**。
+
+顺带一提，默认的 `temp_directory` 是 **`.tmp`** —— 也就是**当前工作目录**。
+不改它，DuckDB 落盘的时候就会往你正在跑脚本的那个目录里写临时文件。
+
+`SET memory_limit='50MB'` 之后回显成 **47.6 MiB** —— DuckDB 认的是十进制：
+50 MB = 50,000,000 字节 = 47.7 MiB。「我设了 50MB」在内部其实是 47.6 MiB，
+差的那点不是误差，是**单位制**。
+
+这个上限管的是**缓冲区管理器**的总预算（扫描缓冲、哈希表、排序的临时空间）。
+超了 DuckDB 有两条路：往磁盘上溢写，或者报错。
+
+→ 它**不是**「不许超过」的硬墙 —— 它是「超了以后怎么办」的开关。
+
+（另外：DuckDB 2.0 里没有 `PRAGMA memory_limit`，只有 `current_setting`；
+`PRAGMA temp_directory` 同样不存在，别按老文档写。）
+
+### 2. 落盘：预算不够时，中间结果写到 temp_directory
+
+能落盘的窗口其实很窄 —— 上限太小，缓冲区管理器的固定开销就把预算吃光了，直接 OOM；
+上限太大，中间状态又装得下，压根不用落盘。脚本里是**试**出来的（每个组合都真跑一遍）：
+
+| 上限 | 4 线程 | 8 线程 |
+| --- | --- | --- |
+| 10MB | OOM | OOM |
+| 20MB | OOM | OOM |
+| 30MB | 跑完，落盘 56,786,944 字节 | OOM |
+| 40MB | 跑完，落盘 52,396,032 字节 | OOM |
+| 50MB | 跑完，落盘 29,130,752 字节 | OOM |
+| 60MB | 跑完，落盘 27,885,568 字节 | 跑完，落盘 48,824,320 字节 |
+| 80MB | 跑完，落盘 16,187,392 字节 | 跑完，落盘 37,388,288 字节 |
+| 100MB | 跑完，落盘 3,112,960 字节 | 跑完，落盘 10,584,064 字节 |
+
+临时文件长这样（文件名里那个数字是**进程 PID**）：
+
+```
+duckdb_temp_902737_12_owner
+duckdb_temp_902737_12_storage_DEFAULT-0.tmp
+duckdb_temp_902737_12_storage_S128K-0.tmp
+```
+
+**查询跑完之后再看目录** —— 数据文件（`*.tmp`）都删了，只剩一个 0 字节的 `_owner` 锁文件。
+临时文件是**用完即删**的：「有没有落盘」只能靠运行期间观察，事后去目录里找是找不到的。
+（想从 SQL 侧看，`duckdb_temporary_files()` 有 `path` / `size` 两列 ——
+但查询结束再查它就是空的，同一张表，区别只在查的时刻。）
+
+### 3. 反直觉：线程一多，同样上限直接 OOM
+
+同样的查询、同样的 50MB 上限，只改线程数：
+
+```
+threads=8 -> OutOfMemoryException
+  Out of Memory Error: failed to allocate data of size 4.0 KiB (47.8 MiB/47.6 MiB used)
+    Possible solutions:
+    * Reducing the number of threads (SET threads=X)
+    * Disabling insertion-order preservation (SET preserve_insertion_order=false)
+    * Increasing the memory limit (SET memory_limit='...GB')
+```
+
+→ **DuckDB 的 `memory_limit` 是全局预算，但每个线程各自持有缓冲区。**
+线程越多，单线程能分到的就越少 —— 同一个上限下反而更容易直接 OOM。
+注意 8 线程那次：**先落了 8,024,064 字节的盘，然后才撞上限** ——
+落盘只是把失败往后推了推，并没有救回来。DuckDB 自己的报错第一条建议就是降线程数。
+
+→ 所以「内存不够就调大 memory_limit」不是唯一解，**先把 `SET threads` 调小**往往就够了。
+
+### 4. 反直觉：`memory_limit` 是**连接级**的
+
+| 连接 | `memory_limit` |
+| --- | --- |
+| 连接 A（内存库） | 47.6 MiB |
+| 连接 B（新建的内存库） | 100.3 GiB（**完全没受影响**） |
+| 连接 C（文件库） | 47.6 MiB |
+| 连接 D（重开同一个文件） | 100.3 GiB |
+
+文件库也不记这个设置：它是**连接状态**，不写进 `.duckdb` 文件。
+这跟视图、宏不一样 —— 对照表：
+
+| 设置 / 对象 | 存在哪 | 换个连接还有吗 |
+| --- | --- | --- |
+| `CREATE VIEW` / `MACRO` | `.duckdb` 文件 | 在 |
+| `SET memory_limit` | 连接状态 | 不在 |
+| `SET threads` | 连接状态 | 不在 |
+
+→ 实务上的后果：同一个 Python 进程里 `duckdb.connect()` 两次就是两个互不相关的世界；
+多个进程各连同一个 `.duckdb` 文件，各自的 memory_limit 互不影响 ——
+这既是好事（不会互相踩），也是坏事（你以为设了，其实是各设各的）。
+
+### 5. Polars 的流式引擎：`collect(engine="streaming")`
+
+```
+lf.collect(streaming=True)
+-> ArgumentRemovedError: the argument 'streaming' ... was removed in version 2.0.
+   Use `engine="streaming"` instead.
+```
+
+而且 **2.x 的默认引擎已经是流式的**（1.x 默认是内存引擎）。
+实测判据是抓 Polars 的 verbose 日志：流式引擎会把聚合**拆成子图并行跑**
+（`running group-by in subgraph`），内存引擎是一把梭（`keys/aggregates are not partitionable`）：
+
+| 写法 | 拆子图 | 一把梭 |
+| --- | --- | --- |
+| 默认 `collect()` | True | False |
+| `engine="streaming"` | True | False |
+| `engine="in-memory"` | False | True |
+
+流式的意思是**一批一批**往外吐：`collect_batches(chunk_size=20000)` → 5 批，
+每批 `[20000, 20000, 20000, 20000, 20000]` 行。
+（对比 DuckDB：DuckDB 没有「批次」这个概念，它是一条流水线，内存不够就往 `temp_directory` 溢写。）
+
+→ 流式引擎是 Polars **唯一**的省内存手段 —— 但它**不是上限**：
+它让峰值更低，可它没有「不许超过 X MB」这个开关。
+
+### 6. 谁在管内存：峰值 RSS 实测
+
+每个实现单独跑在独立子进程里，用 `/proc/self/status` 的 `VmHWM` 报它自己占了多少
+（不能用 `ru_maxrss`：Linux 上它会被子进程从父进程继承，测出来会一排相同）。
+基线（只 import 引擎）：DuckDB 66.0 MB · Polars 55.8 MB。
+
+| 实现 | 峰值 RSS (MB) | 减去基线 | 结果行数 |
+| --- | --- | --- | --- |
+| DuckDB 不限内存 | 271.2 | 205.2 | 100,000 |
+| DuckDB 50MB 上限（落盘） | 156.0 | 90.0 | 100,000 |
+| Polars in-memory | 265.7 | 209.9 | 100,000 |
+| Polars streaming | 251.2 | 195.4 | 100,000 |
+
+- DuckDB 侧的关键对照是前两行：**同一个引擎、同一个查询，只把上限从「不设」改成那个试出来的值** ——
+  多出来的内存从 205.2 MB 降到 90.0 MB，上限确实在起作用。
+- 但**别把它当成「进程 RSS 的上限」**：它管的是 DuckDB 自己记账的那部分
+  （扫描缓冲、哈希表、排序空间），进程里还有引擎常驻开销和分配器碎片。
+  它是**引擎账本的上限**，不是操作系统账本的上限。
+- Polars 侧：换流式引擎确实省了一点 —— 但**省的是峰值，不是上限**，
+  而且不管选哪个引擎，都**没有任何一个旋钮**能把它钉在某个数上。
+
+实测枚举（Polars 2.1）：
+
+- `pl.Config` 里名字带 `mem` 的设置项 → `[]`
+- `pl.exceptions` 里名字带 `memory` 的异常 → `[]`
+
+一个都没有。Polars 的内存是 Python 和 Rust 运行时直接向系统要的，
+中间**没有一层「记账 + 拦截」**。
+
+| 能力 | DuckDB | Polars |
+| --- | --- | --- |
+| 内存上限 | `SET memory_limit='50MB'` | 没有 |
+| 溢写落盘 | `SET temp_directory='...'` | 没有 |
+| 批大小 | 随上限自动调整 | `set_streaming_chunk_size()` |
+| 超限时的异常 | `OutOfMemoryException` | 没有 |
+
+两边的**失败方式**完全不同：
+
+- DuckDB：失败发生在**进程内**，是一个能被 try/except 接住的 `OutOfMemoryException`，
+  报错里写着「Reducing the number of threads」「Increasing the memory limit」——
+  失败是**可诊断、可修复**的，连接还能接着用。
+- Polars：没有上限，也就没有「预算超了」的判定点。真到分配不出来的时候，
+  是 Rust 运行时 abort 掉整个进程（或者被系统的 OOM killer 干掉），
+  Python 侧什么都拿不到 —— 没有异常、没有 traceback、没有部分结果。
+
+→ **DuckDB 的内存上限是一套能兑现的机制，Polars 压根没有这套机制。**
+迁过去之前得自己加一层：用 cgroup / 容器限额把进程框住，
+否则「跑一半被 kill」这种事在生产环境里最难查。
+
+### 7. 代价：落盘比全放内存慢多少
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果行数 |
+| --- | --- | --- | --- |
+| DuckDB 不限内存 | 79.6 | 76.1 | 100,000 |
+| DuckDB 50MB 上限（落盘） | 165.2 | 160.6 | 100,000 |
+| Polars in-memory | 41.9 | 39.7 | 100,000 |
+| Polars streaming | 35.7 | 32.8 | 100,000 |
+
+对账（两个引擎对同一份 parquet 做的同一个聚合，逐组比对）：
+**✅ 100000 行 × 2 列全部一致**。
+（落盘那一行跑了 5 次，期间最多写了 35,848,192 字节到 `temp_directory`。）
+
+口径：四个实现跑的是**同一个聚合**（10 万个分组、每组求和），读的是**同一份 parquet**，
+结果的行数一样（上面的对账已确认）。计时的范围是「从 parquet 读进来到拿到最终结果」，
+**包含读盘**。DuckDB 两行都固定 4 线程 —— 两行之间只差一个 `memory_limit`，
+所以它们可以直接比大小。Polars 两行用的是引擎默认线程池；跨引擎只能看量级，别当成严格对比。
+
+解读：
+
+- 落盘的代价就是**多了一轮磁盘 I/O**：中间状态本来在内存里，现在要写出去再读回来。
+  差距的大小取决于溢写了多少 —— 溢写得多差距就大；工作集本来就不大的话，差距接近零。
+- 所以「把 memory_limit 调小」是有代价的，但这个代价是**可预期的**：
+  它换来的是「不管机器内存多小都能跑完」。
+- DuckDB 和 Polars 在这里没有本质差别 —— 两边都能在低内存下跑完。
+  真正的差别在**失败的那一侧**（场景 6）：DuckDB 给你一个带解法的异常，
+  Polars 那边连一个内存异常类型都没有，进程被带走你就什么也拿不到了。
+
 ## 目录结构
 
 ```
@@ -2270,6 +4088,18 @@ duckdb-polars-demo/
 │   ├── schema_demo.py      # Schema 演进：ALTER TABLE / 大小写 / 读不一致的 schema
 │   ├── timeseries_demo.py  # 时间轴与序列生成：端点语义 / 补齐空档 / 截断 / 间隔
 │   ├── approx_demo.py      # 近似 vs 精确：HLL 误差 / 近似分位数 / 值不值
+│   ├── arith_demo.py       # 算术边界：除法 / 取模符号 / 舍入 / 溢出 / 除零
+│   ├── groupsets_demo.py   # 多维聚合：GROUPING SETS / ROLLUP / CUBE
+│   ├── pivot_demo.py       # 透视与重塑：PIVOT / UNPIVOT
+│   ├── nested_demo.py      # 嵌套类型：LIST / STRUCT / MAP / lambda 语法变更
+│   ├── plan_demo.py        # 查询计划：EXPLAIN 与投影裁剪
+│   ├── sample_demo.py      # 采样与随机：三种采样方法 / 种子
+│   ├── constraint_demo.py  # 约束与完整性：PK / FK / CHECK / 序列
+│   ├── ddl_demo.py         # 视图、宏与持久化对象：VIEW / MACRO / SEQUENCE
+│   ├── memory_demo.py      # 内存上限与落盘：memory_limit / temp_directory
+│   ├── exists_demo.py      # 存在性查询与半连接：EXISTS / IN / NOT IN
+│   ├── recursive_demo.py   # 递归 CTE 与迭代计算：WITH RECURSIVE
+│   ├── fault_demo.py       # 容错模式与坏数据：ignore_errors / store_errors
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     └── bench.sh            # 一键跑完整流程
@@ -2320,3 +4150,17 @@ duckdb-polars-demo/
 - Polars `over`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.over.html>
 - Polars `upsample`：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.upsample.html>
 - Polars `approx_quantile`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.approx_quantile.html>
+- DuckDB GROUPING SETS：<https://duckdb.org/docs/stable/sql/query_syntax/groupby>
+- DuckDB PIVOT：<https://duckdb.org/docs/stable/sql/statements/pivot>
+- DuckDB 嵌套类型：<https://duckdb.org/docs/stable/sql/data_types/struct>
+- DuckDB 宏：<https://duckdb.org/docs/stable/sql/macro>
+- DuckDB 约束：<https://duckdb.org/docs/stable/sql/constraints>
+- DuckDB 采样：<https://duckdb.org/docs/stable/sql/samples>
+- DuckDB 内存管理：<https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads>
+- DuckDB `WITH RECURSIVE`：<https://duckdb.org/docs/stable/sql/query_syntax/with>
+- DuckDB 算术函数：<https://duckdb.org/docs/stable/sql/functions/math>
+- Polars `pivot` / `unpivot`：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.pivot.html>
+- Polars `LazyFrame.explain`：<https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.explain.html>
+- Polars `sample`：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.sample.html>
+- Polars `List` 命名空间：<https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.list.html>
+- Polars `join`（semi / anti）：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.join.html>
