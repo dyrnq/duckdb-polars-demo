@@ -84,6 +84,8 @@ uv run python src/collation_demo.py  # 排序规则与中文排序：DuckDB 有 
 uv run python src/math_demo.py       # 数学函数语义：log() 在 DuckDB 是 log10，在 Polars 是自然对数
 uv run python src/similarity_demo.py # 字符串相似度 / 编辑距离：DuckDB 有 8 个内置函数，Polars 一个都没有
 uv run python src/parquet_meta_demo.py # Parquet 元数据内省 + 行组裁剪：zonemap 在哪儿、剪掉了多少
+uv run python src/concurrency_demo.py  # 并发 / 锁 / 多进程：DuckDB 单写者模型 vs Polars 只剩文件
+uv run python src/attach_demo.py       # ATTACH 多库 + catalog 内省：DuckDB 有「库」，Polars 只有文件
 ```
 
 一键跑完整流程：
@@ -149,6 +151,8 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `math_demo.py` | 数学函数语义：`log()` 在 DuckDB 是 log10、在 Polars 是自然对数；定义域边界、浮点精度、函数集合 |
 | `similarity_demo.py` | 字符串相似度 / 编辑距离：DuckDB 8 个内置函数 vs Polars 零个；且**全部按 UTF-8 字节算** |
 | `parquet_meta_demo.py` | Parquet 元数据内省 + 行组统计裁剪：zonemap 在哪儿、剪掉了多少、两边能不能看见 |
+| `concurrency_demo.py` | 并发 / 锁 / 多进程：文件锁、只读连接插队、WAL 崩溃恢复、MVCC、Polars 静默丢数据 |
+| `attach_demo.py` | ATTACH 多库 + 跨库 join + catalog 内省：DuckDB 有「库」和元数据，Polars 只有文件 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -199,6 +203,7 @@ uv run python src/fts_demo.py --extension            # 试装 duckdb 的 fts 扩
 uv run python src/math_demo.py --rows 2000000 --repeat 5
 uv run python src/similarity_demo.py --pairs 20000 --repeat 5
 uv run python src/parquet_meta_demo.py --rows 1000000 --repeat 5
+uv run python src/concurrency_demo.py --hold 3    # 持锁进程待多久（秒）
 ```
 
 用 DuckDB 交互式探索数据：
@@ -231,7 +236,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，54 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，56 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -284,6 +289,8 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | `parquet_meta/` | 文件名带行数，**永远不覆盖** | `sorted_<行数>.parquet`（按 `v` 排序落盘）、`shuffled_<行数>.parquet`（同内容、顺序打乱） | Parquet 元数据内省 + 行组统计裁剪（**两份内容完全一样，只有行组布局不同**） |
 
 `index_customers_*` 和 `parquet_meta/` 的文件名里带行数：换个 `--rows` 就是另一份文件，**永远不覆盖已有数据**。
+
+`concurrency_demo` 和 `attach_demo` **不往 `data/` 里写任何东西** —— 它们的实验数据全在 `tempfile.mkdtemp()` 建的临时目录里，跑完当场删掉（只删自己建的那个目录）。理由很直接：这两个 demo 测的正是「多进程同时碰同一个文件」，实验目录必须是**干净的、独占的** —— 要是落在 `data/` 里，跟别的 demo 并发跑就测不准了。
 
 ## 三条对照查询
 
@@ -531,6 +538,29 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 201 | Parquet 元数据内省 | **5 个表函数**（`parquet_schema` / `parquet_file_metadata` / `parquet_metadata` / `parquet_kv_metadata` / `parquet_full_metadata`） | 3 个（`read_parquet_schema` / `read_parquet_metadata` / `collect_schema`） | **行组级**（每个行组的 min/max、压缩、编码）Polars 一个都拿不到 |
 | 202 | `sniff_parquet` | **不存在**（只有 `sniff_csv`） | —— | Parquet 的 schema 在文件头里写死了，不需要「猜」 |
 | 203 | 看得见自己剪了多少 | `EXPLAIN ANALYZE` 直接报 **「Row Groups Scanned: 1 / 49」** | 只有 `use_statistics=True/False` 一个开关 | 想验证裁剪是否生效，DuckDB 侧看得到，Polars 侧只能看耗时 |
+| 204 | 多个进程写同一个文件 | 第二个进程 **`IOException: Could not set lock on file …`** | **两个都退出 0**，后写的赢，谁也不知道自己覆盖了谁 | DuckDB 失败得很响，Polars 静默丢数据 |
+| 205 | 只读连接能不能插队 | ❌ **不能**：`read_only=True` 和 `ATTACH (READ_ONLY)` 一样被挡 | 没有锁，随便读 | 只读的前提是**没有别的进程正在写** |
+| 206 | 锁矩阵 | 只有**全只读**才共享；任何一边要写就上独占锁 | 没有锁这一层 | — |
+| 207 | 锁冲突的报错 | 带**持锁进程的 PID + 用户名 + 文档链接** | 没有报错 | 排查线上事故时一眼知道是谁占着 |
+| 208 | 进程被 kill 后 | **WAL 自动回放**：`.wal` 留在盘上（**约 7.5 KB**，实测 7559~7562 字节），下次打开读到 900 行 | 文件是半截的，读都读不出来 | — |
+| 209 | 正常退出后 | 自动 checkpoint，`.wal` 被并进主文件并删除 | —— | — |
+| 210 | 事务 / 隔离级别 | **MVCC**：没提交的行别的连接看不见（0 行），提交后才可见（11 行） | 没有事务、没有「未提交」 | — |
+| 211 | 同一个文件 ATTACH 两次 | `ResourceInUseException: Unique file handle conflict` | —— | 别名换成什么都一样 |
+| 212 | 并发写同一个 parquet 路径 | —— | **两个进程都退出 0**，最终文件只剩 **100 / 200 行**（整整一个分片没了），有时直接坏掉 | 必须写临时文件 + 原子替换 |
+| 213 | 读到写了一半的文件 | 读不到（写者持锁） | `ComputeError: File out of specification`，偶尔 Rust `PanicException` | — |
+| 214 | PanicException 接不接得住 | —— | `PanicException` 继承的是 **`BaseException`**，`except Exception` **接不住** | 要写 `except BaseException` |
+| 215 | 「库」这个概念 | 有：一个 `.duckdb` 文件就是一个库 | 没有，只有文件和目录 | — |
+| 216 | 把别的库挂进来 | `ATTACH 'x.duckdb' AS sales` | 没有等价物 | — |
+| 217 | 跨库 join | 直接 `sales.t JOIN orders_db.u`，写法和单库一模一样 | 读多个路径后自己拼 | — |
+| 218 | 跨 schema 限定名 | `库.模式.表` 三段全支持 | 没有模式的概念 | — |
+| 219 | 枚举有哪些表 | `SHOW ALL TABLES` / `duckdb_tables()` / `INFORMATION_SCHEMA` | 只能自己扫目录 | — |
+| 220 | `SHOW TABLES` 的范围 | **当前 schema + 当前库的 main**（`USE sales.prod` → 3 行） | ❌ 没有这个语句 | 要全部用 `SHOW ALL TABLES` |
+| 221 | `INFORMATION_SCHEMA` 的范围 | **跨库**（`table_catalog` 是库名）—— 跟 Postgres 不一样 | ❌ 没有 | Postgres 迁过来的人会**多看到一堆别的库的表** |
+| 222 | `SHOW DATABASES` | 3 个 external 库（不含 system / temp） | ❌ 没有 | — |
+| 223 | 只读挂载 | `ATTACH (READ_ONLY)`，往里写 → `InvalidInputException` | 没有这层 | 引擎层禁止，不靠自觉 |
+| 224 | 挂 parquet 当库 | ❌ `Unrecognized storage type "parquet"` | parquet 本来就是它唯一的输入格式 | parquet 是「读的格式」，不是「一个库」 |
+| 225 | `DESCRIBE` | `DESCRIBE 库.模式.表`（跨库跨 schema 都能用） | `pl.describe` **不存在**；`DataFrame.describe()` 是**列的统计摘要** | 搜「describe」命中的是后者，不是 catalog |
+| 226 | Postgres 工具能不能直连 | 带 **pg_catalog 兼容层**（22 个视图） | —— | `information_schema` 本身就是拿这些视图拼出来的 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -554,7 +584,9 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 172~182 条在 `时间戳与日期的边界`、第 183~190 条在 `排序规则与中文排序` 里展开；
 第 191~198 条在 `数学函数语义：同一个 log()，两个底数`、
 第 199~200 条在 `字符串相似度与编辑距离：DuckDB 有 8 个，Polars 有 0 个`、
-第 201~203 条在 `Parquet 元数据内省与行组裁剪` 里展开。
+第 201~203 条在 `Parquet 元数据内省与行组裁剪` 里展开；
+第 204~214 条在 `并发、锁与多进程访问：DuckDB 拒绝，Polars 不设防`、
+第 215~226 条在 `ATTACH 与 catalog 内省：DuckDB 有「库」，Polars 只有「文件」` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -6221,6 +6253,339 @@ Polars 的 `scan_parquet` 有个 `use_statistics` 参数（默认 True），但*
 
 顺带说一句：`index_demo` / `parquet_meta_demo` / `partition_demo` 讲的其实是同一件事的三个面 —— **「让数据物理上挨在一起」，比在逻辑上建结构更划算。**
 
+## 并发、锁与多进程访问：DuckDB 拒绝，Polars 不设防
+
+`uv run python src/concurrency_demo.py`
+
+ETL 里最常见的事故之一是「多个进程同时往同一个 `.duckdb` 里写」。这个 demo 把两边在**真实多进程**下的行为逐条测出来 —— 每一行都是开了另一个进程实测的，不是查文档。
+
+一句话结论：**DuckDB 用「拒绝」换正确，Polars 用「不设防」换灵活。**
+
+### 1. DuckDB 的文件锁：第二个进程碰同一个文件
+
+主进程先以读写模式占住 `orders.duckdb`，另一个进程用四种方式去开同一个文件：
+
+| 打开方式 | 结果 |
+| --- | --- |
+| 读写 `connect(db)` | ❌ 被挡 |
+| 只读 `connect(db, read_only=True)` | ❌ 被挡 |
+| `ATTACH ... (读写)` | ❌ 被挡 |
+| `ATTACH ... (READ_ONLY)` | ❌ 被挡 |
+
+完整报错：
+
+```
+IOException: IO Error: Could not set lock on file "…/orders.duckdb":
+Conflicting lock is held in /usr/bin/python3.13 (PID 1981503) by user bill.
+See also https://duckdb.org/docs/current/connect/concurrency
+```
+
+**这里有个必须纠正的误解**：`READ_ONLY` **绕不过这个锁**。别的进程正在写的时候，你用只读模式打开、或者 `ATTACH ... (READ_ONLY)`，拿到的是**同一个 IOException**。「我不写」不等于「我能读」。
+
+而报错里带着**持锁进程的 PID、用户名和文档链接** —— 抢不到锁的时候，一眼就知道是谁占着，这在排查线上事故时非常值钱。
+
+### 2. 锁矩阵：到底什么能共享
+
+把「谁在占锁」和「另一个进程想怎么开」交叉着测了 8 种组合：
+
+| 进程 A | 进程 B | 结果 | 说明 |
+| --- | --- | --- | --- |
+| 读写 | 读写 | ❌ 冲突 | 有人要写 → 独占锁，别人全挡住 |
+| 读写 | 只读 | ❌ 冲突 | 同上 |
+| 读写 | ATTACH 只读 | ❌ 冲突 | 同上 |
+| 读写 | ATTACH 读写 | ❌ 冲突 | 同上 |
+| 只读 | 读写 | ❌ 冲突 | 同上 |
+| 只读 | **只读** | ✅ 能开 | 两边都只读 → 共享锁，不冲突 |
+| 只读 | **ATTACH 只读** | ✅ 能开 | 同上 |
+| 只读 | ATTACH 读写 | ❌ 冲突 | 同上 |
+
+规则一句话：**只要有一边想写，就上独占锁；全只读才共享。** 这就是 DuckDB 的「单写者模型」。
+
+同一个进程里开两个连接写同一个文件**不算**「两个写者」—— 两个连接都成功，第二个读到 30 行。
+
+### 3. 同一个文件不能 ATTACH 两次
+
+```sql
+ATTACH 'sales.duckdb' AS sales;        -- 成功
+ATTACH 'sales.duckdb' AS warehouse;    -- ResourceInUseException
+```
+
+```
+Resource In Use Error: Unique file handle conflict:
+Cannot attach "warehouse" - the database file "…/sales.duckdb" is already attached by database "sales"
+```
+
+别名换成什么都一样 —— DuckDB 对同一个文件只保留**一个 handle**。所以「先 ATTACH 读写、同一进程再 ATTACH 只读看看」这种写法行不通；这跟上一节「另一个进程只读打开被挡」是同一个根因。
+
+### 4. WAL：进程被 kill 了，数据还在
+
+起一个子进程写 900 行，然后 `SIGKILL` 自己（模拟机器被 kill，来不及 checkpoint）：
+
+| 步骤 | 结果 |
+| --- | --- |
+| 子进程被 kill 后 `.wal` 还在吗 | 在（**约 7.5 KB**，实测 7559~7562 字节） |
+| 下次打开这个文件 | **自动回放 WAL，读到 900 行** |
+| 回放之后 `.wal` 还在吗 | 不在了（已并进主文件） |
+
+**没丢数据。** 这是 WAL 的全部意义：写出去的要么在主文件里，要么在 WAL 里，下次打开一定在。
+
+对照：**正常退出**（没被 kill）→ `.wal` 已被自动 checkpoint 掉（不存在了）。
+
+`PRAGMA disable_checkpoint_on_shutdown` + 正常退出 → `.wal` 留着（几百字节），下次打开照样回放。这个 pragma 是给「批量写完之后自己控制 checkpoint 时机」用的。
+
+### 5. 事务隔离：没提交的数据，别人看不见
+
+连接 1 开一个事务插一行（但不提交），连接 2 同时读：
+
+| 时点 | 连接 2 看到那行吗 | 连接 2 看到的总行数 |
+| --- | --- | --- |
+| 连接 1 未提交 | **0 行** | 10 行（事务开始前的快照） |
+| 连接 1 回滚后 | —— | 10 行 |
+| 连接 1 提交后 | 1 行 | **11 行** |
+
+DuckDB 是 **MVCC**：读到的永远是「某一时刻的快照」，提交之前别人看不见，提交之后才看得见 —— 两边都不需要显式加锁。
+
+**Polars 没有这一层。** DataFrame 是一次性的物化结果，没有「事务」「未提交」「隔离级别」这些概念。
+
+### 6. Polars 侧：没有锁，只有文件
+
+**场景 A：两个进程同时覆盖写同一个 parquet 路径。** worker A 写第 0~99 行，worker B 写第 100~199 行，两边循环覆盖写同一路径：
+
+```
+写 A 段的进程：退出码 0，最后一句：OK
+写 B 段的进程：退出码 0，最后一句：OK
+```
+
+**两个进程都成功，没有一个人报错。** 最终文件有两种结局，**都很糟**：
+
+- **一种是少了整整一半**：本该有 200 行，实际只有 **100 行** —— **整整一个分片没了**；没有任何异常、警告，或「谁覆盖了谁」的痕迹 —— 你只会拿到一份**不完整**的数据，而且不知道少了什么；
+- **另一种是文件直接坏掉**：两个写进程的内容在文件里交错，footer 是碎的 —— `ComputeError: File out of specification: invalid utf8`，**连读都读不出来** —— 而两个写进程**都认为自己成功了**。
+
+> 这一段是竞态，落在哪一边取决于交错时机。demo 会把本次实测值如实印出来（本机两种结局都实测到过）。
+
+**场景 B：一个进程在写，另一个进程同时读。**
+
+| 测法 | 结果 |
+| --- | --- |
+| B1（确定性）：写进程把文件截断成一半停住 | `ComputeError: parquet: File out of specification: The file must end with PAR1 or PARE` |
+| B2（竞态）：200k 行文件被反复覆盖写，读 40 次 | 本机实测：**成功 0~2 次 / 失败 38~40 次**，全是 `ComputeError` |
+
+**没有锁，所以读到半截文件是常态。** 而 DuckDB 这边，写进程持锁期间读进程会拿到明确的 IOException —— 不是「偶尔读到坏数据」，是**每次都明确失败**。
+
+> B2 是竞态，失败比例随机器负载浮动 —— 上面的区间是本机多次实测的范围，demo 每次都把当次的值印出来。
+>
+> 失败时除了常见的 `ComputeError`，本机实测还出现过一次 Rust 的 **`pyo3_runtime.PanicException`**（`thread 'async-executor-N' panicked at crates/polars-io/src/utils/byte_source.rs:461`）—— 它继承的是 `BaseException` 而不是 `Exception`，**`except Exception` 接不住**。这就是 demo 里那个 `except BaseException` 的来由（Polars 侧要兜底只能这么写）。
+
+Polars 的正确做法（也是本项目 `write_demo.py` 讲的）：**先写临时文件，写完再原子替换** —— 读的人永远看到完整的旧版本或新版本。但这是**你自己要写的事**，Polars 不会替你做，也没有任何机制提醒你没做。
+
+### 7. 小结：并发的两套模型
+
+| 维度 | DuckDB | Polars |
+| --- | --- | --- |
+| 多个进程写同一个文件 | 第二个 IOException（带持锁 PID） | 两个都成功，数据悄悄少一半 |
+| 只读连接能不能插队 | ❌ 不能，同样被锁挡 | 没有锁，随便读（可能读到半截） |
+| 写一半的文件被读到 | 读不到（写者持锁） | ComputeError，偶尔 Rust panic |
+| 崩溃后数据会丢吗 | 不会，WAL 自动回放 | 会，文件是半截的 |
+| 事务 / 隔离级别 | 有（MVCC，看得见快照） | 没有 |
+| 要自己保证原子写 | 不需要 | **需要**（写临时文件 + 原子替换） |
+
+**ETL 里多进程抢写同一个 `.duckdb` 的正确姿势**：
+
+1. 一个进程写、别的进程等 —— 别并发写；
+2. 要并行，就各写各的文件，最后由一个进程合并；
+3. 只读的进程可以用 `ATTACH ... (READ_ONLY)`，但**前提是没有别的进程正在写** —— 这一条最容易踩。
+
+**Polars 侧的对应做法**：每个进程写自己的一份 parquet（天然并行、互不干扰）；要合并就读目录（`scan_parquet('dir/*.parquet')`，见 `partition_demo.py`）；**永远不要让两个进程写同一个路径** —— 实测不会报错，只会让你的数据悄悄少一半。
+
+## ATTACH 与 catalog 内省：DuckDB 有「库」，Polars 只有「文件」
+
+`uv run python src/attach_demo.py`
+
+DuckDB 的一个 `.duckdb` 文件是一个**独立的数据库**，可以挂到另一个连接上：
+
+```sql
+ATTACH 'sales.duckdb'   AS sales;
+ATTACH 'orders.duckdb'  AS orders_db;
+```
+
+挂上之后就能直接跨库 join，写法跟单库一模一样：
+
+```sql
+SELECT s.name, o.amount
+FROM sales.customers s
+JOIN orders_db.orders o ON s.id = o.id;
+```
+
+而且 DuckDB 自带一整套 catalog 内省（`SHOW TABLES` / `INFORMATION_SCHEMA` / `duckdb_tables()` / `duckdb_schemas()` / `duckdb_columns()` …）。
+
+**Polars 完全没有这一层** —— 没有「数据库」这个概念，只有文件和目录。
+
+### 1. 挂上之后长什么样
+
+`duckdb_databases()`：
+
+| 库名 | 路径 | 类型 | 只读 | internal |
+| --- | --- | --- | --- | --- |
+| memory | （内存 / 无文件） | duckdb | 否 | 否 |
+| orders_db | orders.duckdb | duckdb | 否 | 否 |
+| sales | sales.duckdb | duckdb | 否 | 否 |
+| system | （内存 / 无文件） | duckdb | 否 | **是** |
+| temp | （内存 / 无文件） | duckdb | 否 | **是** |
+
+`system` / `temp` 是 DuckDB 自带的（`internal = 是`），`memory` 是内存库；自己挂上来的 `sales` / `orders_db` 是 external 的。
+
+### 2. 跨库查询：三段式限定名
+
+跨库 join 两库各 100 行、按 id 对上 → 100 行。跨 schema 也能写：
+
+| 写法 | 结果 |
+| --- | --- |
+| `sales.main.customers`（库.表） | 100 行 |
+| `sales.prod.orders`（库.模式.表） | 100 行 |
+| `sales.vip`（库.视图） | 10 行 |
+
+**限定名跟单库一模一样**，只是多了一段前缀 —— 迁移的时候不需要为「多库」改任何查询写法。
+
+### 3. `ATTACH` 的选项
+
+**`READ_ONLY`**：挂上之后 `duckdb_databases()` 里 `readonly = True`，往里写直接报
+
+```
+InvalidInputException: Invalid Input Error: Cannot execute statement of type "INSERT"
+on database "ro" which is attached in read-only mode
+```
+
+只读是**引擎层**保证的：不是「你小心点别写」，是写不了。
+
+**`TYPE`** —— 挂什么类型的存储：
+
+| TYPE | 结果 | 说明 |
+| --- | --- | --- |
+| duckdb | ✅ 接受 | DuckDB 自己的文件（.duckdb） |
+| sqlite | ✅ 接受 | SQLite 文件 |
+| postgres | ⚠️ 连不上 | 需要真实的连接串（本机没连） |
+| mysql | ⚠️ 连不上 | 需要真实的连接串（本机没连） |
+| **parquet** | ❌ **不支持** | `Unrecognized storage type "parquet"` |
+| csv | ⚠️ 要扩展 | 需要 csv 扩展（下载被挡，见 `fts_demo`） |
+
+**`ATTACH` 不能挂 parquet。** parquet 在 DuckDB 里是「读的时候的格式」，不是「一个库」—— 要读 parquet 直接 `read_parquet('x.parquet')` 就行（见 `parquet_meta_demo.py`）。
+
+### 4. 同一个文件不能 ATTACH 两次
+
+跟 `concurrency_demo.py` 那节是同一个根因：别名换成什么都一样，`ResourceInUseException: Unique file handle conflict`。
+
+### 5. catalog 内省：三层接口，各能看到什么
+
+**① SQL 标准写法**
+
+| 语句 | 看到几行 | 覆盖范围 |
+| --- | --- | --- |
+| `SHOW TABLES` | 0 | **当前 schema + 当前库的 main**（当前库是 memory，没建表 → 0 行） |
+| `SHOW TABLES FROM sales` | 3 | 指定库的**所有** schema（3 张表/视图） |
+| `SHOW ALL TABLES` | 4 | **所有挂上来的库**（4 张表/视图） |
+| `SHOW DATABASES` | 3 | 所有 external 库（memory / orders_db / sales） |
+| `DESCRIBE sales.customers` | 2 | 指定表的三段式限定名 |
+| `DESCRIBE sales.prod.orders` | 2 | 跨 schema 也能 DESCRIBE |
+
+`USE` 之后再看 `SHOW TABLES`，范围跟着「当前库 + 当前 schema」走：
+
+| 当前设置 | `SHOW TABLES` |
+| --- | --- |
+| `USE sales` | 2 行：customers, vip |
+| `USE sales.prod` | 3 行：customers, orders, vip |
+| `USE orders_db` | 1 行：orders |
+| `USE memory` | 0 行 |
+
+**`SHOW TABLES` = 当前 schema 的表 + 当前库的 main schema**（`USE sales.prod` 时看到的是 `prod.orders` **加上** main 的 customers / vip）。`SHOW TABLES FROM <库>` 才是那个库的**所有** schema；`SHOW ALL TABLES` 才是**所有挂上来的库**。
+
+**② `INFORMATION_SCHEMA`（SQL 标准的那套）**
+
+| 视图 | 行数 |
+| --- | --- |
+| `INFORMATION_SCHEMA.tables` | 4（表和视图） |
+| `INFORMATION_SCHEMA.columns` | 8（列） |
+| `INFORMATION_SCHEMA.schemata` | 8（模式） |
+
+剔掉系统表之后，`INFORMATION_SCHEMA.tables` 里剩下：
+
+```
+('orders_db', 'main', 'orders')
+('sales', 'main', 'customers')
+('sales', 'main', 'vip')
+('sales', 'prod', 'orders')
+```
+
+**`table_catalog` 里是各个库的名字** —— `INFORMATION_SCHEMA` **是跨库的**。
+
+> 这一条反直觉：**Postgres 的 information_schema 只描述当前库**，DuckDB 这里却是所有挂上来的库都进来了。从 Postgres 迁过来的人会以为「查 information_schema 就等于查当前库」，在 DuckDB 这里会**多看到一堆别的库的表** —— 好消息是不会漏，坏消息是过滤条件得自己加。
+
+**③ `duckdb_*()` 表函数**（DuckDB 自己的接口，这一层也跨库，还多一个 `internal` 标记）
+
+| 表函数 | 跨库吗 | 能拿到什么 |
+| --- | --- | --- |
+| `duckdb_databases()` | ✅ | 所有库 + 路径 + 只读标记 + internal 标记 |
+| `duckdb_schemas()` | ✅ | 库 + 模式（含 main / prod）+ internal 标记 |
+| `duckdb_tables()` | ✅ | 库 + 模式 + 表名 + 行数估计 |
+| `duckdb_columns()` | ✅ | 库 + 表 + 列名 + 序号 + 类型 |
+| `duckdb_views()` | ✅ | 库 + 视图 + 定义 SQL |
+| `duckdb_indexes()` | ✅ | 库 + 索引（见 `index_demo.py`） |
+
+> **注意：视图不在 `duckdb_tables()` 里**，在 `duckdb_views()` 里 —— 拼 `duckdb_tables()` + `duckdb_views()` 才是一张完整的表清单。
+
+**三层接口的覆盖面不一样，这是最容易踩的地方**：
+
+- `SHOW TABLES` 只看**当前 schema + 当前库的 main**；
+- `INFORMATION_SCHEMA` **是跨库的**（这点跟 Postgres 不一样）；
+- `duckdb_*()` 跨库，还多给一个 `internal` 标记 —— 用它把 system / temp 这些内置库滤掉最方便。
+
+附：DuckDB 还带了一整套 **pg_catalog 兼容层**（`pg_catalog.pg_class` / `pg_tables` / `pg_attribute` … 共 **22 个视图**），好让 Postgres 的工具能直接连上来 —— `information_schema` 本身也是拿这些视图拼出来的。
+
+### 6. Polars 侧：没有「库」这个概念
+
+| 想要的东西 | Polars 有吗 | Polars 实际的做法 |
+| --- | --- | --- |
+| `SHOW TABLES` | ❌ 没有 | 读目录：`scan_parquet('dir/*.parquet')` |
+| `INFORMATION_SCHEMA` | ❌ 没有 | 读 schema：`read_parquet_schema()` |
+| `SHOW DATABASES` | ❌ 没有 | 自己维护一份目录清单 |
+| `ATTACH` | ❌ 没有 | 没有等价物 —— 直接读多个路径 |
+
+**「describe」这个词在 Polars 里的命中**：顶层命名空间里带 `describe` 的**一个都没有**，`pl.describe` 不存在（AttributeError）。只有 `DataFrame.describe()` —— 那是**列的统计摘要**（列名 / dtype / 计数 / …），跟「列出库里有哪些表」完全是两回事。搜「describe」命中的是它，不是 catalog。
+
+Polars 的「库」实际长什么样：**一个目录 = 一张虚拟表**。
+
+```
+目录里有 3 个 parquet 文件
+scan_parquet('customers/*.parquet') → 惰性帧，collect 出来 30 行
+```
+
+这个东西扮演的就是「表」的角色：能查、能 join、能聚合；schema 靠所有文件的 schema 推出来，不一致就报错。但它**没有名字** —— 你只能靠路径指认它，所以 Polars 里没有「列出所有表」这种事可做。
+
+还有一个理论上能用的 `pl.read_database(query, connection)`，但它要靠 connectorx 去连真正的 SQL 数据库，跟 DuckDB 文件不是一回事（本机也没装 connectorx，实测调用会 ImportError）。
+
+### 7. 小结：多库与内省
+
+| 维度 | DuckDB | Polars |
+| --- | --- | --- |
+| 「数据库」这个概念 | 有（一个 .duckdb 文件就是一个库） | 没有，只有文件和目录 |
+| 把别的库挂进来 | `ATTACH 'x.duckdb' AS sales` | 没有等价物 |
+| 跨库 join | 直接写 `sales.t JOIN orders_db.u` | 读多个路径后自己拼 |
+| 跨 schema 限定名 | 库.模式.表 三段全支持 | 没有模式的概念 |
+| 枚举有哪些表 | `SHOW ALL TABLES` / `duckdb_tables()` | 只能自己扫目录 |
+| SQL 标准元数据 | `INFORMATION_SCHEMA`（跨库，跟 Postgres 不同） | 没有 |
+| 只读挂载 | `ATTACH ... (READ_ONLY)`，引擎层禁止写 | 没有这层 |
+| 挂 parquet 当库 | ❌ 不支持 | 本来就是它唯一的输入格式 |
+
+这不是「谁更先进」的问题，是**任务形态不同**：
+
+- **DuckDB 是数据库** —— 业务库要能被多个下游同时连、要能只读挂载、要能查元数据；
+- **Polars 是文件处理器** —— 数据在 parquet 里，「目录 = 表」够用了，加一层「库」反而是负担。
+
+**实务上的取舍**：
+
+- 要「一个库多个下游读」→ DuckDB（但记住并发那节那条：**只读挂载的前提是没有别的进程正在写**）；
+- 要「一堆 parquet 上并行跑」→ Polars + 目录（见 `partition_demo.py`）；
+- 要「跨库 join」→ DuckDB 一次 ATTACH 搞定；Polars 侧就是读两个路径再 join，或者干脆让 DuckDB 去 join。
+
 ## 目录结构
 
 ```
@@ -6308,6 +6673,8 @@ duckdb-polars-demo/
 │   ├── math_demo.py        # 数学函数语义：log 的底数 / ln / 浮点精度 / NaN 与 inf
 │   ├── similarity_demo.py  # 字符串相似度：编辑距离 / Jaro / Jaccard，DuckDB 有 Polars 没有
 │   ├── parquet_meta_demo.py # Parquet 元数据内省：zonemap 与行组裁剪
+│   ├── concurrency_demo.py  # 并发 / 锁 / 多进程：文件锁、WAL、MVCC、Polars 静默丢数据
+│   ├── attach_demo.py       # ATTACH 多库 + catalog 内省：DuckDB 有「库」，Polars 只有文件
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
@@ -6348,6 +6715,10 @@ duckdb-polars-demo/
 - DuckDB Hive 分区：<https://duckdb.org/docs/stable/data/parquet/hive_partitioning>
 - DuckDB CSV 读取：<https://duckdb.org/docs/stable/data/csv/overview>
 - DuckDB 事务：<https://duckdb.org/docs/stable/connect/concepts>
+- DuckDB 并发与文件锁：<https://duckdb.org/docs/current/connect/concurrency>
+- DuckDB `ATTACH`：<https://duckdb.org/docs/stable/sql/statements/attach>
+- DuckDB 元数据（`duckdb_tables()` 等）：<https://duckdb.org/docs/stable/sql/meta/duckdb_tables>
+- DuckDB `INFORMATION_SCHEMA`：<https://duckdb.org/docs/stable/sql/information_schema>
 - Polars `scan_parquet`：<https://docs.pola.rs/api/python/stable/reference/polars/api/polars.scan_parquet.html>
 - Polars `replace_time_zone` / `convert_time_zone`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.dt.replace_time_zone.html>
 - Polars `read_csv`：<https://docs.pola.rs/api/python/stable/reference/polars/api/polars.read_csv.html>

@@ -78,6 +78,9 @@ now_ms() {
 #
 # similarity_demo 的规模开关叫 --pairs（字符串对数），不是 --rows，
 # 所以那一行只传 --repeat；它的默认规模（两万对）本身就是合适的。
+#
+# concurrency_demo 的 --hold 是「持锁进程待多久」，不是规模开关；
+# 它只是个上限（持锁进程在探测完就被 terminate 了），CI 里给个小的。
 DEMOS=(
   "gen_data|--rows $ROWS"
   "duckdb_demo|"
@@ -133,6 +136,8 @@ DEMOS=(
   "math_demo|--rows $ROWS --repeat $REPEAT"
   "similarity_demo|--repeat $REPEAT"
   "parquet_meta_demo|--rows $ROWS --repeat $REPEAT"
+  "concurrency_demo|--hold 1"
+  "attach_demo|"
 )
 
 # 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。
