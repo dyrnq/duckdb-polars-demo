@@ -45,8 +45,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          # .python-version 已经锁了 3.13，直接读它，别在两处各写一个版本号
-          version-file: ".python-version"
+          # 这里**故意不传** Python 版本。
+          #
+          # setup-uv 没有 `python-version-file` 这个输入（传了只会被忽略并 warn）；
+          # 而它的 `version-file` 是「**uv 自己**的版本」的文件，按 TOML 的
+          # requires-uv 解析 —— 指向 .python-version 会直接报
+          # "Could not determine uv version from file"（踩过，2026-11-11）。
+          #
+          # Python 版本用 .python-version 锁就够了：uv 自己会读它
+          # （实测 ubuntu runner 跟着它下 managed 3.13，macOS 用系统的 3.13）。
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
@@ -76,7 +83,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          version-file: ".python-version"
+          # 同 lint 那个 job：Python 版本由 .python-version 决定，setup-uv 不收这个输入
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
