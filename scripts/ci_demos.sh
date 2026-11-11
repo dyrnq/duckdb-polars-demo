@@ -8,7 +8,7 @@
 #
 # 为什么单独写个脚本，而不是把命令直接列在 workflow 里：
 #   每个 demo 的规模开关名字并不统一（--rows / --repeat / --repeats /
-#   --rounds / --files / --trades / --quotes），把这层对应关系收在一处，
+#   --rounds / --files / --trades / --quotes / --keys），把这层对应关系收在一处，
 #   本地和 CI 跑的就是同一套东西 —— CI 挂了能在本地原样复现。
 #
 # 规模刻意比各 demo 的默认值小：CI 要的是「跑通 + 存档」，不是测性能。
@@ -116,6 +116,8 @@ DEMOS=(
   "exists_demo|--rows $ROWS --repeat $REPEAT"
   "recursive_demo|--rows $ROWS --repeat $REPEAT"
   "fault_demo|--rows $ROWS --repeat $REPEAT"
+  "compress_demo|--rows $ROWS --repeat $REPEAT"
+  "skew_demo|--rows $ROWS --repeat $REPEAT"
 )
 
 # 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。
@@ -143,7 +145,7 @@ if [ -n "$missing" ]; then
   done
   echo
   echo "   把它们加进上面 DEMOS 数组（顺便定一下规模开关："
-  echo "   --rows / --repeat / --repeats / --rounds / --files / --trades / --quotes）。"
+  echo "   --rows / --repeat / --repeats / --rounds / --files / --trades / --quotes / --keys）。"
   exit 1
 fi
 
