@@ -75,6 +75,9 @@ uv run python src/type_demo.py       # 类型系统全景：类型清单、对�
 uv run python src/enum_demo.py       # ENUM / Categorical：排序、cast、未知值、物理码、往返
 uv run python src/blob_demo.py       # BLOB / 二进制：字面量陷阱、编解码、cast、长度、往返
 uv run python src/uuid_demo.py       # UUID：原生类型 vs 模拟、大小写、排序、Parquet 往返
+uv run python src/quantifier_demo.py # 量词 ANY/ALL、相关标量子查询、LATERAL、UNNEST
+uv run python src/sql_sugar_demo.py  # SQL 语法糖逐条对账：GROUP BY ALL / EXCLUDE / FILTER …
+uv run python src/fts_demo.py        # 全文本搜索：DuckDB 有 fts 扩展，Polars 只能硬扫
 ```
 
 一键跑完整流程：
@@ -132,6 +135,9 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `enum_demo.py` | ENUM / Categorical：三种枚举的排序规则、cast、未知值、物理码与往返 |
 | `blob_demo.py` | BLOB / 二进制：字面量陷阱、四个编解码函数、VARCHAR↔BLOB cast、长度与往返 |
 | `uuid_demo.py` | UUID：原生类型 vs 自己模拟、大小写这个最大的坑、排序、parquet 往返 |
+| `quantifier_demo.py` | 量词 ANY/ALL、相关标量子查询（优化器改写成 delim join）、LATERAL、UNNEST vs explode |
+| `sql_sugar_demo.py` | SQL 语法糖逐条对账：GROUP BY ALL / ORDER BY ALL / EXCLUDE / REPLACE / FILTER / IS DISTINCT FROM / NULLS FIRST |
+| `fts_demo.py` | 全文本搜索：DuckDB 的 fts 扩展（倒排索引 + BM25）vs Polars 只能硬扫 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -176,6 +182,9 @@ uv run python src/recursive_demo.py --rows 2000000 --repeat 5
 uv run python src/fault_demo.py --rows 2000000 --repeat 5
 uv run python src/compress_demo.py --rows 500000 --repeat 3   # 行数别开太大：zstd 高级别很贵
 uv run python src/skew_demo.py --rows 2000000 --repeat 5
+uv run python src/quantifier_demo.py --rows 100000 --repeat 5
+uv run python src/fts_demo.py --rows 50000 --repeat 5
+uv run python src/fts_demo.py --extension            # 试装 duckdb 的 fts 扩展（要联网）
 ```
 
 用 DuckDB 交互式探索数据：
@@ -208,7 +217,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，40 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，49 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -459,6 +468,21 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 154 | UUID 转整数 | `::BIGINT` / `::HUGEINT` 都是 **Unimplemented** | UInt128 模拟**能**存下这 128 位 | 模拟方案唯一比原生强的地方（但也只是「存得下」） |
 | 155 | INTERVAL 的 parquet | 落成 FIXED_LEN_BYTE_ARRAY + Interval 标注 | **整个文件读不了**（Rust **panic**，不是 Python 异常） | 读之前先把 interval 列转成字符串或秒数 |
 | 156 | 字符串转数值失败 | 严格 `CAST` **报错**（`ConversionException`）、宽松 `TRY_CAST` 给 **NULL** | 严格 `cast` **报错**（`InvalidOperationError`）、宽松 `cast(strict=False)` 给 **None** | 行为其实**对齐**，差别只在异常类型 —— 按类型 catch 的代码要改 |
+| 157 | 量词 `= ANY` / `> ALL` | SQL **三值逻辑**：命中 TRUE、没命中但子集里有 NULL → **UNKNOWN** | `is_in` 是**两值**的：只答「在不在」，把 UNKNOWN 压成 FALSE | 量词判定要留在结果里 → DuckDB 侧 `COALESCE(x = ANY(s), FALSE)`；要保留 UNKNOWN 得自己维护三值 |
+| 158 | `x > ALL(s)` 改写成 `x > max(s)` | s 里有 NULL 时给 **UNKNOWN** | `max()` **忽略 NULL** → 给出**确定的** TRUE/FALSE | 这个改写只在 s **无 NULL 且非空**时成立；有 NULL 要按三值逻辑分三种情况写 |
+| 159 | 空集上的量词 | `ALL` 是 **TRUE**（`1 > ALL(∅)` → TRUE，连 `NULL > ALL(∅)` 都是 TRUE）、`ANY` 是 FALSE | `max(∅)` 是 NULL → `1 > NULL` 是 NULL | 空集单独处理，别套 max/min 改写 |
+| 160 | 相关标量子查询 | 优化器改写成 **delim join**（`__duckdb_delim_N` + Nested Loop Join），不是「每行跑一次子查询」 | **没有**，只能手工 join + group_by | DuckDB 侧留原样最好；Polars 侧手工 join 或 `join_asof` |
+| 161 | LATERAL | 支持；子查询是聚合就永远返回一行，不是聚合就可能**丢行** | **没有** | `join_asof`（首选）/ `map_elements`（字面翻译）/ 手工 join + group_by |
+| 162 | `join_asof` 的边界 | 写 `v < x` 就不含等号 | `join_asof` 固定匹配 `v <= x`（含等号） | DuckDB 侧写 `v <= x` 才对得齐 |
+| 163 | `UNNEST` 与 NULL 列表 | **丢行** | `explode()` **留一行**（值是 NULL） | Polars 侧先 `filter(pl.col("tags").is_not_null())` 再 explode |
+| 164 | `with_columns(explode())` | —— | 行数不变，新列**按位置**贴回原表 → **静默错位**（不报错不警告） | 展开会改行数时只能用 `df.explode(...)`，绝不能塞进 `with_columns` |
+| 165 | `GROUP BY ALL` | 按**所有未被聚合的列**分组（不是「所有列」） | `group_by` 的键**必须写全** | Polars 侧键写全；全 NULL 组的 `sum` 还要自己补 NULL 语义（DuckDB 给 NULL、Polars 给 0） |
+| 166 | `SELECT * EXCLUDE` / `REPLACE` | 有 | `drop()` / `with_columns()` | **完全一致**（列的顺序也一样）—— 这两条糖没有坑 |
+| 167 | `IS [NOT] DISTINCT FROM` | 有 | `eq_missing()` / `ne_missing()` | **完全一致**；用普通 `==` / `!=` 则给 NULL，不是 TRUE/FALSE |
+| 168 | 聚合的 `FILTER (WHERE ...)` | 组**保留**：没有命中行的组，sum 是 **NULL**、count 是 **0** | 先 filter 再 group_by 会**把组弄丢**；agg 内 `.filter()` 保留组，但 sum 给 **0** | 用 agg 内 `.filter()` 或 `when-then`，sum 自己补 `otherwise(None)` |
+| 169 | `ORDER BY ALL` / `NULLS FIRST` | 升序、降序默认都是 **NULLS LAST** | 升序、降序默认都是 **NULLS FIRST**；`sort()` **只有** `nulls_last` 一个开关 | Polars 侧写 `nulls_last=True`；要按列分别设 NULL 位置，只能在 SQL 侧排好 |
+| 170 | 全文本搜索 | 有 `fts` 扩展：倒排索引 + **BM25 打分** + 排序 | **一个相关 API 都没有**（字符串命名空间 47 个方法，0 个相关） | Polars 侧只能 `str.contains` 硬扫，或者自己造倒排表 —— 这条**没有对齐办法**，只能靠约定避开 |
+| 171 | `str.contains` 的语义 | —— | 默认**大小写敏感**，参数是**正则**不是字面量 | 先 `to_lowercase()`；要字面匹配加 `literal=True`；`contains_any` 反过来是字面匹配且没有 `literal` 参数 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -476,7 +500,9 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 119~121 条在 `存在性查询与半连接`、第 122~124 条在 `递归 CTE 与迭代计算`、
 第 125~129 条在 `视图、宏与持久化对象`、第 130~134 条在 `内存上限与落盘` 里展开；
 第 135~136 条在 `类型系统全景对照`、第 137~141 条在 `ENUM / Categorical：三种枚举，三种脾气`、
-第 142~148 条在 `BLOB / 二进制：字节、编码、base64`、第 149~156 条在 `UUID：原生类型 vs 自己模拟` 里展开。
+第 142~148 条在 `BLOB / 二进制：字节、编码、base64`、第 149~156 条在 `UUID：原生类型 vs 自己模拟` 里展开；
+第 157~159 条在 `量词与相关子查询：SQL 的一等公民`、第 160~164 条在 `同一节的相关子查询 / LATERAL / UNNEST`、
+第 165~169 条在 `SQL 语法糖对照：八条糖逐条对账`、第 170~171 条在 `全文本搜索：DuckDB 有扩展，Polars 没有` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -4813,6 +4839,564 @@ Polars 写 parquet → DuckDB 的类型 → BLOB（没有 UUID 的 logical annot
 | 要给人和别的系统看 | String（**小写**） | 能直接读；必须统一小写，否则同一个 UUID 算两个 |
 | 要能跟 DuckDB 对账 | 两边都存小写文本 | DuckDB 侧 `::UUID` 贴回去，Polars 侧 `str.lower()` |
 
+## 量词与相关子查询：SQL 的一等公民
+
+`uv run python src/quantifier_demo.py`。这一节讲四件 DuckDB 有、Polars 没有的东西：
+**量词**（`= ANY` / `> ALL`）、**相关标量子查询**、**LATERAL**、**CROSS JOIN UNNEST**。
+
+前两件有「凑得出来的写法」（只是要自己维护三值逻辑），后两件 Polars 侧连语法都没有 ——
+但也不是完全没法写。这一节最后有六种写法的代价对比。
+
+### 1. 量词：六个形式，一张三值逻辑的真值表
+
+DuckDB 支持六个量词（实测都能用）：
+
+```sql
+x = ANY  (S)   -- 存在 s ∈ S，使 x = s
+x <> ANY (S)   -- 存在 s ∈ S，使 x <> s
+x = ALL  (S)   -- 对每个 s ∈ S，都有 x = s
+x <> ALL (S)   -- 对每个 s ∈ S，都有 x <> s
+x > ALL  (S)   -- 对每个 s ∈ S，都有 x > s
+x < ANY  (S)   -- 存在 s ∈ S，使 x < s
+```
+
+外层 `t`：x = 1, 2, 3, 5, NULL；内层 `s`：v = 2, NULL —— 那个 NULL 是本节的主角：
+
+| 量词 | x=1 | x=2 | x=3 | x=5 | x=NULL |
+| --- | --- | --- | --- | --- | --- |
+| `x = ANY (s)` | NULL | TRUE | NULL | NULL | NULL |
+| `x <> ANY (s)` | TRUE | NULL | TRUE | TRUE | NULL |
+| `x = ALL (s)` | FALSE | NULL | FALSE | FALSE | NULL |
+| `x <> ALL (s)` | NULL | FALSE | NULL | NULL | NULL |
+| `x > ALL (s)` | FALSE | FALSE | NULL | NULL | NULL |
+| `x < ANY (s)` | TRUE | NULL | NULL | NULL | NULL |
+
+读这张表：
+
+- **命中就是 TRUE**：x=2 时 `x = ANY(s)` 是 TRUE（2 命中了），哪怕 s 里还有一个 NULL —— ANY 是「有一个成立就算成立」。
+- **没命中就是 NULL**：x=1、3、5 的 `= ANY` 全是 NULL —— 「1 = 2」是 FALSE、「1 = NULL」是 UNKNOWN，ANY(FALSE, UNKNOWN) 还是 UNKNOWN。
+- **ALL 比 ANY 更容易变成 NULL**：`x = ALL(s)` 只有 x=2 那行是 TRUE，其余全是 NULL —— 只要 s 里有 NULL，ALL 就塌成 UNKNOWN。
+
+空集上的量词（SQL 标准的规定，不是 DuckDB 的怪癖）：
+
+```
+1 = ANY(∅)       -> FALSE
+1 = ALL(∅)       -> TRUE
+1 > ALL(∅)       -> TRUE
+1 > ANY(∅)       -> FALSE
+NULL > ALL(∅)    -> TRUE
+```
+
+→ ANY 在空集上是 FALSE，ALL 在空集上是 TRUE；连 `NULL > ALL(∅)` 都是 TRUE —— 空集上的全称量词根本不看比较本身。
+
+### 2. Polars 的 `is_in` 只回答「在不在」，不回答 UNKNOWN
+
+| x | DuckDB `= ANY` | Polars `is_in` |
+| --- | --- | --- |
+| 1 | NULL | FALSE |
+| 2 | TRUE | TRUE |
+| 3 | NULL | FALSE |
+| 5 | NULL | FALSE |
+| NULL | NULL | NULL |
+
+`<> ALL` 那一侧同样对不上：
+
+| x | DuckDB `<> ALL` | Polars `~is_in` |
+| --- | --- | --- |
+| 1 | NULL | TRUE |
+| 2 | FALSE | FALSE |
+| 3 | NULL | TRUE |
+| 5 | NULL | TRUE |
+| NULL | NULL | NULL |
+
+这不是「Polars 少了个功能」，是**两个引擎的答案模型不一样**：
+
+- DuckDB 走 SQL 标准的三值逻辑：TRUE / FALSE / **UNKNOWN**。
+- Polars 的 `is_in` 是**两值**的：它只问「在不在」，探针是 NULL 时给 NULL，**子集里有 NULL 一概不影响** —— 它把 UNKNOWN 直接压成了 FALSE。
+
+后果很具体：`WHERE x = ANY(s)` 在 DuckDB 里会滤掉那些 UNKNOWN 行，在 Polars 里 `filter(is_in(...))` 也会滤掉 FALSE 行 —— 这一处碰巧一样；
+但一旦这个判定进了 `SELECT` 列表（要的是布尔列，不是筛行），两边给的列就**逐行不同**。
+
+→ **迁移规则**：量词判定如果要留在结果里，DuckDB 侧先 `COALESCE(x = ANY(s), FALSE)` 把它压成两值，两边才对得上；要保留 UNKNOWN 就得自己维护三值（见下一节）。
+
+### 3. 「改写成 max/min」这个流传很广的做法是有坑的
+
+常见的迁移建议：
+
+```sql
+x > ALL(子查询)  ⟶  x > (SELECT max(v) FROM 子查询)
+x = ALL(子查询)  ⟶  x = min(v) AND x = max(v)
+x = ANY(子查询)  ⟶  x IN (子查询)
+```
+
+这三条**只在子查询没有 NULL、且非空时成立**。带一个 NULL 就全塌：
+
+| 场景 | DuckDB | Polars 直译 | 对不对 |
+| --- | --- | --- | --- |
+| `x > ALL(s)`，x = 3 | NULL | TRUE | ❌ |
+| `x = ALL(s)`，x = 2 | NULL | TRUE | ❌ |
+| `x = ANY(s)`，x = 1 | NULL | FALSE | ❌ |
+
+三个错法各有各的错法：
+
+- `x > ALL` 直译成 `x > max()`：max **忽略 NULL**，所以 s=(2,NULL) 时 max=2，`3 > 2` 是 TRUE —— 而 DuckDB 的答案是 UNKNOWN（因为 `3 > NULL` 是 UNKNOWN）。**一个确定答案换掉了一个 UNKNOWN**，两边从此对不上。
+- `x = ALL` 直译成 `x = min() AND x = max()`：s=(2,NULL) 时 min=max=2，`2 = 2 AND 2 = 2` 是 TRUE —— 而 DuckDB 的 `2 = ALL((2,NULL))` 是 UNKNOWN。
+- `x = ANY` 直译成 `is_in`：把 UNKNOWN 压成了 FALSE（上一节已经见过）。
+
+空集时又错一次 —— `ALL` 在空集上是 TRUE，`max(∅)` 是 NULL：
+
+```
+DuckDB  1 > ALL(∅)                 -> TRUE
+Polars  1 > max(∅)（max = None）    -> NULL   ❌
+```
+
+那怎么改才对？先补一条 SQL 三值逻辑的规矩：**AND 里面 FALSE 支配 UNKNOWN** —— FALSE ∧ UNKNOWN = FALSE。所以 `x > ALL(S)` 的答案是：
+
+```
+存在非 NULL 的 s ≥ x        → FALSE（有一个比较是 FALSE，整句就 FALSE）
+S 为空                      → TRUE（空集上的全称量词恒真）
+S 里有 NULL（且没人 ≥ x）   → UNKNOWN
+否则                        → TRUE
+```
+
+注意第二条：**「有 NULL 就一定是 UNKNOWN」是错的** —— 如果同时还有一个 s ≥ x 让比较变成了 FALSE，结果是 FALSE，不是 UNKNOWN。上面 `x > ALL(s)，x = 1` 那行 DuckDB 给的就是 FALSE，不是 NULL。
+
+Polars 侧照着写（demo 里是 `pol_gt_all`）：
+
+```python
+pl.when(x.is_null())          .then(None)              # x 是 NULL → NULL
+    .when(x <= 非NULL的最大值)  .then(False)             # 有人 ≥ x → FALSE
+    .when(S 里有 NULL)        .then(None)              # 否则 UNKNOWN
+    .otherwise()              .then(True)              # 否则 TRUE
+```
+
+用正确改写再对一次账（左边 DuckDB，右边 Polars）：
+
+| 量词 | 结果 |
+| --- | --- |
+| `x = ANY(s)` | ✅ 逐行一致（NULL / TRUE / NULL / NULL / NULL） |
+| `x > ALL(s)` | ✅ 逐行一致（FALSE / FALSE / NULL / NULL / NULL） |
+
+干净子集（没有 NULL）时，粗改写是对的：s=(2,4) 时 DuckDB `x > ALL` ↔ Polars `x > 4` ✅ 逐行一致。
+
+→ 所以「max/min 改写」不是错的，是**有前提的**：前提是子查询不带 NULL 且非空。迁移前先确认这两条。
+
+### 4. 相关标量子查询：优化器会把它改写成 join
+
+不相关的标量子查询（每个外层行都拿到同一个值）在 DuckDB 里只算一次，Polars 侧就是 `s["v"].max()` 广播成标量。
+
+**相关**标量子查询（内层引用外层的 x，每行结果不同）：
+
+```sql
+SELECT x, (SELECT max(v) FROM s WHERE s.v < t.x) AS m FROM t ORDER BY x NULLS LAST
+```
+
+结果：x=1 → NULL，x=2 → NULL，x=3 → 2，x=5 → 2，x=NULL → NULL。
+
+这条 SQL 在 DuckDB 里**不是**「外层每行跑一次内层」。`EXPLAIN` 出来的计划长这样（节选）：
+
+```
+│ CTE Name: __duckdb_delim_18        │
+╭─ Nested Loop Join ────────────────╮
+│ Join Type: INNER                  │
+│ Conditions: v < x                 │
+```
+
+→ 优化器把相关标量子查询**改写成了一个 delim join**：① 先建一个 `__duckdb_delim_N` 的 CTE，把外层的取值集合装进去；② 拿它跟内层做一次 Nested Loop Join（条件就是那个相关条件 `v < x`）；③ 再把结果聚合回标量。
+
+所以「相关子查询慢」是个过时经验 —— DuckDB 2.0 把它变成连接了（代价见第 7 节）。
+
+Polars 侧怎么写同一个查询：
+
+- **手工 join**（cross + filter + group_by，再 left join 回外层补 NULL）—— 语义最容易对账，代价是连接本身。对账结果：✅ 5 行 × 2 列全部一致。
+- **`join_asof`** —— 如果查的是「不小于 x 的最近一行」，Polars 有专门的函数：x=1 → NULL，x=2 → 2，x=3 → 2，x=5 → 4，x=NULL → NULL。**但边界不一样**：它匹配的是 `v <= x`（含等号），而 DuckDB 那个写的是 `v < x`（不含等号）—— x 正好等于某个 v 时两边对不上，DuckDB 侧写 `s.v <= t.x` 才和 `join_asof` 对齐。
+
+### 5. LATERAL：两种口味，行数完全不同
+
+LATERAL 的意思是「右边这个子查询可以看到左边这一行的值」。它有两种口味：
+
+**① 子查询是聚合（count/max）—— 永远返回一行，外层行不会消失**：
+
+```sql
+SELECT t.x, l.c FROM t, LATERAL (SELECT count(*) AS c FROM s WHERE s.v < t.x) l
+```
+
+x=1 → 0，x=2 → 0，x=3 → 1，x=5 → 1，x=NULL → **0**（不是 NULL —— `s.v < NULL` 没有一行为真，count 数出来是 0）。
+
+**② 子查询不是聚合 —— 返回 0..N 行，外层行会被丢掉**（像 INNER JOIN）：
+
+```sql
+SELECT t.x, l.v FROM t, LATERAL (SELECT s.v FROM s WHERE s.v < t.x) l
+```
+
+只有 x=3 → v=2 和 x=5 → v=2 两行 —— **x=1 和 x=2 整个消失了**。这是 LATERAL 最容易吓人的地方：它到底是 LEFT 还是 INNER，取决于子查询返回几行。
+
+Polars 侧：**没有 LATERAL**。三种替代写法，各对应一个场景：
+
+| 写法 | 适合什么 | 代价 |
+| --- | --- | --- |
+| `join_asof` | 「取不小于/不大于的最近一行」这类形状 | 向量化、无 NULL 语义问题 —— **首选**；但边界是 `<=`，且只能算「最近的一行」 |
+| `map_elements` / `map_batches` | 任意逻辑 | LATERAL 的**字面翻译**，代价是每行进一次 Python |
+| 手工 join + group_by | 把相关条件拆成普通连接 | 语义最容易对账，代价是连接本身 |
+
+`map_elements` 那版长这样（每行拿 x 去 Python 有序列表里二分一次）：
+
+```python
+def lookup(x):
+    if x is None:
+        return None
+    i = bisect.bisect_right(vals, x) - 1
+    return vals[i] if i >= 0 else None
+
+df.with_columns(pl.col("x").map_elements(lookup, return_dtype=pl.Int64).alias("m"))
+```
+
+→ 注意边界：`bisect_right` 找的是 `v <= x`，要 `v < x` 得用 `bisect_left`。DuckDB 那条写的是 `<`。
+
+对账：LATERAL(count) ↔ cross join + group_by ✅ 5 行 × 2 列全部一致。
+
+### 6. `CROSS JOIN UNNEST` ↔ `explode()`：一个丢行，一个留行
+
+`lists` 表：
+
+| id | tags | other |
+| --- | --- | --- |
+| 1 | `['a','b']` | `['x','y','z']` |
+| 2 | `['c']` | `['w']` |
+| 3 | `[]` | `[]` |
+| 4 | NULL | NULL |
+
+DuckDB 的 `UNNEST` 在 SELECT 列表里：
+
+```sql
+SELECT id, unnest(tags) AS t FROM lists
+```
+
+→ id=1 → 'a'，id=1 → 'b'，id=2 → 'c' —— **id=3（空列表）和 id=4（NULL 列表）两行都消失了。**
+
+Polars 的 `df.explode("tags")`：id=1 → 'a'，id=1 → 'b'，id=2 → 'c'，id=4 → NULL
+→ id=3（空列表）**同样消失**（两边一致 ✅）；但 id=4（NULL 列表）**留下来了，值是 NULL** —— DuckDB 那边这行没了 ❌
+
+对账：`UNNEST ↔ explode()` ❌ 行数不一致（duckdb=3，polars=4）。
+→ 迁移规则：Polars 侧在 explode 前先把 NULL 列表过滤掉 —— `df.filter(pl.col("tags").is_not_null()).explode("tags")`。
+
+顺带两个实测：
+
+- DuckDB 的 SELECT 列表里写**两个** UNNEST，它们是**并排拉链**，不是笛卡尔积：id=1 的 tags 有 2 个、other 有 3 个，**按短的那个补 NULL**，拉成 3 行（不是 6 行）。
+- `UNNEST` 也能写在 FROM 里（等价于 CROSS JOIN LATERAL UNNEST），行数跟 SELECT 列表里的一样（空列表 / NULL 列表都丢行）。
+
+**还有一个静默错位的坑**：
+
+```python
+df.with_columns(pl.col("tags").explode())   # ❌ 别这么写
+```
+
+explode 之后的列本身是 `['a', 'b', 'c', None]`（4 个值），可是**行数还是 4** —— Polars 把新列**按位置**贴回原表，于是 id=2 拿到了 'b'（其实是 id=1 的第二个值）。
+**不报错、不警告，只是数据悄悄错位了。** → 展开改变行数时，必须用 `df.explode(...)`（或 `.select(...)`），**绝不能塞进 `with_columns`**。
+
+### 7. 代价：同一个「每行查一次」，六种写法
+
+外层 100,000 行（x = 0..99999），内层 1,000 行（v = 0, 13, 26, …），
+任务：每行 x 算出 `max(v) WHERE v <= x` —— 六种写法做的是**同一件事**，
+用的也是同一个不等号（`<=`），所以结果逐行相同（下面单独对账）。
+
+| 写法 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB 相关标量子查询 | 380.3 | 326.1 |
+| DuckDB LATERAL | 303.4 | 296.0 |
+| DuckDB 手工 join + group_by | 2011.1 | 1976.2 |
+| Polars cross join + group_by | 1160.0 | 1134.8 |
+| Polars `join_asof` | **1.0** | 0.7 |
+| Polars `map_elements`（Python 逐行） | 33.4 | 32.4 |
+
+口径：两个 parquet 在计时前已物化（DuckDB 侧是内存表 `big_t` / `big_s`，Polars 侧是内存里的 DataFrame），所以计时**不含读盘**；重复 5 次取中位数，机器是 8 核共享开发机（本次 load1 = 2.5）。
+内层表固定 1,000 行 —— 不是偷懒，是因为这个查询的代价主要来自**范围连接**（每行 x 都要看一遍 `v <= x` 的候选），内层越大越接近平方级，两边都会慢得没法看。
+
+结果对账（都是 `max(v) where v <= x`）：`cross join + group_by` / `join_asof` / `map_elements` 三种 Polars 写法 ✅ 100000 行 × 2 列全部一致。
+
+解读：
+
+- **DuckDB 的相关标量子查询并不慢** —— 优化器改写成 delim join 之后，它比「手工把相关条件拆成普通 join」**快五倍**：拆开写的那条要先物化整个范围连接的结果，再聚合回去。→ 迁移时**别把相关子查询手工拆开**，DuckDB 那边留着原样最好。
+- **LATERAL 和相关标量子查询基本同价**（DuckDB 把 LATERAL 也改写成连接了），所以「LATERAL 慢」也是个过时经验。
+- **Polars 的 cross join 走的是同一条路**（范围连接），代价是 DuckDB 手写 join 的一半左右 —— 因为 Polars 不用把结果再聚合回标量；但 **`join_asof` 是另一个算法**：排序归并，线性，所以快了**两个数量级以上** —— 代价是它只能算「最近的一行」，而且匹配的是 `<=`。
+- **`map_elements` 是 LATERAL 的字面翻译**，慢在「每行进一次 Python」；但只要你的查找逻辑是「对有序数组二分」，它其实很划算 —— 比 DuckDB 的范围连接快得多。
+- → 落到实践：**先看能不能改写成 join_asof / 排序归并**（最省），不行再手工 join + group_by（语义最稳），最后才是逐行进 Python（最灵活、最慢）。
+
+## SQL 语法糖对照：八条糖逐条对账
+
+`uv run python src/sql_sugar_demo.py`。这一节把八条常用语法糖逐条对一遍，
+每条都跑一次、逐值对一次账。
+
+**先说结论**：这八条糖**不是能力差距**。八条里有四条是逐行逐列完全对上的，
+剩下四条的差别全部来自**默认值**或**空集语义** —— 写上对应的参数就能对上。
+
+### 1. `GROUP BY ALL` —— 键是推出来的，不是写出来的
+
+DuckDB 的 `GROUP BY ALL` 的意思是「按**所有没有被聚合的列**分组」：
+
+```sql
+SELECT region, channel, sum(amount) AS total FROM sales GROUP BY ALL
+```
+
+只聚合了 amount，所以分组键 = region、channel 两列 —— **不是** (region, channel, amount)。
+
+三个坑：
+
+1. **DuckDB 的 ALL 不是「按所有列」** —— 被聚合的列不参与分组。
+2. **NULL 也参与分组**（NULL 自成一组），两边一致。
+3. **全 NULL 组的 sum 不一样**：那一组只有一行、而那一行的 amount 是 NULL —— DuckDB 的 `sum` 给 **NULL**，Polars 的 `sum` 给 **0**（语义差异表里的第 21 条）。
+
+对账：`GROUP BY ALL ↔ group_by([...])` ❌ —— 列 `total` 第 3 行 NULL 不一致（None vs 0.0）。
+把 NULL 语义补回去（`pl.when(...).then(...).otherwise(None)`）之后：✅ 4 行 × 3 列全部一致。
+→ 分组和列序本来就对得上，差的只是那一个全 NULL 组的 sum。
+
+### 2. `ORDER BY ALL` —— 按所有列排，NULL 排在哪儿要另外说
+
+`ORDER BY ALL` 本身两边没有语义差别，**差别在 NULL 的位置**：
+
+| 引擎 | 升序默认 | 降序默认 |
+| --- | --- | --- |
+| DuckDB | **NULLS LAST** | **NULLS LAST** |
+| Polars | **NULLS FIRST** | **NULLS FIRST** |
+
+两个引擎的默认值**正好相反，而且两个方向都相反**。Polars 侧写上 `nulls_last=True` 才和 DuckDB 一致。
+
+对账：`ORDER BY ALL ↔ sort([...], nulls_last=True)` ✅ 5 行 × 3 列全部一致。
+
+### 3. `SELECT * EXCLUDE (...)` —— 去掉几列
+
+Polars 侧是 `drop()`：删掉的列**从结果里消失**，位置自动收紧。
+
+对账：`EXCLUDE ↔ drop()` ✅ 5 行 × 2 列全部一致 —— **包括列的顺序**（剩下的列保持原来的相对顺序）。
+
+### 4. `SELECT * REPLACE (expr AS col)` —— 原地改一列
+
+Polars 侧是 `with_columns()` —— 注意它是**覆盖同名列，位置不动**，不是删掉再追加到末尾。
+
+对账：`REPLACE ↔ with_columns()` ✅ 5 行 × 4 列全部一致 —— **包括列的位置**。
+（这跟 `with_columns` 追加**新**列不同 —— 新列会追加到末尾。）
+
+`EXCLUDE` 和 `REPLACE` 一起用也对得上：DuckDB 列序 `['region','channel','amount']`，Polars 列序相同。
+
+### 5. 聚合的 `FILTER (WHERE ...)` —— 最容易写错的一个
+
+`sum(x) FILTER (WHERE c)` 的意思是「只对满足 c 的行求和」，**但分组还在**：
+没有任何一行满足条件的组，聚合结果是 NULL（count 是 0）。
+
+Polars 的三种写法，结果各不相同：
+
+| 写法 | 行数 | 空组的 sum | 对不对 |
+| --- | --- | --- | --- |
+| ① 先 filter 再 group_by | 4 → **2** | —— | ❌ **把整个组弄丢了** |
+| ② agg 里面用 `.filter()` | 4 | **0** | ❌ 分组保留，但 sum 语义不对 |
+| ③ `when/then` | 4 | **0** | ❌ 同上 |
+| ④ `when/then` + `otherwise(None)` | 4 | **NULL** | ✅ 4 行 × 3 列全部一致 |
+
+- ① 「华北」和「华南」这两组没有 app 渠道的行，先 filter 之后这些组根本不存在，**行数比 DuckDB 少**。
+- ② ③ 分组都在，但 `sum` 的空集语义和 DuckDB 不同：DuckDB 的 `sum` 对零行给 **NULL**，Polars 的 `sum` 给 **0**；而 `count` 两边都是 0 —— 这个是对的。
+
+→ **迁移规则**：① 那个写法**不能用**（丢组），除非你本来就不想要那些组；② ③ 可以用，但 `sum` 要自己补 NULL 语义；要是只是要**计数**（count / count_if），② ③ 两边完全一致，直接用。
+
+还有一个类型上的小差别：DuckDB 的 `sum(int)` 是 **HUGEINT**（Arrow 里显示成 `decimal[38,0]`），Polars 的 `sum()` 保持输入类型（i64）。对账前两边都转成 Int64 才不会在类型上打架。
+
+### 6. `IS [NOT] DISTINCT FROM` —— NULL 安全的比较
+
+Polars 侧是 `eq_missing()` / `ne_missing()`。
+
+对账：`IS [NOT] DISTINCT FROM ↔ eq_missing/ne_missing` ✅ 4 行 × 4 列全部一致 —— **包括 NULL 的位置**。
+这是全套糖里对得最准的一对：`eq_missing` 的意思是「相等，NULL 也算相等」，`ne_missing` 是「不等，NULL 也算不等」。
+
+对照一下**不用**这两个函数会怎样（普通 `==` / `!=`）：a=4, b=NULL 那行给的是 **null**，不是 false —— 普通 `==` 遇到 NULL 给 NULL（不是 TRUE），所以「两个 NULL 一样吗」这道题，SQL 的 `IS NOT DISTINCT FROM` 答「一样」，Polars 的 `==` 答「不知道」。
+
+### 7. `NULLS FIRST` / `NULLS LAST` —— 默认位置两边不一样
+
+两个引擎的默认值（实测，不是查文档）：
+
+```
+DuckDB  升序 → NULLS LAST     降序 → NULLS LAST
+Polars  升序 → NULLS FIRST    降序 → NULLS FIRST
+```
+
+不写就静默不一样 —— 这一条语义差异表里也记着（第 8 条）。
+
+Polars 侧要**显式**写 `nulls_last=True`（降序同理，它也只有这一个开关）：
+
+```python
+df.sort("region")                                        # 升序，NULL 在前（DuckDB 那样要写 nulls_last=True）
+df.sort("region", descending=True, nulls_last=True)      # 降序，NULL 在后
+```
+
+对账（两边都排成 NULLS LAST）：升序 ✅ 5 行 × 2 列全部一致，降序 ✅ 5 行 × 2 列全部一致。
+
+注意 Polars 的 `sort()` **只有 `nulls_last` 一个开关**（没有 `nulls_first`），而且它是给**所有排序列**用的同一个值。
+想按列分别设置 NULL 位置，DuckDB 那边可以直接写 `ORDER BY a NULLS FIRST, b NULLS LAST`，Polars 侧就只能
+在排序键上做文章（或者干脆在 SQL 侧排好再读回来）。
+
+### 8. 八条糖的总账
+
+| 糖 | DuckDB | Polars | 对齐程度 |
+| --- | --- | --- | --- |
+| `GROUP BY ALL` | `GROUP BY ALL` | `group_by([...])` | 键要自己写全；sum 的空集是 0 不是 NULL |
+| `ORDER BY ALL` | `ORDER BY ALL` | `sort([...])` | NULL 位置要自己写 |
+| `SELECT * EXCLUDE (...)` | `EXCLUDE (a, b)` | `drop('a','b')` | **完全一致** |
+| `SELECT * REPLACE (...)` | `REPLACE (e AS a)` | `with_columns(...)` | **完全一致，列位置也一致** |
+| 聚合 `FILTER (WHERE ...)` | `sum(x) FILTER (WHERE c)` | agg 内 `.filter()` / when-then | 分组保留；sum 的空集是 0 不是 NULL |
+| `IS NOT DISTINCT FROM` | `IS NOT DISTINCT FROM` | `eq_missing()` | **完全一致** |
+| `IS DISTINCT FROM` | `IS DISTINCT FROM` | `ne_missing()` | **完全一致** |
+| `NULLS FIRST / LAST` | `ORDER BY x NULLS LAST` | `sort(nulls_last=...)` | 两边默认值相反 |
+
+→ 结论跟「能力差距」那组正好相反：
+
+- **八条糖里有四条是逐行逐列完全对上的** —— `EXCLUDE` ↔ `drop`、`REPLACE` ↔ `with_columns`、`IS [NOT] DISTINCT FROM` ↔ `eq_missing` / `ne_missing`；
+- 剩下四条的差别**全部来自默认值或空集语义**（NULL 的位置、NULL 的分组、空集的 sum），**不是「Polars 做不到」** —— 写上对应的参数就能对上；
+- 真正的能力差距在别处 —— 量词、相关标量子查询、LATERAL、全文本搜索（见 `src/quantifier_demo.py` 和 `src/fts_demo.py`）。
+
+→ 迁移时的通用做法：**两边都把默认值写死**。DuckDB 侧写 `NULLS LAST`、Polars 侧写 `nulls_last=True`；DuckDB 侧写 `GROUP BY r, c`、Polars 侧写 `group_by(['r','c'])`；空集求和两边都要显式补 NULL 语义。别指望默认值对得上 —— 这一组里**没有一条默认值是对得上的**。
+
+顺带一提：`QUALIFY` 不在这张表里 —— 它已经在 `src/window_demo.py` 里演示过了，Polars 侧对应的是「先 `with_columns` 算窗口，再 `filter`」。
+
+## 全文本搜索：DuckDB 有扩展，Polars 没有
+
+`uv run python src/fts_demo.py`。这是本项目里**唯一一条真正的能力差距** ——
+量词、LATERAL 那些是「没有等价物，但有能凑的写法」，
+全文本搜索是「连凑都没法凑」。
+
+DuckDB 的 `fts` 扩展能给一张表建**倒排索引**，然后用 BM25 打分做全文检索：
+
+```sql
+PRAGMA create_fts_index('docs', 'id', 'content');
+SELECT id, fts_main_docs.match_bm25(id, 'parquet') AS score
+FROM docs
+WHERE fts_main_docs.match_bm25(id, 'parquet') IS NOT NULL
+ORDER BY score DESC;
+```
+
+**Polars 没有任何等价物** —— 不是「功能弱一点」，是**根本没有这一层**：
+没有倒排索引、没有 BM25、没有文档频率统计、没有分词器。
+
+### 1. 两边能用的 API 清单（实测）
+
+DuckDB 侧，`duckdb_extensions()` 自带这张元数据表，查它**不需要联网**：
+
+| 扩展 | 已安装 | 安装方式 | 说明 |
+| --- | --- | --- | --- |
+| `fts` | False | `NOT_INSTALLED` | Adds support for Full-Text Search Indexes |
+| `icu` | True | `STATICALLY_LINKED` | 时区和排序规则 |
+| `json` | True | `STATICALLY_LINKED` | JSON 操作 |
+
+→ `fts` 是 `NOT_INSTALLED`，意味着要用得先 `INSTALL fts` 下载，**这一步要联网**；
+对照组 `icu` / `json` 是 `STATICALLY_LINKED` —— 编译进二进制里，装都不用装。
+
+装扩展之前，`duckdb_functions()` 里跟 FTS 相关的函数是 **0 个**（装了才有 `match_bm25` 这类函数）。
+
+Polars 侧 —— 字符串命名空间一共 **47** 个方法，其中跟 FTS 相关
+（`bm25` / `fts` / `token` / `idf` / `index` / `invert`）的有 **0 个**：
+
+```
+contains  contains_any  count_matches  decode  encode  ends_with  escape_regex  extract
+extract_all  extract_groups  extract_many  find  find_many  head  join  json_decode
+json_path_match  len_bytes  len_chars  normalize  pad_end  pad_start  replace  replace_all
+replace_many  reverse  slice  split  split_exact  splitn  starts_with  strip_chars
+strip_chars_end  strip_chars_start  strip_prefix  strip_suffix  strptime  tail  to_date
+to_datetime  to_decimal  to_integer  to_lowercase  to_time  to_titlecase  to_uppercase  zfill
+```
+
+→ DuckDB 那边是「装个扩展就有」，Polars 这边是「自己从零写」。
+
+### 2. Polars 侧只有「硬扫」：能搜到，不能排序
+
+语料是 8 篇中英混排的文档。Polars 能做的三件事：
+
+**① `str.contains` —— 「有没有这个词」**
+
+```
+str.contains('parquet')                    -> id []          ← 一条都不命中
+str.to_lowercase().str.contains('parquet') -> id [3, 6]
+```
+
+两个坑：
+
+- 默认**大小写敏感** —— 语料里写的是 `Parquet`，`contains('parquet')` 一条都不命中；
+- 参数是**正则**不是字面量 —— `contains('a.b')` 会连 `axb` 一起命中，要按字面匹配得加 `literal=True`。
+
+**② `str.contains_any` —— 「这几个词里有没有一个」（OR 语义）**
+
+```
+contains_any(['parquet','BM25'])                 -> id [4, 7]
+to_lowercase().contains_any(['parquet','bm25'])  -> id [3, 4, 6, 7]
+```
+
+这个函数**没有** `literal` 参数 —— 它是**字面子串**匹配，所以 `['c++']` 这种含正则元字符的词也不会出问题。
+
+**③ 自己倒排 —— `split` + `explode` + `group_by`**
+
+```
+词 → 文档 id
+bm25       -> [4, 7]
+dataframe  -> [2]
+duckdb     -> [1, 3, 5]
+idf        -> [7]
+parquet    -> [3, 6]
+polars     -> [2, 3]
+rust       -> [2]
+sql        -> [5]
+tf         -> [7]
+```
+
+**中文这里露馅了**：正则是按**非单词字符**切的，中文之间没有空格，所以一整串中文变成了**一个词**：
+
+```
+不需要先转格式
+全文检索需要倒排索引
+内存友好
+```
+
+→ 不做分词的话，倒排表对中文基本没用。DuckDB 的 fts 扩展自带分词器，Polars 侧要自己接分词器，或者用 `jieba` / `pkuseg` 这类外部库先切好。
+
+**→ 能搜到，但少了三样东西**：
+
+1. **没有排序**：BM25 会给每篇文档一个分数，排序后「最相关的在前」；硬扫只能给一个布尔列，想要排序就得自己定规则。
+2. **没有打分**：BM25 考虑词频、逆文档频率、文档长度；倒排表里只有「哪些文档含这个词」，没有权重。
+3. **多词查询不是 AND**：`contains_any` 是 OR 语义，真要 AND 得自己过滤后取交集。
+
+还有一样 DuckDB 有、Polars 没有的东西：**索引**。DuckDB 的 fts 扩展在表上建的是**倒排索引**，查一个词是 O(命中数)；Polars 的 `str.contains` 是**每行扫一遍**，O(总行数)。
+
+### 3. 不装扩展的话，Polars 侧的硬扫有多贵
+
+50,000 篇文档上，「找出正文里含 `parquet` 的文档」这个查询：
+
+| 写法 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| Polars `str.contains`（硬扫） | **14.6** | 11.1 |
+| Polars `split+explode+group_by`（倒排） | 86.9 | 85.1 |
+
+口径：两个都是「找出正文里含 `parquet` 的文档」，返回命中条数；数据都在内存里，计时不含读盘，重复 5 次取中位数。
+
+注意倒排那种写法**每次查询都要重建整张倒排表** —— DuckDB 的 fts 扩展是**建一次、查很多次**，这是它真正的价值。
+
+→ 所以在没有扩展的 Polars 侧，全文检索的现实选择只有三个：
+
+1. 语料不大 → `str.contains` 硬扫，简单够用；
+2. 语料大且查得频繁 → **自己把倒排表物化成一张表**（或者干脆换到有 FTS 的引擎）；
+3. 需要相关度排序 → DuckDB 的 BM25 是现成的，Polars 侧得自己实现 TF-IDF / BM25。
+
+### 4. 装上扩展之后
+
+加 `--extension` 会真的 `INSTALL fts; LOAD fts;`，然后建索引、跑 BM25、两边比结果和代价：
+
+```bash
+uv run python src/fts_demo.py --extension --rows 20000
+```
+
+这一步**需要联网下载扩展**；离线环境下那一节会打印「当前环境不可用」然后跳过，不影响其余部分。
+
+这一节会打印的东西：DuckDB 侧装上之后 `duckdb_functions()` 里多出来的 FTS 函数清单、`PRAGMA create_fts_index` 的建索引耗时、
+三个查询（单个英文词 / 英文词 + 中文 / 纯中文）的 BM25 分数和排序结果，以及跟 Polars 侧硬扫的结果对比和代价对比。
+
+> 口径提醒：BM25 那一侧**多算了分数**，Polars 那一侧只判断命中与否 ——
+> 这不是纯粹的引擎速度对比，是「能力差 + 代价差」的总账。
+> 建索引的时间**不计入**查询耗时（它是一次性成本，脚本里单独打）。
+
 ## 目录结构
 
 ```
@@ -4890,6 +5474,9 @@ duckdb-polars-demo/
 │   ├── enum_demo.py        # ENUM / Categorical：排序 / cast / 未知值 / 物理码 / 往返
 │   ├── blob_demo.py        # BLOB / 二进制：字面量 / 编解码 / cast / 长度 / 往返
 │   ├── uuid_demo.py        # UUID：原生类型 vs 模拟 / 大小写 / 排序 / 往返
+│   ├── quantifier_demo.py  # 量词 ANY/ALL / 相关标量子查询 / LATERAL / UNNEST
+│   ├── sql_sugar_demo.py   # SQL 语法糖逐条对账：GROUP BY ALL / EXCLUDE / FILTER …
+│   ├── fts_demo.py         # 全文本搜索：fts 扩展 vs Polars 硬扫
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程

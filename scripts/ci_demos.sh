@@ -122,6 +122,9 @@ DEMOS=(
   "enum_demo|"
   "blob_demo|"
   "uuid_demo|"
+  "quantifier_demo|--rows $ROWS --repeat $REPEAT"
+  "sql_sugar_demo|"
+  "fts_demo|--rows $ROWS --repeat $REPEAT"
 )
 
 # 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。
