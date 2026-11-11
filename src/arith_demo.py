@@ -58,24 +58,30 @@ def duck_scalar(con: duckdb.DuckDBPyConnection, expr: str) -> object:
 def scenario_division(con: duckdb.DuckDBPyConnection) -> None:
     section("场景 1 · 除法：DuckDB 的 `/` 不是整数除法")
 
+    # 表里每个值都是当场算出来的 —— 写死的版本在负数那一组被抄错过
+    # （把 -7//3 的 -2 填进了 -7//2，把 -7%3 的 2 填进了 -7%2）。
+    cases: list[tuple[str, str, object]] = [
+        ("7 / 2", "7 / 2", lambda: (pl.Series([7]) / 2).to_list()[0]),
+        ("7 // 2", "7 // 2", lambda: (pl.Series([7]) // 2).to_list()[0]),
+        ("-7 / 2", "-7 / 2", lambda: (pl.Series([-7]) / 2).to_list()[0]),
+        ("-7 // 2", "-7 // 2", lambda: (pl.Series([-7]) // 2).to_list()[0]),
+        ("7 % 2", "7 % 2", lambda: (pl.Series([7]) % 2).to_list()[0]),
+        ("-7 % 2", "-7 % 2", lambda: (pl.Series([-7]) % 2).to_list()[0]),
+    ]
     print("  表达式            DuckDB            Polars")
     print("  " + "-" * 52)
-    rows = [
-        ("7 / 2", "3.5", "3.5"),
-        ("7 // 2", "3", "3"),
-        ("-7 / 2", "-3.5", "-3.5"),
-        ("-7 // 2", "-2", "-4"),
-        ("7 % 2", "1", "1"),
-        ("-7 % 2", "-1", "2"),
-    ]
-    for label, duck_val, pol_val in rows:
-        print(f"  {label:<16}{duck_val:<18}{pol_val}")
+    measured: dict[str, tuple[object, object]] = {}
+    for label, sql_expr, pol_fn in cases:
+        duck_val = duck_scalar(con, sql_expr)
+        pol_val = pol_fn()
+        measured[label] = (duck_val, pol_val)
+        print(f"  {label:<16}{str(duck_val):<18}{pol_val}")
 
     duck_div_type = q1(con, "SELECT typeof(7/2)")
     duck_idiv_type = q1(con, "SELECT typeof(7//2)")
-    pol_div = (pl.Series([7]) / 2).to_list()[0]
-    pol_idiv = (pl.Series([7]) // 2).to_list()[0]
-    pol_neg_idiv = (pl.Series([-7]) // 2).to_list()[0]
+    pol_div = measured["7 / 2"][1]
+    pol_idiv = measured["7 // 2"][1]
+    pol_neg_idiv = measured["-7 // 2"][1]
 
     print(f"\n  DuckDB typeof(7/2)  -> {duck_div_type}   ← `/` 永远是浮点")
     print(f"  DuckDB typeof(7//2) -> {duck_idiv_type}   ← `//` 才是整数除法")
@@ -83,12 +89,22 @@ def scenario_division(con: duckdb.DuckDBPyConnection) -> None:
     print(f"  Polars 7 // 2      -> {pol_idiv}")
     print(f"  Polars -7 // 2     -> {pol_neg_idiv}")
 
+    duck_neg_idiv = measured["-7 // 2"][0]
+    duck_neg_mod = measured["-7 % 2"][0]
+    pol_neg_mod = measured["-7 % 2"][1]
+
     print("\n→ 两条要记住的：")
     print("  · **DuckDB 的 `/` 不做整除**：`7/2` 是 `3.5`，不是 `3`、不是 `3.5` 的整数部分。")
     print("    从 MySQL/Postgres 迁过来的人最容易在这里错：Postgres 的 `7/2` 是 `3`。")
     print("  · 两边的 `//` 对**负数**的定义不同：")
-    print("    DuckDB `-7//2` = -2（向零截断），Polars `-7//2` = -4（向下取整）。")
-    print("    同理 `%`：DuckDB `-7%2` = -1（截断余数），Polars `-7%2` = 2（floor mod）。")
+    print(
+        f"    DuckDB `-7//2` = {duck_neg_idiv}（向零截断），"
+        f"Polars `-7//2` = {pol_neg_idiv}（向下取整）。"
+    )
+    print(
+        f"    同理 `%`：DuckDB `-7%2` = {duck_neg_mod}（截断余数），"
+        f"Polars `-7%2` = {pol_neg_mod}（floor mod）。"
+    )
     print("    → 负数参与整除/取模时，两边的结果**不是差 1 的关系，是完全不同的一套数**。")
     print("      DuckDB 的 `%` 跟 C/C++/Java 一致；Polars 的跟 Python 一致。")
 
