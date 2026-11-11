@@ -138,6 +138,8 @@ DEMOS=(
   "parquet_meta_demo|--rows $ROWS --repeat $REPEAT"
   "concurrency_demo|--hold 1"
   "attach_demo|"
+  "ranking_demo|--rows $ROWS --repeat $REPEAT"
+  "materialize_demo|--rows $ROWS --repeat $REPEAT"
 )
 
 # 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。

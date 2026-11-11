@@ -86,6 +86,8 @@ uv run python src/similarity_demo.py # 字符串相似度 / 编辑距离：DuckD
 uv run python src/parquet_meta_demo.py # Parquet 元数据内省 + 行组裁剪：zonemap 在哪儿、剪掉了多少
 uv run python src/concurrency_demo.py  # 并发 / 锁 / 多进程：DuckDB 单写者模型 vs Polars 只剩文件
 uv run python src/attach_demo.py       # ATTACH 多库 + catalog 内省：DuckDB 有「库」，Polars 只有文件
+uv run python src/ranking_demo.py      # 排名函数全家桶：9 个函数逐个对账，4 种结局
+uv run python src/materialize_demo.py  # 结果物化方式的代价：把数据拿出引擎的几条通道
 ```
 
 一键跑完整流程：
@@ -153,6 +155,8 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `parquet_meta_demo.py` | Parquet 元数据内省 + 行组统计裁剪：zonemap 在哪儿、剪掉了多少、两边能不能看见 |
 | `concurrency_demo.py` | 并发 / 锁 / 多进程：文件锁、只读连接插队、WAL 崩溃恢复、MVCC、Polars 静默丢数据 |
 | `attach_demo.py` | ATTACH 多库 + 跨库 join + catalog 内省：DuckDB 有「库」和元数据，Polars 只有文件 |
+| `ranking_demo.py` | 排名函数全家桶：DuckDB 9 个 vs Polars 对齐 4 个 / 手搓 3 个 / 语义不同 1 个 / 没有 1 个 |
+| `materialize_demo.py` | 结果物化方式的代价：Arrow / numpy / 元组 / 字典几条通道，代价差一个数量级，语义还不一样 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -204,6 +208,8 @@ uv run python src/math_demo.py --rows 2000000 --repeat 5
 uv run python src/similarity_demo.py --pairs 20000 --repeat 5
 uv run python src/parquet_meta_demo.py --rows 1000000 --repeat 5
 uv run python src/concurrency_demo.py --hold 3    # 持锁进程待多久（秒）
+uv run python src/ranking_demo.py --rows 2000000 --repeat 5
+uv run python src/materialize_demo.py --rows 2000000 --repeat 5
 ```
 
 用 DuckDB 交互式探索数据：
@@ -236,7 +242,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，56 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，58 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -561,6 +567,24 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 224 | 挂 parquet 当库 | ❌ `Unrecognized storage type "parquet"` | parquet 本来就是它唯一的输入格式 | parquet 是「读的格式」，不是「一个库」 |
 | 225 | `DESCRIBE` | `DESCRIBE 库.模式.表`（跨库跨 schema 都能用） | `pl.describe` **不存在**；`DataFrame.describe()` 是**列的统计摘要** | 搜「describe」命中的是后者，不是 catalog |
 | 226 | Postgres 工具能不能直连 | 带 **pg_catalog 兼容层**（22 个视图） | —— | `information_schema` 本身就是拿这些视图拼出来的 |
+| 227 | 排名函数一共几个 | **9 个**：`row_number` / `rank` / `dense_rank` / `percent_rank` / `cume_dist` / `ntile` / `first_value` / `last_value` / `nth_value` | 直接对齐 **4 个**，手搓 **3 个**，语义不同 **1 个**，完全没有 **1 个** | —— |
+| 228 | `row_number()` | 有 | 有：`cum_count().over(g, order_by=v)` | **逐行一致** ✅ |
+| 229 | `rank()` / `dense_rank()` | 有 | 有：`rank('min')` / `rank('dense')` | **逐行一致** ✅（Polars `rank()` 默认 `average`，DuckDB 没有对应函数） |
+| 230 | `percent_rank()` | 有 | ❌ **没有** | 手搓 `(rank('min') − 1) / (行数 − 1)`，逐行一致 ✅ |
+| 231 | `cume_dist()` | 有 | ❌ **没有** | 手搓 `rank('max') / 行数`，逐行一致 ✅ |
+| 232 | `ntile(k)` | 有 | ❌ **没有** | 手搓 `((cum_count() − 1) × k) // 行数 + 1`，逐行一致 ✅ |
+| 233 | `last_value()` 默认 frame | 默认 frame 是 `RANGE UNBOUNDED PRECEDING → CURRENT ROW`，给的是**当前行自己的值** | `last().over()` 给的是**分区最后一行** | **同一个名字两个意思** —— 要分区最后一行，SQL 里得显式写全 frame |
+| 234 | `nth_value(v, n)` | 有，frame 不够长时给 **NULL** | ❌ **没有** | —— |
+| 235 | 单行分区的 `percent_rank()` | **0.0**（不是 NaN、也不报除零） | 手搓版是 **NaN**（÷0） | 手搓版要自己兜这个边界，不然 NaN 会流进报表 |
+| 236 | 「把结果拿出去」的方法名 | conn 上 `fetchall` / `fetchnumpy` / `to_arrow_table`；rel 上多 `to_dicts` | DataFrame 上 `to_dicts` / `to_numpy` / `to_arrow` / `rows` | **名字对不上，活儿对得上** —— 迁移是改方法名，不是改逻辑 |
+| 237 | numpy 通道里的 NULL | **MaskedArray**（mask 是真的，`.tolist()` 还看得到 NULL） | `to_numpy()` 给 **float64 + NaN**；`masked=True` 才给 MaskedArray | 要 NULL 一路保真就**走 Arrow** |
+| 238 | `np.asarray(masked_array)` | **mask 被丢掉，NULL 变成 0** | —— | 别这么拆 —— 填 0 的读数比 NaN 危险得多 |
+| 239 | numpy 通道里的 DECIMAL | **float64**，尾数当场丢失 | `to_numpy()` 退成 **object**（值还是精确的 Decimal） | 两边**丢的东西正好相反**：DuckDB 丢 DECIMAL，Polars 丢 int64 |
+| 240 | numpy 通道里的大 int64 | int64 **保住了**（MaskedArray 底子还是 int64） | 带 NULL 的 int64 列 → **float64**，`9007199254740993` 变 `…992`，**差 1 不报错** | 而且是**整表统一降级**：一列有 NULL，全表 int64 跟着降 |
+| 241 | Arrow 通道 | **一字不差** | **一字不差** | 默认走 Arrow —— 没有「转换」这一步就没有地方丢精度 |
+| 242 | Arrow 里的字符串类型 | `string`（32 位偏移） | `large_string`（64 位偏移） | 写同一个 Arrow 文件给第三方读，得留意对方认不认 |
+| 243 | pandas 通道报错 | `InvalidInputException`，说清了「该去装 pandas」 | `ModuleNotFoundError`，原因藏在异常链里 | 按异常类型 catch 的代码要改 |
+| 244 | `con.execute(sql).to_arrow_table()` | **多拷一份**（DuckDB 自己会警告） | —— | 写 `con.sql(sql).to_arrow_table()` |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -586,7 +610,9 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 199~200 条在 `字符串相似度与编辑距离：DuckDB 有 8 个，Polars 有 0 个`、
 第 201~203 条在 `Parquet 元数据内省与行组裁剪` 里展开；
 第 204~214 条在 `并发、锁与多进程访问：DuckDB 拒绝，Polars 不设防`、
-第 215~226 条在 `ATTACH 与 catalog 内省：DuckDB 有「库」，Polars 只有「文件」` 里展开。
+第 215~226 条在 `ATTACH 与 catalog 内省：DuckDB 有「库」，Polars 只有「文件」` 里展开；
+第 227~235 条在 `排名函数全家桶：DuckDB 有 9 个，Polars 直接对齐 4 个`、
+第 236~244 条在 `结果物化方式的代价：把数据拿出引擎的几条通道` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -6586,6 +6612,476 @@ scan_parquet('customers/*.parquet') → 惰性帧，collect 出来 30 行
 - 要「一堆 parquet 上并行跑」→ Polars + 目录（见 `partition_demo.py`）；
 - 要「跨库 join」→ DuckDB 一次 ATTACH 搞定；Polars 侧就是读两个路径再 join，或者干脆让 DuckDB 去 join。
 
+## 排名函数全家桶：DuckDB 有 9 个，Polars 直接对齐 4 个
+
+`uv run python src/ranking_demo.py`
+
+`window_demo.py` 讲了 frame、命名窗口、QUALIFY、LAG/LEAD，但**排名这一族**散在两边。
+这个 demo 把 9 个排名/位置类函数逐个对账，结论是四种结局：
+
+- **4 个直接对得上** —— `row_number` / `rank` / `dense_rank` / `first_value`；
+- **3 个得手搓** —— `percent_rank` / `cume_dist` / `ntile`，Polars 里**完全没有**，
+  但公式能推出来，本 demo 验过逐行一致；
+- **1 个语义不同** —— `last_value`，DuckDB 受 frame 支配，Polars 没有 frame；
+- **1 个根本没有** —— `nth_value`。
+
+### 1. 9 个函数各给什么
+
+8 行小表，**故意造出并列**：
+
+```
+  g     v     tag
+  -----------------------
+  a     10    x
+  a     20    y
+  a     20    z     ← 并列
+  a     30    w
+  b     5     v
+  b     5     u     ← 头尾都有并列
+  b     40    t
+  b     40    s
+```
+
+a 组 = `[10, 20, 20, 30]`，b 组 = `[5, 5, 40, 40]`。
+
+| 函数 | 含义 | a 组结果 | b 组结果 |
+| --- | --- | --- | --- |
+| `row_number()` | 第几行（并列也往下数） | `1, 2, 3, 4` | `1, 2, 3, 4` |
+| `rank()` | 第几名（并列同名次，**跳号**） | `1, 2, 2, 4` | `1, 1, 3, 3` |
+| `dense_rank()` | 第几名（并列同名次，**不跳号**） | `1, 2, 2, 3` | `1, 1, 2, 2` |
+| `percent_rank()` | `(rank − 1) / (行数 − 1)` | `0, 0.333, 0.333, 1` | `0, 0, 0.667, 0.667` |
+| `cume_dist()` | `≤ 当前值的行数 / 行数` | `0.25, 0.75, 0.75, 1` | `0.5, 0.5, 1, 1` |
+| `ntile(3)` | 第几档 | `1, 1, 2, 3` | `1, 1, 2, 3` |
+| `first_value(v)` | frame 里第一个值 | `10, 10, 10, 10` | `5, 5, 5, 5` |
+| `last_value(v)` | frame 里最后一个值 | `10, 20, 20, 30` | `5, 5, 40, 40` |
+| `nth_value(v, 2)` | frame 里第 2 个值 | `NULL, 20, 20, 20` | `5, 5, 5, 5` |
+
+**同一组里 9 个函数给出 9 种不同的「名次」** —— 它们不是同一个东西的 9 种写法，
+是 9 个**各有各的用途**的函数。选错一个，口径就变了。
+
+### 2. 能对齐的三个：row_number / rank / dense_rank
+
+| 函数 | DuckDB | Polars | 逐行一致 |
+| --- | --- | --- | --- |
+| `row_number()` | `row_number() OVER (...)` | `cum_count().over(g, order_by=v)` | ✅ |
+| `rank()` | `rank() OVER (...)` | `rank('min').over(g, order_by=v)` | ✅ |
+| `dense_rank()` | `dense_rank() OVER (...)` | `rank('dense').over(g, order_by=v)` | ✅ |
+
+**注意 Polars 的 `rank()` 默认是 `average`**（并列取平均名次）——
+对应的是 SQL 的 `RANK()` **加**并列求平均，DuckDB 没有这个函数。
+所以 Polars 侧要显式写 `rank('min')`，别用默认值。
+
+### 3. 没有的三个：percent_rank / cume_dist / ntile
+
+在 Polars 的命名空间里搜一遍：
+
+```
+pl.percent_rank   顶层：没有      pl.Expr.percent_rank ：没有
+pl.cume_dist      顶层：没有      pl.Expr.cume_dist    ：没有
+pl.ntile          顶层：没有      pl.Expr.ntile        ：没有
+```
+
+**不是「藏在别处」，是真的没有。** 这三个在 DuckDB 里都是一行 SQL。
+
+但都能手搓出来，本 demo **逐行验过和 DuckDB 一致**：
+
+| 函数 | 手搓公式 | 逐行一致 |
+| --- | --- | --- |
+| `percent_rank()` | `(rank('min') − 1) / (行数 − 1)` | ✅ |
+| `cume_dist()` | `rank('max') / 行数` | ✅ |
+| `ntile(k)` | `((cum_count() − 1) × k) // 行数 + 1` | ✅ |
+
+```python
+# percent_rank
+(pl.col("v").rank("min").over("g", order_by="v") - 1) / (pl.len().over("g") - 1)
+# cume_dist
+pl.col("v").rank("max").over("g", order_by="v") / pl.len().over("g")
+# ntile(k)
+((pl.col("v").cum_count().over("g", order_by="v") - 1) * k) // pl.len().over("g") + 1
+```
+
+差别在**可读性**和**责任**：DuckDB 一行，Polars 这三行要自己推导公式，
+公式一变（换引擎版本、改排名口径）就得重新验一遍。
+
+### 4. last_value：同名不同义
+
+DuckDB 的 `last_value` **受 frame 支配**，默认 frame 是
+`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` —— 右端是**当前行**。
+
+a 组（按 v 排序：`10, 20, 20, 30`）：
+
+| v | `last_value(v)` 默认 frame | 显式 `UNBOUNDED FOLLOWING` |
+| --- | --- | --- |
+| 10 | 10 | 30 |
+| 20 | 20 | 30 |
+| 20 | 20 | 30 |
+| 30 | 30 | 30 |
+
+**DuckDB 的 `last_value` 默认给的是「当前行自己的值」** —— 因为 frame 的右端就是当前行。
+要「分区的最后一行」，必须显式写全 frame。
+
+Polars 侧 `first().over(g)` / `last().over(g)` 给的是**整个分区的首 / 尾**：
+
+```
+first() → [10, 10, 10, 10, 5, 5, 5, 5]
+last()  → [30, 30, 30, 30, 40, 40, 40, 40]
+```
+
+**同一个想法，两个引擎给的答案不一样。**
+
+| 要什么 | DuckDB | Polars |
+| --- | --- | --- |
+| 分区的最后一行 | `last_value(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)` | `pl.col('v').last().over('g')` |
+| 当前行的值 | `last_value(v) OVER (ORDER BY v)`（默认 frame 就行） | 没有直接对应的，得自己用 shift / cum_* 拼 |
+
+### 5. ntile 的分桶规则：三个容易搞错的地方
+
+**坑一：桶的大小最多差 1，多出来的那行给前面的桶。**
+
+| 写法 | 桶号 | 每桶行数 |
+| --- | --- | --- |
+| `ntile(2)` | `1, 1, 2, 2` | `2, 2` |
+| `ntile(3)` | `1, 1, 2, 3` | `2, 1, 1` |
+| `ntile(5)` | `1, 2, 3, 4` | `1, 1, 1, 1` |
+
+**坑二：ntile 是按分区分的，不是全局分位。** a 组和 b 组各自从 1 开始编号，
+所以 `ntile(4)` **绝不等价于**「全局四分位」—— 想做全局分位得按全局排序算，
+或者用 `quantile` 切阈值。
+
+**坑三：桶数比行数还多时，多出来的桶是空的。** 4 行的分区 `ntile(9)` → 桶号 `1, 2, 3, 4`，
+第 5~9 号桶**没有行**。所以「桶号 ≤ 4」不等于「所有行」，统计的时候要当心。
+
+### 6. nth_value：Polars 没有
+
+DuckDB 的 `nth_value(v, 2)` 在 frame 不够长时给 **NULL**（第一行只有 1 个值，要第 2 个就取不到）：
+
+```
+a 组：[(10, None), (20, 20), (20, 20), (30, 20)]
+```
+
+Polars **完全没有** `nth_value`（`pl.Expr` 里也没有）。
+
+### 7. 边界：单行分区
+
+一个只有 1 行的分区，几个函数各给什么：
+
+| 函数 | DuckDB | 手搓的 Polars 版 |
+| --- | --- | --- |
+| `row_number()` | 1 | 1 |
+| `rank()` | 1 | 1 |
+| `dense_rank()` | 1 | 1 |
+| `percent_rank()` | **0.0** | **NaN** |
+| `cume_dist()` | 1.0 | 1.0 |
+| `ntile(3)` | 1 | 1 |
+
+DuckDB 给 `percent_rank` = **0.0**（不是 NaN、不是除零报错）。
+但**手搓**的 Polars 版在同一个场景下是 **NaN** —— 行数 − 1 = 0，除零。
+
+**DuckDB 给 0.0，手搓给 NaN** —— 手搓版本要自己兜住这个边界，
+不然 NaN 会顺着下游流进报表。
+
+这就是「DuckDB 有 3 个现成函数，Polars 得手搓 3 个公式」的**真实代价**：
+不只是多写几行，是**边界情况要自己一个个补**。
+
+### 8. 代价：排名算得有多快
+
+20 万行 × 1,000 个分区，同一个排序键（v）上各跑一遍。
+
+计时**只包住「算出结果」这一段**，两边出口统一成 **Arrow**
+（DuckDB 侧走 `rel.arrow()`，Polars 侧本来就活在 Arrow 里）——
+**不能**用 `fetchall()`，那量到的是「物化成 Python 对象」的代价，不是「算排名」的代价。
+
+| 函数 | Polars 侧写法 | DuckDB 中位 | Polars 中位 | Polars / DuckDB |
+| --- | --- | --- | --- | --- |
+| `row_number` | `cum_count().over(g, order_by=v)` | 16.0 ms | 7.1 ms | 0.45× |
+| `rank` | `rank('min').over(g, order_by=v)` | 16.1 ms | 6.5 ms | 0.40× |
+| `dense_rank` | `rank('dense').over(g, order_by=v)` | 15.2 ms | 6.5 ms | 0.43× |
+| `percent_rank` | 手搓：`(rank−1)/(n−1)` | 17.9 ms | 11.2 ms | 0.62× |
+| `cume_dist` | 手搓：`rank('max')/n` | 16.7 ms | 10.8 ms | 0.64× |
+| `ntile(4)` | 手搓：`(cum_count−1)*4÷n +1` | 16.7 ms | 12.4 ms | 0.75× |
+
+> 口径：同一份数据（Polars 造，Arrow 零拷贝灌进 DuckDB），
+> 两边**交错**跑 3 轮取中位数和最快（避免「谁先跑谁吃亏」）。
+> 共享开发机，单次数字会抖，看趋势。
+
+**6 个函数 Polars 全部更快，差距在 0.40~0.75 倍之间** —— 排名本身不是瓶颈
+（Polars 侧是原生算子，DuckDB 侧要过一遍通用窗口框架）。
+手搓的那三个（percent_rank / cume_dist / ntile）差距最小，
+因为公式本身要算好几遍 `rank` —— **越依赖手搓公式，越追不上现成函数**。
+
+**但这不等于「两边可以换着用」**：percent_rank / cume_dist / ntile 这三个是手搓的，
+性能上的领先换不来语义上的自动对齐 —— 公式要自己负责，
+边界情况（比如单行分区）也要自己负责。
+
+### 9. 小结
+
+| 函数 | DuckDB | Polars |
+| --- | --- | --- |
+| `row_number` | 有 | 有：`cum_count().over()` |
+| `rank` | 有 | 有：`rank('min').over()` |
+| `dense_rank` | 有 | 有：`rank('dense').over()` |
+| `percent_rank` | 有 | ❌ **没有**，得手搓 |
+| `cume_dist` | 有 | ❌ **没有**，得手搓 |
+| `ntile` | 有 | ❌ **没有**，得手搓 |
+| `first_value` | 有（默认 frame 恰好对齐） | 有：`first().over()`，**没有 frame** |
+| `last_value` | 有（默认 frame **不对齐**） | 有：`last().over()`，**语义不同** |
+| `nth_value` | 有 | ❌ **没有** |
+
+**实务建议**：
+
+- 排名口径只用到 `row_number` / `rank` / `dense_rank` → 两边都能直接写；
+- 要 `percent_rank` / `cume_dist` / `ntile` → 优先在 **DuckDB 侧**算，
+  别在 Polars 侧手搓（公式要自己负责，边界也要自己负责）；
+- 要「分组最后一行」→ **别用 `last_value`**，DuckDB 侧写全 frame，Polars 侧写 `last().over()`；
+- 要「组内第 k 名」→ 记得加一个**唯一的** tiebreaker，不然并列行的名次是不确定的。
+
+## 结果物化方式的代价：把数据拿出引擎的几条通道
+
+`uv run python src/materialize_demo.py`
+
+前面所有 demo 讲的都是**在引擎里算**。但 ETL 的最后一步总是同一个动作：**把结果交出去**。
+这一步两边各有好几条通道，每条的代价能差一个数量级，**语义还不一样**。
+
+### 1. 出口清单：两边各有哪些方法
+
+DuckDB 有**两个**对象，各带一套出口：
+
+```
+con = duckdb.connect()  —— DB-API 连接
+  fetch_df, fetch_df_chunk, fetchall, fetchdf, fetchmany, fetchnumpy,
+  fetchone, to_arrow_reader, to_arrow_table
+
+rel = con.sql(sql)      —— 关系对象（多几个 dict / Arrow 出口）
+  fetch_arrow_reader, fetch_arrow_table, fetch_record_batch, fetchall, fetchdf,
+  fetchnumpy, iter_rows, to_arrow_reader, to_arrow_table, to_dicts, to_table
+```
+
+Polars 只有一个对象 —— `DataFrame`：
+
+```
+iter_rows, rows, rows_by_key, to_arrow, to_dict, to_dicts, to_dummies,
+to_init_repr, to_jax, to_numpy, to_pandas, to_series, to_struct, to_torch
+```
+
+**DuckDB 多了一层对象**，所以同一个引擎有两套出口，而且两套**不完全重叠** ——
+关系对象才有 `to_dicts()`。Polars 侧就一个 DataFrame。
+
+但**功能上大体能对上**：
+
+| 想要什么 | DuckDB | Polars |
+| --- | --- | --- |
+| Python 元组 | `fetchall()` | `rows()` |
+| Python 字典 | `rel.to_dicts()` | `to_dicts()` |
+| numpy 数组 | `fetchnumpy()` | `to_numpy()` |
+| Arrow 表 | `rel.to_arrow_table()` | `to_arrow()` |
+| Arrow 流 | `rel.to_arrow_reader()` | `scan_parquet().collect_batches()` |
+| pandas | `rel.df()` | `to_pandas()` |
+
+名字对不上，**活儿是对得上的** —— 迁移时是改个方法名，不是改逻辑。
+真正要小心的是**语义**。
+
+### 2. 同一个 NULL，几条通道，几种归宿
+
+一列 int64：`[NULL, 42]`。
+
+| 通道 | 结果 |
+| --- | --- |
+| DuckDB `fetchall()` | `[(None,), (42,)]` |
+| DuckDB `fetchnumpy()` | **MaskedArray**，`mask = [True, False]` |
+| DuckDB `rel.to_dicts()` | `[{'n': None}, {'n': 42}]` |
+| Polars `to_dicts()` | `[{'n': None}, {'n': 42}]` |
+| Polars `to_numpy()` | **float64** `[nan, 42.0]` |
+| Polars `to_numpy(masked=True)` | **MaskedArray** int64，`[None, 42]` |
+
+DuckDB 给的 MaskedArray **mask 是真的**，`.tolist()` 还能看到 NULL。
+但有个陷阱：
+
+```python
+np.asarray(masked)   # → [ 0 42]   ← mask 被丢掉了，NULL 变成 0
+```
+
+**一个填 0 的传感器读数，比一个 NaN 危险得多** —— NULL 和「真的读到 0」在下游算平均值时结果一样，
+但它们根本不是一回事。Polars 的 `to_numpy()` 直接给 float64 + NaN，
+NaN 往下传会一直传染，反而更容易发现。
+
+> **要 NULL 一路保真，就走 Arrow。** numpy 通道在两个引擎里都会把 NULL 变成「某个具体的数」。
+
+### 3. 精度的暗礁：int64 和 DECIMAL 丢的东西正好相反
+
+两个「装不下 float64」的值：`int64 9007199254740993`（2^53 + 1）和
+`DECIMAL(24,3) 12345678901234567.890`。
+
+小表 `t` 的两行故意摆成三种对照（`big_int` 有 NULL、`big_int_clean` 两行都有值）：
+
+| 通道 | 结果 |
+| --- | --- |
+| DuckDB `fetchall()` | **一字不差**（Python 的 int 任意精度，Decimal 精确） |
+| DuckDB `fetchnumpy()` | int64 列**保住了**；**DECIMAL 列变 float64**，尾数当场丢失 |
+| Polars `to_numpy()`（一列 int64，无 NULL） | int64 **一字不差** |
+| Polars `to_numpy()`（两列 int64，一列有 NULL） | **整表统一降级成 float64** |
+| Polars `to_numpy()`（混了 DECIMAL / 字符串） | **object**，每列各自转 |
+| Arrow（两边） | **一字不差** |
+
+Polars 那个「整表统一降级」最狠 —— 要拼成一个 numpy 数组，各列必须同类型，
+所以**一列有 NULL，全表的 int64 都跟着降**：
+
+```
+to_numpy() 之前：  big_int = 9007199254740993（有 NULL）  big_int_clean = 9007199254740993
+to_numpy() 之后：  big_int = 9007199254740992.0          big_int_clean = 9007199254740992.0
+                                                                              ↑ 连没 NULL 的那列也降了
+```
+
+**不报错、不警告**，就是少了一个。
+
+而混了 DECIMAL 的整表退成 `object` 之后，反而**每列各自转**、值不丢：
+
+```
+[[9007199254740992.0, 9007199254740993, Decimal('12345678901234567.890'), 'a', nan],
+ [nan,             9007199254740993, None,                   'b', 42.0]]
+       ↑ 这列有 NULL，掉了        ↑ 这列没 NULL，保住了      ↑ DECIMAL 也保住了
+```
+
+**所以两边的 numpy 通道，丢的东西正好相反**：
+
+- **DuckDB 丢 DECIMAL**（int64 用 MaskedArray 保住了）；
+- **Polars 丢 int64**（DECIMAL 退成 Python 对象反而保住了）。
+
+### 4. Arrow 是唯一一字不差的通道
+
+`DECIMAL(24,3)`、`int64`、`date32` 全部原样保留 ——
+原因很简单：Arrow 本来就是两边共同的存储格式，**「转换」这一步根本不存在，没有地方可以丢精度**。
+
+顺带一个类型上的小差别：
+
+| 引擎 | Arrow 里的字符串 |
+| --- | --- |
+| DuckDB | `string`（32 位偏移） |
+| Polars | `large_string`（64 位偏移） |
+
+两边互相读都没问题，但**写到同一个 Arrow 文件里**再让第三方读，得留意对方认不认 `large_string`。
+
+### 5. 代价：各条通道有多贵
+
+20 万行，两边读**同一个 parquet 文件**，从零读起，再走各自的通道
+（端到端对比，两边都包含 parquet 解码，对称）。
+
+| 通道 | DuckDB 中位 | Polars 中位 | 比值（Polars / DuckDB） |
+| --- | --- | --- | --- |
+| Arrow 表 | 15.9 ms | 9.3 ms | 0.58× |
+| numpy | 26.6 ms | 66.7 ms | **2.51×** |
+| Python 元组 | 188.0 ms | 187.4 ms | 1.00× |
+| Python 字典 | 375.9 ms | 333.1 ms | 0.89× |
+
+体积（同一个结果，不同包装）：
+
+| 通道 | 体积 |
+| --- | --- |
+| Arrow 表 | 9.09 MB |
+| numpy | 9.00 MB |
+| Python 元组 | 56.79 MB |
+| Python 字典 | 91.99 MB |
+
+**Python 对象是 Arrow 的 6.2 倍（tuple）/ 10.1 倍（dict）** ——
+每个元素都要一个 PyObject，外加 dict 的哈希表。
+数据量一大，这就是「内存爆掉」和「跑得动」的分水岭。
+
+> 口径：两边**交错**跑 3 轮取中位数和最快（避免「谁先跑谁吃亏」）。
+> 共享开发机，单次数字会抖，看趋势。
+
+三条结论：
+
+1. **通道之间的差距是量级上的，跨引擎的差距是零头。** Arrow 16 ms 对字典 376 ms —— 差 20 倍以上；
+   而同一个通道上两个引擎的差距，除了 numpy 那条之外都在 **1.8 倍以内**
+   （元组那一条几乎一模一样：188.0 vs 187.4 ms）。
+   **选通道比选引擎重要得多。**
+2. **两个引擎内部都是「dict 比 tuple 贵」**：DuckDB 2.0×、Polars 1.8× ——
+   dict 每个键都要一个 PyObject 外加哈希表，tuple 是连续的一块。
+3. **Arrow 通道 DuckDB 比 Polars 慢**（15.9 vs 9.3 ms，差 6.6 ms）——
+   DuckDB 得先从自己的列存格式转成 Arrow，Polars 本来就活在 Arrow 里。
+
+**唯一反过来的通道是 numpy**：Polars 66.7 ms vs DuckDB 26.6 ms（慢 2.5 倍）。
+原因是这份 parquet 里有 DECIMAL 列 —— Polars 的 `to_numpy()` 退成 `object` dtype，
+每一格都得装箱成一个 Python 对象；DuckDB 把 DECIMAL 转成 float64，代价小得多，
+但**精度丢了**（见上一节）。**「快」和「准」在这里是二选一。**
+
+→ 实务结论：**下游只要 Arrow（pandas / pyarrow / 另一个引擎），就别在 Python 对象这一层绕一圈。**
+一定要 Python 对象时，优先 `rows()` / `fetchall()`（元组），别一上来就要 dict。
+
+### 6. 一次性还是流式
+
+结果比内存大的时候，别用 `to_arrow_table()` / `collect()` —— 那两个都要求全量进内存。
+
+| 引擎 | 流式接口 | 给什么 |
+| --- | --- | --- |
+| DuckDB | `rel.to_arrow_reader()` | **Arrow 批次**（零额外转换） |
+| DuckDB | `rel.fetch_record_batch()` | Arrow 批次（自己收） |
+| Polars | `lf.collect_batches()` | **DataFrame 列表**（不是 Arrow），要 Arrow 得自己再转一次 |
+| Polars | `lf.sink_batches(callback)` | 不在内存里攒着，来一批处理一批 |
+
+实测 20 万行：DuckDB 的 reader 分 2 批（122,880 + 77,120 行），
+Polars 的 `collect_batches()` 也是 2 批（`[122880, 77120]`）。
+
+**接口粒度不同是重点**：DuckDB 直接给 Arrow 批次，Polars 给 DataFrame，
+中间多一次转换。
+
+### 7. 顺带一提：pandas 通道
+
+两边都依赖 pandas（本机没装，所以都报错），但**报错方式不一样**：
+
+| 引擎 | 报错 |
+| --- | --- |
+| DuckDB `.df()` | `InvalidInputException: 'pandas' is required for this operation but it was not installed` |
+| Polars `.to_pandas()` | `ModuleNotFoundError: No module named 'pandas'` |
+
+DuckDB 抛自己的异常类型，把「你该去装 pandas」说得很清楚；
+Polars 直接把 `ModuleNotFoundError` 抛出来，底层原因被包在异常链里。
+
+还有 DuckDB 的一个坑：`con.execute(sql).to_arrow_table()` 会**多拷一份**，
+DuckDB 自己会警告：
+
+```
+Arrow output on a DB-API result makes an extra copy of the rows,
+use con.sql(query).to_arrow_table() instead.
+```
+
+实测 20 万行（两条路**交错**跑，避免「谁先跑谁吃亏」）：
+
+| 写法 | 耗时 |
+| --- | --- |
+| `con.execute(sql).to_arrow_table()`（多拷一份） | 13.0 ms |
+| `con.sql(sql).to_arrow_table()`（正确写法） | 14.2 ms |
+
+差 **−1.2 ms** —— **在这个行数下，那份额外的拷贝淹没在噪声里了**（±1 ms 量级）。
+
+这是本项目里少数几个「测不出差别」的结论，如实记下来：
+**拷贝确实存在**（DuckDB 自己会警告），但在这个规模上它的**时间**代价量不出来；
+它真正的影响是**内存** —— 那一份多出来的 Arrow 缓冲是实打实的。
+行数越大越明显，别赌。
+
+**要 Arrow 就写 `con.sql(sql).to_arrow_table()`。**
+
+### 8. 小结：四条通道，怎么选
+
+| 通道 | 类型保真 | 代价 | 什么时候用 |
+| --- | --- | --- | --- |
+| Arrow | ✅ 一字不差 | 最快 | 下游是 pandas / pyarrow / 另一个引擎；数据量大 |
+| Python 元组 | ✅ 一字不差 | 慢 | 要按行处理，行数不大（几百万以内） |
+| Python 字典 | ✅ 一字不差 | 最慢 | 要按列名取值（`row['col']`）；行数不大 |
+| numpy | ❌ 降级 | 居中 | **确认没有 DECIMAL、没有大 int** 才用；否则先转 Arrow |
+
+**一句话：默认走 Arrow。** 它是唯一两边都「一字不差」的通道，
+也是唯一在数据量大时还保持数量级的通道。
+
+**三个具体的坑，按踩中概率排**：
+
+1. `np.asarray(masked_array)` —— **mask 被丢掉，NULL 变 0**；
+2. `to_numpy()` 把带 NULL 的 int64 变 float64 —— `9007199254740993` 变 `9007199254740992`，
+   **差 1 不报错**，而且是**整表**降级；
+3. DuckDB `fetchnumpy()` 把 DECIMAL 变 float64 —— **尾数当场丢失**。
+
+这三条的共同点：**都不报错**。结果照样出来、类型照样是 numpy 数组，
+只有在下游做聚合的时候，答案悄悄差了一点。
+
 ## 目录结构
 
 ```
@@ -6675,6 +7171,8 @@ duckdb-polars-demo/
 │   ├── parquet_meta_demo.py # Parquet 元数据内省：zonemap 与行组裁剪
 │   ├── concurrency_demo.py  # 并发 / 锁 / 多进程：文件锁、WAL、MVCC、Polars 静默丢数据
 │   ├── attach_demo.py       # ATTACH 多库 + catalog 内省：DuckDB 有「库」，Polars 只有文件
+│   ├── ranking_demo.py      # 排名函数全家桶：9 个函数逐个对账 / 手搓公式 / frame 语义
+│   ├── materialize_demo.py  # 结果物化方式的代价：几条通道的代价与语义
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
@@ -6726,6 +7224,11 @@ duckdb-polars-demo/
 - Polars `sort`（`maintain_order`）：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.sort.html>
 - Polars `n_unique`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.n_unique.html>
 - DuckDB 窗口函数：<https://duckdb.org/docs/stable/sql/functions/window_functions>
+- DuckDB 排名函数（`rank` / `percent_rank` / `cume_dist` / `ntile` / `nth_value`）：<https://duckdb.org/docs/stable/sql/functions/window_functions#rank-functions>
+- Polars `rank`（`method` 取值）：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.rank.html>
+- DuckDB Arrow 输出：<https://duckdb.org/docs/stable/guides/python/sql_on_arrow>
+- Polars `to_numpy`（`masked` 参数）：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.to_numpy.html>
+- Polars `collect_batches` / `sink_batches`：<https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.collect_batches.html>
 - DuckDB 正则表达式：<https://duckdb.org/docs/stable/sql/functions/regular_expressions>
 - DuckDB 集合运算：<https://duckdb.org/docs/stable/sql/query_syntax/setops>
 - DuckDB ALTER TABLE：<https://duckdb.org/docs/stable/sql/statements/alter>
