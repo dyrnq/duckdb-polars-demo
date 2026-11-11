@@ -16,6 +16,7 @@
 | 并行 | 多线程扩展性与并行效率；线程数变了结果是否还一致 |
 | 存储与索引 | 数据布局、索引的适用边界与代价 —— 点查快不快到底取决于什么 |
 | 金额精度 | 浮点求和会错到什么程度；想要精确金额该用哪种类型 |
+| 类型系统 | 两边各有哪些类型、逐一对位、Parquet 往返会变型、隐式转换规则 —— 整个项目的「总表」 |
 | 时间与时区 | naive / aware、DST、session 时区 —— 跨时区算错的几种方式 |
 | 写入与事务 | 覆盖还是追加、原子性、事务与并发读写 |
 | 文件布局 | 多文件与分区表：schema 冲突、分区裁剪、往返保真 |
@@ -70,6 +71,10 @@ uv run python src/csv_demo.py        # CSV 读写：类型推断、采样窗口�
 uv run python src/tz_demo.py         # 日期时间与时区：naive/aware、夏令时、Parquet 往返
 uv run python src/order_demo.py      # 排序稳定性：NULL 位置、并列顺序、LIMIT 取到不同的行
 uv run python src/partition_demo.py  # 多文件与分区表：glob、schema 冲突、分区裁剪
+uv run python src/type_demo.py       # 类型系统全景：类型清单、对位总表、Parquet 往返、隐式转换
+uv run python src/enum_demo.py       # ENUM / Categorical：排序、cast、未知值、物理码、往返
+uv run python src/blob_demo.py       # BLOB / 二进制：字面量陷阱、编解码、cast、长度、往返
+uv run python src/uuid_demo.py       # UUID：原生类型 vs 模拟、大小写、排序、Parquet 往返
 ```
 
 一键跑完整流程：
@@ -123,6 +128,10 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `fault_demo.py` | 容错模式与坏数据：ignore_errors / store_errors / try_cast |
 | `compress_demo.py` | 压缩与编码：默认压缩差多少、压缩矩阵、zstd 级别曲线、字典编码、行组大小 |
 | `skew_demo.py` | 数据倾斜：热点分布长什么样、GROUP BY 怕不怕、JOIN 的 build 侧悬崖 |
+| `type_demo.py` | 类型系统全景：两边各有哪些类型、逐一对位总表、Parquet 往返会变型、隐式转换规则 |
+| `enum_demo.py` | ENUM / Categorical：三种枚举的排序规则、cast、未知值、物理码与往返 |
+| `blob_demo.py` | BLOB / 二进制：字面量陷阱、四个编解码函数、VARCHAR↔BLOB cast、长度与往返 |
+| `uuid_demo.py` | UUID：原生类型 vs 自己模拟、大小写这个最大的坑、排序、parquet 往返 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -428,6 +437,28 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 132 | 超限时的失败方式 | `OutOfMemoryException`（进程内可捕获，报错里带解法，**连接还能接着用**） | **没有内存异常类**，真不够时 Rust runtime abort 整个进程 | 「跑一半被 kill」在生产环境里最难查 |
 | 133 | 线程数与内存上限 | `memory_limit` 是全局预算，但**每线程各自持有缓冲区** → 8 线程反而 OOM，4 线程能跑完 | —— | 内存不够先调 `SET threads`，不是先调大上限（DuckDB 自己的报错第一条建议就是这个） |
 | 134 | `memory_limit` 的作用域 | **连接级**，新连接完全不受影响（连文件库重开也不记得） | —— | 同一个 Python 进程 `duckdb.connect()` 两次 = 两个互不相关的世界 |
+| 135 | 类型全集 | **41** 个逻辑类型 | **30** 个具体 dtype | UUID / BIT / GEOMETRY / VARIANT / BIGNUM 两边根本没有对位 |
+| 136 | 128 位整数的 parquet 落盘 | HUGEINT → **DOUBLE**，精度在**落盘那一刻**就没了 | Int128 写出去，**DuckDB 读成 BLOB**（16 字节，值对类型不对） | 落成字符串或 `Decimal(38,0)`；两边都过不了 128 位整数 |
+| 137 | ENUM 的排序规则 | 按**物理码**（类型里声明的顺序） | `Enum` 按物理码 / **`Categorical` 按字典序** | 显式写排序规则，别靠默认 —— DuckDB ENUM ↔ Polars Enum 是一对，跟 Categorical 不是 |
+| 138 | ENUM 转整数 | **没有直接办法**（`::INTEGER` 报错，它想按字符串转） | `.cat.physical()` 直接给码 | DuckDB 侧绕 `list_position(enum_range(...), e)` |
+| 139 | 枚举里的未知值 | **报错** ConversionException | `Enum` 报错 / **`Categorical` 默默多一个类别**（还给它编新码） | Categorical 不能当约束用 |
+| 140 | 枚举的物理码 | —— | **进程内字符串缓存的序号**：跨进程会变、对象回收后从 0 重排 | 别把物理码当业务值或主键 |
+| 141 | 枚举的往返 | 写 parquet 就变 VARCHAR（`.duckdb` 文件里还在） | 自己的 parquet / Arrow IPC **保得住**（靠 Arrow 字段元数据） | 跨引擎一律掉成字符串 |
+| 142 | BLOB 字面量的 `\x` | **只吃两位**十六进制：`'\xDEADBEEF'` 是 **7 个字节** | 没有字面量语法 | 每个字节都写全：`'\xDE\xAD\xBE\xEF'` |
+| 143 | `encode` / `decode` | 是 **UTF-8** 编解码，**不是** base64 | base64 在 `.bin` 命名空间里 | 别照着别的系统（PostgreSQL / Java）的 `decode` 猜 |
+| 144 | base64 / hex 的入口 | `to_base64()` / `from_base64()`、`hex()` / `unhex()` | `.bin.encode('base64'\|'hex')` / `.bin.decode(...)` | hex **大小写相反**（DuckDB 大写、Polars 小写）；Polars 的 `.bin.decode()` 只吃 Binary 输入 |
+| 145 | VARCHAR → BLOB 的 cast | **只吃 ASCII**，还会把 `\xNN` 当转义解开 | —— | 要真字节用 `encode()`，别用 `::BLOB` |
+| 146 | BLOB → VARCHAR 的 cast | **转义**成 `\xNN`（不报错），字符数 ≠ 字节数 | **硬解**，非法 UTF-8 直接 ComputeError | 同一个坏字节，一个当错一个当数据 |
+| 147 | 二进制的长度函数 | 只有 `octet_length`（**没有** `length(BLOB)`） | `.bin.size()`（`.str.len_bytes()` 只吃 String） | 别把字节数和字符数搞混 |
+| 148 | 二进制工具函数 | BLOB 上**没有** `contains` / `substring` | `.bin.contains/get/slice` 都有 | DuckDB 侧得先 hex / base64 绕一圈 |
+| 149 | UUID 类型 | **原生**：可排序、可做主键、能生成、能提版本号 | **没有 UUID dtype** | Polars 侧只能用 String / UInt128 / Binary 模拟 |
+| 150 | UUID 的大小写 | `'550E…'` 和 `'550e…'` 认成**同一个值**（count DISTINCT = 1） | String 认成**两个**（`n_unique()` = 2） | 一进系统就统一小写 —— 或者干脆用 Binary 模拟 |
+| 151 | UUID 的生成 | 4 个函数（`gen_random_uuid` / `uuid` / `uuidv4` / `uuidv7`）+ `uuid_extract_version()` | **没有**，只能走 Python 标准库 | 批量生成靠 Python 循环，比 DuckDB 慢得多 |
+| 152 | UUID 的排序 | 按**字节**（大端十六进制） | String / Binary / UInt128 **三种模拟都跟它一致** | 前提是文本是规范小写 |
+| 153 | UUID 的 parquet 往返 | 保住（FIXED_LEN_BYTE_ARRAY + UUID 标注） | 读成 16 字节 **Binary** | DuckDB 侧补一次 `::UUID` 能救回来 |
+| 154 | UUID 转整数 | `::BIGINT` / `::HUGEINT` 都是 **Unimplemented** | UInt128 模拟**能**存下这 128 位 | 模拟方案唯一比原生强的地方（但也只是「存得下」） |
+| 155 | INTERVAL 的 parquet | 落成 FIXED_LEN_BYTE_ARRAY + Interval 标注 | **整个文件读不了**（Rust **panic**，不是 Python 异常） | 读之前先把 interval 列转成字符串或秒数 |
+| 156 | 字符串转数值失败 | 严格 `CAST` **报错**（`ConversionException`）、宽松 `TRY_CAST` 给 **NULL** | 严格 `cast` **报错**（`InvalidOperationError`）、宽松 `cast(strict=False)` 给 **None** | 行为其实**对齐**，差别只在异常类型 —— 按类型 catch 的代码要改 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -443,7 +474,9 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 100~105 条在 `嵌套类型：LIST / STRUCT / MAP`、第 106~110 条在 `查询计划：EXPLAIN 与投影裁剪`、
 第 111~115 条在 `采样与随机`、第 116~118 条在 `约束与完整性`、
 第 119~121 条在 `存在性查询与半连接`、第 122~124 条在 `递归 CTE 与迭代计算`、
-第 125~129 条在 `视图、宏与持久化对象`、第 130~134 条在 `内存上限与落盘` 里展开。
+第 125~129 条在 `视图、宏与持久化对象`、第 130~134 条在 `内存上限与落盘` 里展开；
+第 135~136 条在 `类型系统全景对照`、第 137~141 条在 `ENUM / Categorical：三种枚举，三种脾气`、
+第 142~148 条在 `BLOB / 二进制：字节、编码、base64`、第 149~156 条在 `UUID：原生类型 vs 自己模拟` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -4342,6 +4375,444 @@ macOS 没有 `/proc`，那边才退回 `ru_maxrss`）。
   真正的差别在**失败的那一侧**（场景 6）：DuckDB 给你一个带解法的异常，
   Polars 那边连一个内存异常类型都没有，进程被带走你就什么也拿不到了。
 
+## 类型系统全景对照
+
+`uv run python src/type_demo.py`。别的 demo 都在比「同一件事谁更快」，
+这个比的是更靠下的东西：**你往 DuckDB 里塞的每一个值，能不能原样落到 Polars 里**（反过来也一样）。
+
+三个层次：类型全集 → Parquet 往返会不会变型 → 隐式转换规则。
+表里的每一个类型名都是**跑出来的**（DuckDB 的清单来自 `duckdb_types()`，Polars 的来自 `pl.datatypes`，
+parquet 的物理类型和逻辑标注来自 pyarrow 读出来的 schema），不是抄文档。
+
+### 1. 两边各有哪些类型
+
+DuckDB **41** 个逻辑类型，Polars **30** 个具体 dtype。
+
+「宽度阶梯」是对得上的：
+
+```
+DuckDB  TINYINT / SMALLINT / INTEGER / BIGINT / HUGEINT
+Polars  Int8    / Int16    / Int32    / Int64    / Int128
+DuckDB  UTINYINT / USMALLINT / UINTEGER / UBIGINT / UHUGEINT
+Polars  UInt8    / UInt16    / UInt32   / UInt64   / UInt128
+```
+
+差口气的地方集中在**高级类型**：DuckDB 的 UUID / BIT / GEOMETRY / VARIANT / BIGNUM，
+Polars 一个对应物都没有（ENUM 有个近似物，但排序规则不一样，见下面那节）。
+逐一对位的总表里统计下来是：**对位 24 个，近似 6 个，没有对位 8 个**。
+
+### 2. Parquet 往返会变型
+
+同一张表，DuckDB 写成 parquet，然后两边各自读回来（「DuckDB 读回」是自问自答，
+「Polars 读回」才是互操作的真相）：
+
+| DuckDB 原类型 | parquet 物理类型 | parquet 逻辑标注 | DuckDB 读回 | Polars 读回 | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| TINYINT | INT32 | `Int(8,true)` | TINYINT | Int8 | ✅ 对位 |
+| BIGINT | INT64 | `Int(64,true)` | BIGINT | Int64 | ✅ 对位 |
+| UTINYINT | INT32 | `Int(8,false)` | UTINYINT | UInt8 | ✅ 对位 |
+| **HUGEINT** | DOUBLE | — | DOUBLE | Float64 | ❌ 断了 |
+| **UHUGEINT** | DOUBLE | — | DOUBLE | Float64 | ❌ 断了 |
+| DECIMAL(18,2) | INT64 | `Decimal(18,2)` | DECIMAL(18,2) | Decimal(18,2) | ✅ 对位 |
+| DECIMAL(38,0) | FIXED_LEN_BYTE_ARRAY | `Decimal(38,0)` | DECIMAL(38,0) | Decimal(38,0) | ✅ 对位 |
+| VARCHAR | BYTE_ARRAY | `String` | VARCHAR | String | ✅ 对位 |
+| BLOB | BYTE_ARRAY | — | BLOB | Binary | ✅ 对位 |
+| **UUID** | FIXED_LEN_BYTE_ARRAY | `UUID` | UUID | **Binary** | ❌ 断了 |
+| **ENUM** | BYTE_ARRAY | `String` | **VARCHAR** | String | ❌ 断了 |
+| **BIT** | BYTE_ARRAY | `String` | **VARCHAR** | String | ❌ 断了 |
+| DATE | INT32 | `Date` | DATE | Date | ✅ 对位 |
+| TIME | INT64 | `Time(us)` | TIME | Time | ✅ 对位 |
+| TIMESTAMP | INT64 | `Timestamp(us)` | TIMESTAMP | Datetime(us) | ✅ 对位 |
+| TIMESTAMPTZ | INT64 | `Timestamp(us,UTC)` | TIMESTAMPTZ | Datetime(us,UTC) | ✅ 对位 |
+| BOOLEAN | BOOLEAN | — | BOOLEAN | Boolean | ✅ 对位 |
+
+（demo 的输出里有完整的 24 行，这里只列有代表性的 17 个。）
+
+**Parquet 往返的主要坑不是「类型没了」，是「类型悄悄变了」。**
+
+- **HUGEINT / UHUGEINT** —— parquet 没有 128 位整数这个位置，DuckDB 只能落成 DOUBLE，
+  **精度在落盘那一刻就没了**。实测：`123456789012345678901234567890` 落盘再读回来，
+  回到整数域一算是差了 **1,023,514,970,834**。注意在浮点域里比是「相等」的
+  —— 两个值都变成同一个 double，只有回到整数域才看得出差了多少。这正是它危险的地方。
+  头朝另一头：Polars 的 Int128 写进 parquet，**DuckDB 读回来是 BLOB**（16 字节，值对、类型不对）。
+- **UUID** —— parquet 用 16 字节定长 + `UUID` 标注存，DuckDB 认得，Polars 读成**裸字节**（值能还原，类型语义没有）。
+- **ENUM** —— parquet 不存枚举定义，只存字符串，**DuckDB 自己也读不回来**。
+- **BIT** —— 位串没有 parquet 类型，退化成字符串。
+
+**INTERVAL 是硬伤**：DuckDB 的 interval parquet（FIXED_LEN_BYTE_ARRAY + `Interval` 标注）
+Polars **整个文件都读不了** —— 报的是 `PanicException`（Rust 层的 unwrap 失败），
+`except BaseException` 能接住，但这不是「读不出这一列」，是**这个文件读不了**。
+绕法：读之前先把 interval 列转成字符串或秒数。
+
+顺带一个好消息：Polars 读 DuckDB 的 parquet 时，**列名、列序、值的类型都保住了**
+（TINYINT 读回来还是 Int8，不是 Int32）—— 这靠的是 parquet 的 `Int(bitWidth=8)` 逻辑标注，不是靠猜。
+
+### 3. 隐式转换规则
+
+同一句表达式，两边给不给同一个答案：
+
+| 表达式 | DuckDB | Polars |
+| --- | --- | --- |
+| `'1' = 1`（字符串跟数字比） | True | True |
+| `'1' + 1`（字符串加数字） | ❌ BinderException | ❌ TypeError |
+| `1 \|\| 'x'`（数字拼字符串） | `1x` | `1x`（`pl.concat_str`） |
+| `CAST('123abc' AS INTEGER)`（严格） | ❌ ConversionException | ❌ InvalidOperationError |
+| `TRY_CAST('123abc' AS INTEGER)`（宽松） | None | None |
+| `true` 转成整数 | 1 | 1 |
+| `DECIMAL(18,2) + DOUBLE` | 2.23 | 2.23 |
+| `DECIMAL(18,0)` 乘 10 溢出 | ❌ OutOfRangeException | ❌ ComputeError |
+
+读法：
+
+- **比较两边一致**：`'1' = 1` 两边都给 True（都做隐式转换）。
+- **算术两边一致地拒绝**：`'1' + 1` 两边都报错 —— 这一条最重要：两边都不会给你一个「看起来对」的结果。
+- **转数值的严格程度其实是对齐的**：严格模式两边都报错，宽松模式两边都给空。
+  真正的差别只在**异常类型**（`ConversionException` vs `InvalidOperationError`）—— 按类型 catch 的代码要改。
+- **DECIMAL + DOUBLE**：两边都提升到浮点（2.23）。金额场景里这一步就把精确性丢了 —— 两边一样，但一样地危险。
+
+→ **跨引擎搬数据，Parquet 只保证「值」不保证「类型」**：能带过去的只有 parquet 的逻辑标注
+（`Int(bitWidth)` / `Decimal` / `UUID` / `Date`…），没标注的列到了对面就是猜的。
+**128 位整数、UUID、枚举这三个是最容易在迁移中静默变形的**，真要传，落成字符串或 `Decimal(38,0)` 最稳。
+
+## ENUM / Categorical：三种枚举，三种脾气
+
+`uv run python src/enum_demo.py`。三个东西长得像，脾气完全不一样：
+
+| | DuckDB `ENUM` | Polars `Enum` | Polars `Categorical` |
+| --- | --- | --- | --- |
+| 值域 | **写死在类型里** | **写死在类别表里** | **跟着数据走**，来什么收什么 |
+| 未知值 | 报错 | 报错 | **默默多一个类别** |
+| 排序 | **物理码**（声明顺序） | **物理码**（声明顺序） | **字典序** |
+| 转整数 | **没有直接办法** | `.cat.physical()` | `.cat.physical()` |
+
+### 1. 排序 —— 最大的坑
+
+数据 `['b', 'a', 'c']`，**声明顺序故意 ≠ 字典序**（只有这样才能把「按物理码排」和「按字符串排」区分开）：
+
+| 怎么排 | 结果 |
+| --- | --- |
+| DuckDB `ORDER BY e`（ENUM） | `['b', 'a', 'c']` |
+| DuckDB `ORDER BY e::VARCHAR`（按字符串） | `['a', 'b', 'c']` |
+| Polars `Enum.sort()` | `['b', 'a', 'c']` |
+| Polars `Categorical.sort()` | `['a', 'b', 'c']` |
+
+→ **DuckDB 的 ENUM 和 Polars 的 Enum 排序结果一样**（都是物理码序），
+而 **Polars 的 Categorical 跟它们都不一样**（字典序）。
+迁移的时候按「名字像的」对，掉坑里 —— DuckDB ENUM ↔ Polars Enum 是一对，
+DuckDB ENUM ↔ Polars Categorical **不是**。
+
+实践上的后果：用 ENUM 存「状态」「等级」这类**有业务顺序**的值（低 → 中 → 高），
+得**故意把声明顺序写成业务顺序**；同一批数据在 DuckDB（ENUM）和 Polars（Categorical）里排出来顺序不同，
+`LIMIT` 还会因此取到**不同的行**。
+
+### 2. cast 不对等
+
+DuckDB 的 ENUM **没法直接转成整数** —— `e::INTEGER` 报的是「Could not convert string 'b' to INT32」，
+它想按字符串转，不是按物理码转。能拿到的只有 `e::VARCHAR` 和 `enum_range(...)`，
+想要物理码得自己绕 `list_position(enum_range(...), e)`。
+Polars 侧一行 `.cat.physical()` 就给。
+
+反过来有个更实用的差别：**报错的含义不一样**。Polars 的 `cast(pl.Int32)` 直接报错并提示你用 `.cat.physical()`，
+DuckDB 的 `::INTEGER` 报的是「转不了这个字符串」—— 排查时容易看岔。
+
+### 3. 未知值：报错、报错、还是默默多一个类别
+
+往枚举里塞一个不在名单里的值（比如 `'z'`）：
+
+| | 结果 |
+| --- | --- |
+| DuckDB ENUM | ❌ ConversionException（3 行，没插进去） |
+| Polars Enum | ❌ InvalidOperationError |
+| Polars Categorical | ✅ `['a', 'z']` —— **默默收下**，给 `'z'` 编了个新物理码 **1** |
+
+Categorical 这一条最危险：值看着没丢，但**类别列表变了**。
+如果你按物理码 join（或者把码存成整数列），新类别会跟老类别对不上。
+
+### 4. 物理码是「字符串缓存里的序号」，不是字符串的身份
+
+这是最隐蔽的一层。在一个新进程里按顺序 cast（每一步都留着上一步的对象）：
+
+```
+['b','a','c'] → 码 [0, 1, 2]   （b=0, a=1, c=2）
+['b']         → 码 [0]         （'b' 已经在缓存里了，位置不变）
+['z']         → 码 [3]         （新字符串，接在缓存后面）
+['c','b','a'] → 码 [2, 0, 1]   （**不是** [0, 1, 2]！'b' 早就占着 0，'a' 占着 1）
+```
+
+同一个进程里，上一批对象被回收之后：`['b','a','c']` 拿到 `[0, 1, 2]`，
+再 cast `['z']` 拿到 `[0]` —— **从 0 重新开始**。
+
+最后看跨进程 —— 同一个 `'z'`，两个进程给两个码：
+
+```
+进程甲（只见过 z）        → [0]
+进程乙（见过 a, b, c, z） → [0, 1, 2, 3]
+```
+
+→ **物理码只在「同一个进程、同一个缓存还活着」的时候有意义。**
+跨进程、跨文件就不能直接用了 —— 把物理码存进数据库当主键，等于存了一串随机数。
+
+### 5. 往返：Polars 自己保得住，跨引擎保不住
+
+Polars 自己写的文件，自己读回来 —— **保住了**，连物理码都保住了（写出去 `[0, 1, 2]` → 读回来 `[0, 1, 2]`）：
+
+```
+parquet 读回 → Schema({'e': Enum(categories=['b', 'a', 'c']), 'c': Categorical})
+Arrow IPC 读回 → Schema({'e': Enum(categories=['b', 'a', 'c']), 'c': Categorical})
+```
+
+靠的是 Arrow 的字段元数据：`_PL_ENUM_VALUES2` / `_PL_CATEGORICAL2`。
+所以「Arrow 往返掉成普通 String」这个说法**在 Polars 2.1 上不成立** ——
+只要 Arrow 的字段元数据一起走，Enum 和 Categorical 都活得好好的。
+
+但**跨引擎就不行了**：DuckDB 读 Polars 的 parquet，类型 → `['VARCHAR', 'VARCHAR']`，
+**枚举定义整个没了**。DuckDB 自己写的 ENUM 也一样（写 parquet 时就变成 VARCHAR 了，
+读回来是 VARCHAR，连自己都不认识自己的枚举了）。
+
+DuckDB 自己的 `.duckdb` 文件里 → `ENUM('b', 'a', 'c')`（枚举定义还在）。
+
+→ **ENUM 只在 DuckDB 自己的数据库文件里保得住。** 一旦落成 parquet（或者交给别的引擎），
+它就是个普通字符串 —— 枚举的价值（值域约束 + 排序规则）全没了。
+
+## BLOB / 二进制：字节、编码、base64
+
+`uv run python src/blob_demo.py`。DuckDB 把 VARCHAR 和 BLOB 分得很开，
+Polars 侧是 `String` 和 `Binary` 两个 dtype —— 两边都叫「二进制」，但**默认行为不一样**。
+
+### 1. BLOB 字面量的 `\x` 陷阱
+
+DuckDB 的 BLOB 字面量写成 `'\xDEADBEEF'::BLOB`。直觉上它应该是 4 个字节（DE AD BE EF）。**不是。**
+
+```
+值       = b'\xdeADBEEF'
+字节数   = 7
+hex      = DE414442454546
+```
+
+**7 个字节。** 原因是 DuckDB 的转义规则：`\x` 后面只跟**两个**十六进制位。
+所以 `\xDE` 变成了 1 个字节 0xDE，剩下 `ADBEEF` 是 6 个普通 ASCII 字符
+（hex 里 `41 44 42 45 45 46` 就是 `'ADBEEF'`）。
+要 4 个字节得把每个字节都写全：`'\xDE\xAD\xBE\xEF'::BLOB` → 4 字节。
+
+→ **别拿 `hex()` 的输出长度去推字节数，反过来也一样。** 靠谱的办法是 `octet_length()`。
+
+### 2. 四个编解码函数，别搞混
+
+| 函数 | 干什么 | 结果 |
+| --- | --- | --- |
+| `encode(VARCHAR) → BLOB` | **UTF-8 编码** | `b'\xe4\xb8\xad\xe6\x96\x87'` |
+| `decode(BLOB) → VARCHAR` | **UTF-8 解码** | `中` |
+| `base64(BLOB)` / `to_base64(BLOB)` | base64 编码 | `aGVsbG8=` |
+| `from_base64(VARCHAR)` | base64 解码 | `b'hello'` |
+| `hex(BLOB)` | 十六进制（**大写**） | `00FF` |
+| `unhex(VARCHAR)` / `from_hex(VARCHAR)` | 十六进制解码 | `b'\x00\xff'` |
+
+**最大的坑：`encode` / `decode` 在 DuckDB 里是 UTF-8 编解码，不是 base64。**
+别的系统（Python 的 `base64.b64decode`、Java 的 `Base64`、PostgreSQL 的 `decode(x, 'base64)`）
+里 `decode` 经常指 base64 解码 —— 在 DuckDB 里 `decode('aGVsbG8=')` 返回的是**原样的字符串** `'aGVsbG8='`，
+要 base64 解码得用 `from_base64()`。
+
+Polars 的 base64 在 **`.bin` 命名空间**里（不在 `.str` 里），两点要注意：
+
+```python
+pl.Series([b"abc", b"\x00\xff"]).bin.encode("base64")   # ['YWJj', 'AP8=']
+pl.Series([b"abc", b"\x00\xff"]).bin.encode("hex")       # ['616263', '00ff']
+pl.Series(["aGVsbG8="]).cast(pl.Binary).bin.decode("base64")   # [b'hello']  ← 必须先 cast
+```
+
+1. **`.bin.decode()` 只吃 Binary 输入** —— base64 文本得先 cast 成 Binary，直接调会报 `SchemaError`。
+2. **hex 大小写相反**：Polars 给**小写**，DuckDB 给**大写**（`00ff` vs `00FF`）。
+
+base64 的**内容**两边倒是一致的（`AP8=`，跟 Python 标准库也对得上）。
+另外 base64 里的 `=` 补位符在 URL 里要换成 `%3D` —— 两边都没有内置的 URL-safe base64。
+
+### 3. VARCHAR ↔ BLOB 的 cast 是**另一套语义**
+
+DuckDB 里 **cast 和 encode/decode 是两条不同的通道**。cast 那条通道实测下来是：
+**只吃 ASCII，而且把 `\xNN` 当转义解开**。
+
+| 表达式 | 结果 |
+| --- | --- |
+| `'abc'::VARCHAR::BLOB` | `b'abc'` |
+| `'\x41'::VARCHAR::BLOB` | `b'A'`（**1 个字节**，不是 4 个字符 `\x41`） |
+| `'中文'::VARCHAR::BLOB` | ❌ ConversionException（Invalid byte encountered） |
+| `'a\nb'::VARCHAR::BLOB` | ❌ ConversionException（Invalid hex escape code） |
+| `'\xFF'::BLOB::VARCHAR` | `\xFF`（**4 个字符**） |
+| `'\xE4\xB8\xAD'::BLOB::VARCHAR` | `\xE4\xB8\xAD`（转义，不是 UTF-8 解码） |
+
+所以 `length(blob::VARCHAR)` **不等于** `octet_length(blob)`：
+`length('\xFF'::BLOB::VARCHAR)` = **4**，`octet_length('\xFF'::BLOB)` = **1**。
+真要 UTF-8 解码，用 `decode(blob)`。
+
+**Polars 这边完全不一样：Binary → String 是硬解，非法 UTF-8 直接报错。**
+
+```
+Binary([b'abc', b'\x00\xff']).cast(pl.String)               → ❌ ComputeError: invalid utf8
+Binary([b'abc', b'\x00\xff']).cast(pl.String, strict=False) → ❌ ComputeError: invalid utf8
+```
+
+`strict=False` 也救不了。DuckDB 那边同样的字节是**转义**成 `'\x00\xff'`、不报错 ——
+**同一个坏字节，一边当错误处理，一边当数据处理**，迁过去很容易对不上。
+Polars 侧真要转，得自己写 `b.decode('utf-8', errors='replace')`。
+
+### 4. 长度、比较、排序：量的不是同一件事
+
+- **长度**：DuckDB **没有** `length(BLOB)`，只有 `octet_length(BLOB)`（字节数）；
+  `length()` 是字符数（`length('中文')` = 2）。
+  Polars 那边 `.str.len_bytes()` 只吃 String，Binary 得用 `.bin.size()`。
+- **比较**：BLOB 按**字节**比，VARCHAR 按字符比。
+  注意 `'\xFF'::BLOB = '\xFF'` 是 **True** —— VARCHAR 那边的 `\xFF` 是 4 个字符，
+  转成 BLOB 时又被解成 1 个字节 0xFF。这条链路一路都在解转义，别当成「取字节」。
+- **排序**：两边都是**字节序**，这一条是对齐的
+  （`ORDER BY` → `[b'\x01', b'A', b'B']`，Polars `.sort()` → 同）。
+- **工具函数覆盖范围不一样**：DuckDB 的 BLOB 上**没有** `contains` / `substring`
+  （都得 `BinderException`），得先 `to_base64()` 或 `hex()` 落到 VARCHAR 上再处理；
+  Polars 的 `.bin` 命名空间里 `size` / `contains` / `get` / `slice` 全都有。
+  → **二进制处理的活写在 Polars 侧更顺**，DuckDB 那边得自己绕一圈。
+
+### 5. 往返：两边都保得住二进制
+
+**二进制这一环是整个 demo 里对齐得最好的** —— 值和类型语义都保得住，只有类型名不一样。
+
+DuckDB 写的 BLOB 列，Polars 读回来是 `Binary`（值对，类型名不一样）。
+parquet 的物理类型值得看一眼：
+
+```
+列 b: physical=BYTE_ARRAY, logical=None
+列 s: physical=BYTE_ARRAY, logical=String
+```
+
+**VARCHAR 和 BLOB 在 parquet 里是同一个物理类型（BYTE_ARRAY）**，区别只在 logical annotation 上：
+VARCHAR 带 `String`，BLOB **什么都不带**。DuckDB 读回来靠这个 annotation 还原成 BLOB 还是 VARCHAR；
+别的引擎（比如 Polars）不看 annotation —— 它一律读成 `Binary`。
+
+## UUID：原生类型 vs 自己模拟
+
+`uv run python src/uuid_demo.py`。DuckDB 有**原生 UUID 类型**，Polars **没有 UUID dtype**
+（30 个 dtype 里一个都没有）。
+
+### 1. DuckDB 侧：原生类型
+
+```
+typeof(gen_random_uuid()) = UUID
+```
+
+**四个生成函数**（实测都存在）：`gen_random_uuid()` / `uuid()` / `uuidv4()`（版本 4）
+和 `uuidv7()`（版本 7）。`uuid_extract_version()` 能把版本号抠出来 ——
+这是**类型层面**的信息，字符串模拟（Polars 侧）得自己解析文本。
+
+宽度固定 **16 字节**（转成 VARCHAR 是 36 个字符）。排序可用，按**字节**（大端十六进制）排。
+当主键也行 —— 插重复的会被 `ConstraintException` 挡下来。
+
+### 2. Polars 侧：三种模拟方式
+
+| 模拟方式 | 存什么 | 代价 |
+| --- | --- | --- |
+| String | 36 字符文本 | 能直接看、直接 join；但占内存，而且**大小写敏感** |
+| UInt128 | 128 位整数 | 排序跟字节序一致；但转回文本只剩十进制数，横杠得自己拼 |
+| Binary | 16 字节原始字节 | 最省内存、排序也对；但没法直接看 |
+
+实测内存（1,000 行，`DataFrame.estimated_size()`）：
+
+| 形态 | 字节数 | 每行 |
+| --- | --- | --- |
+| String | 36,000 | **36.0 字节/行** |
+| Binary | 16,000 | 16.0 字节/行 |
+| UInt128 | 16,000 | 16.0 字节/行 |
+
+→ **String 是 Binary 的 2.25 倍** —— UUID 列多的时候差别很显眼。
+
+UInt128 还有一个代价：**转回去就不是 UUID 了** ——
+`UInt128.cast(pl.String)` → `113059749145936325402354257176981405696`（十进制数，横杠没了）。
+
+Polars **没有生成 UUID 的函数**（`dir(pl)` 里带 uuid 的：`[]`），只能走 Python 标准库；
+要批量的话得自己写 `pl.Series([str(uuid.uuid4()) for _ in range(n)])` —— Python 循环，比 DuckDB 慢得多。
+
+### 3. 最大的坑：大小写
+
+同一个 UUID，两种写法：
+
+```
+550e8400-e29b-41d4-a716-446655440000
+550E8400-E29B-41D4-A716-446655440000
+```
+
+**DuckDB 的 UUID 类型把它们认成同一个值**（`::UUID = ::UUID` → True），
+但 DuckDB 的 `::VARCHAR` **保留输入时的大小写**（值是同一个，文本长得不一样）。
+
+于是有了这个差别：
+
+| | 结果 |
+| --- | --- |
+| DuckDB `count(DISTINCT x::UUID)` | **1** |
+| DuckDB `count(DISTINCT x::VARCHAR)` | **2** |
+| Polars String 的 `n_unique()` | **2** |
+
+→ **同一个 UUID，Polars 侧算成两条记录。** 后果不是「多了一行」这么轻：
+
+- `unique()` / `distinct()` 去不掉重 —— 主键列会出现重复值。
+- `group_by(uuid)` 会拆成两个组，每组一半。
+- `join` 会**多出一行**（一对多），行数对不上。
+
+**规矩：UUID 一进系统就统一成小写。** DuckDB 那边靠 UUID 类型兜着（大小写两种写法都认），
+Polars 那边得自己 `str.to_lowercase()` —— 或者干脆用 **Binary 模拟**，16 个字节没有大小写这回事。
+
+### 4. 排序：一致，但只有 v7 有时间序
+
+同一批 1000 个 UUID，四种排法**完全一致**（DuckDB UUID 序 == Polars String / Binary / UInt128 序）——
+排序这件事不是问题（前提是 UUID 文本是规范的小写）。
+
+`uuidv7()` 的前 48 位是**毫秒时间戳**，所以按 UUID 排 ≈ 按创建时间排。实测：
+
+```
+连着生成 300 个 uuidv7，全落在同一个毫秒里  →  这个毫秒内排序 == 生成顺序？ False（同毫秒内是随机的）
+每个之间 sleep 3 ms                            →  生成顺序 == 排序结果？ True
+```
+
+（这两行跟机器速度有关 —— 机器一慢，300 个 uuidv7 就跨到好几个毫秒去了。
+demo 每次都现场打印这两个 True/False，上面是本机这次的结果。）
+
+→ `uuidv4()` 是随机的 —— 按它排序跟时间无关，B+ 树索引会一直裂；
+`uuidv7()` 前缀带时间 —— 索引不裂。**主键用 UUID 的话优先选 v7。**
+
+### 5. 往返：路径是通的
+
+```
+DuckDB 写 parquet → 列 id: physical=FIXED_LEN_BYTE_ARRAY, logical=UUID
+                    Polars 的 dtype → Binary（16 字节，值是大端原字节）
+Polars 写 parquet → DuckDB 的类型 → BLOB（没有 UUID 的 logical annotation）
+                    但 SELECT id::UUID FROM read_parquet(...) → 550e8400-e29b-41d4-a716-446655440000
+```
+
+→ **迁移的路径是通的**：Polars 侧存 `Binary(16)` → parquet → DuckDB 读成 BLOB → 补一次 `::UUID`。
+反过来 DuckDB 写 UUID → Polars 拿 Binary(16)，要变回文本得自己拼横杠
+（16 个字节不是合法的 UTF-8，`b.decode('utf-8')` 直接报错 —— 只能走 hex 这一条路）。
+
+### 6. cast 和约束
+
+| 表达式 | 结果 |
+| --- | --- |
+| `uuid::VARCHAR` | `550e8400-e29b-41d4-a716-446655440000` |
+| `uuid::BLOB` | `b'U\x0e\x84\x00\xe2\x9bA\xd4\xa7\x16DfUD\x00\x00'` |
+| `varchar::UUID` | `550e8400-e29b-41d4-a716-446655440000` |
+| `uuid::BIGINT` / `uuid::HUGEINT` | ❌ ConversionException（**Unimplemented type for cast**） |
+
+**UUID 转不了整数** —— 128 位塞不进 64 位。
+（Polars 那边用 UInt128 模拟的话**能**存下这 128 位 —— 这是模拟方案唯一比原生的强的地方，
+但也只是「存得下」，别指望它有 UUID 那种类型约束。）
+
+约束方面：UUID 主键插重复 → `ConstraintException`；Polars 那边**没有主键约束**，
+唯一性得自己保证（`is_duplicated()` 查一遍）。
+
+### 7. 落地建议
+
+| 场景 | 选谁 | 理由 |
+| --- | --- | --- |
+| DuckDB 内部的主键 | UUID 类型 + `uuidv7()` | 有类型约束、能排序、索引不裂（v7） |
+| Polars 侧存 ID 列 | **Binary(16)** | 最省内存，排序跟 DuckDB 一致，没有大小写问题 |
+| 要给人和别的系统看 | String（**小写**） | 能直接读；必须统一小写，否则同一个 UUID 算两个 |
+| 要能跟 DuckDB 对账 | 两边都存小写文本 | DuckDB 侧 `::UUID` 贴回去，Polars 侧 `str.lower()` |
+
 ## 目录结构
 
 ```
@@ -4415,6 +4886,10 @@ duckdb-polars-demo/
 │   ├── fault_demo.py       # 容错模式与坏数据：ignore_errors / store_errors
 │   ├── compress_demo.py    # 压缩与编码：压缩矩阵 / zstd 级别 / 字典 / 行组大小
 │   ├── skew_demo.py        # 数据倾斜：热点分布 / GROUP BY / JOIN 的 build 侧悬崖
+│   ├── type_demo.py        # 类型系统全景：类型清单 / 对位总表 / Parquet 往返 / 隐式转换
+│   ├── enum_demo.py        # ENUM / Categorical：排序 / cast / 未知值 / 物理码 / 往返
+│   ├── blob_demo.py        # BLOB / 二进制：字面量 / 编解码 / cast / 长度 / 往返
+│   ├── uuid_demo.py        # UUID：原生类型 vs 模拟 / 大小写 / 排序 / 往返
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
@@ -4480,3 +4955,10 @@ duckdb-polars-demo/
 - Polars `sample`：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.sample.html>
 - Polars `List` 命名空间：<https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.list.html>
 - Polars `join`（semi / anti）：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.join.html>
+- DuckDB 数据类型总表：<https://duckdb.org/docs/stable/sql/data_types/overview>
+- DuckDB UUID：<https://duckdb.org/docs/stable/sql/data_types/uuid>
+- DuckDB ENUM：<https://duckdb.org/docs/stable/sql/data_types/enum>
+- DuckDB BLOB / 编码函数：<https://duckdb.org/docs/stable/sql/functions/encoding>
+- Polars `Enum` / `Categorical`：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.cast.html>
+- Polars `bin` 命名空间：<https://docs.pola.rs/api/python/stable/reference/series/api/polars.Series.bin.html>
+- Parquet 逻辑类型标注：<https://github.com/apache/parquet-format/blob/master/LogicalTypes.md>

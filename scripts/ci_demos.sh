@@ -118,6 +118,10 @@ DEMOS=(
   "fault_demo|--rows $ROWS --repeat $REPEAT"
   "compress_demo|--rows $ROWS --repeat $REPEAT"
   "skew_demo|--rows $ROWS --repeat $REPEAT"
+  "type_demo|"
+  "enum_demo|"
+  "blob_demo|"
+  "uuid_demo|"
 )
 
 # 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。
