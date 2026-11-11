@@ -11,6 +11,9 @@ data/
 *.parquet
 *.csv
 
+# CI 跑 demo 的输出（本地复现 CI 时也会生成）
+ci-out/
+
 # 工具缓存
 .uv/
 .mypy_cache/

@@ -1,5 +1,7 @@
 # duckdb-polars-demo
 
+[![CI](https://github.com/dyrnq/duckdb-polars-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/dyrnq/duckdb-polars-demo/actions/workflows/ci.yml)
+
 用同一份数据，对比 **DuckDB** 与 **Polars** 两种分析引擎在 Python 侧的用法、语义差异与运行性能。
 
 每条查询都有两份实现（DuckDB/SQL 与 Polars/DataFrame），**基准测试除了计时，还会逐值校验两个引擎的输出是否等价** —— 只比快慢而不对账是没有意义的。
@@ -173,6 +175,27 @@ uv run python src/sql.py --source parquet "SELECT * FROM users LIMIT 5"
 > **别直接用 `duckdb data/demo.duckdb`**：DuckDB 2.x 写出的存储格式是 v999，而系统里装的
 > duckdb CLI（1.5.3）只认 v64~v68，会报 `Trying to read a database file with version number 999`。
 > 用 `src/sql.py` 走 Python 侧的 DuckDB，版本和项目里其他地方一致，不会有这个问题。
+
+## CI
+
+`.github/workflows/ci.yml` 在 **Linux 和 macOS 两个平台**上跑同一套流程（matrix 分开，`fail-fast: false`）：
+
+1. **装环境**：`astral-sh/setup-uv` 按 `.python-version` 装 Python 3.13，`uv sync --locked` 按 `uv.lock` 装依赖 —— 锁文件跟 `pyproject.toml` 对不上就直接失败，不让它悄悄漂。
+2. **lint**：`ruff format --check` + `ruff check`（跟本仓库的要求一致）。
+3. **跑全部 demo**：`scripts/ci_demos.sh` 把 `src/` 下每个 demo 都跑一遍，任何一个非零退出码就判失败。
+4. **存档**：每个 demo 的完整输出（`.out`，含性能表和逐值对账的结论）连同汇总表 `SUMMARY.md` 上传成 artifact，保留 14 天；汇总表同时贴到 CI 页面，不用下载 artifact 就看得到哪个 demo 挂了。
+
+CI 里的规模是**特意调小**的（`--rows 200000 --repeat 3`）—— CI 要的是「跑通 + 存档」，不是测性能。想看真实数字在本地跑 `scripts/bench.sh 1000000 5`。
+
+本地可以原样复现 CI 跑的每一行：
+
+```bash
+bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
+```
+
+`ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
+
+两个平台各存各的 artifact（`demo-output-ubuntu-latest` / `demo-output-macos-latest`），别混着看 —— macOS 上没有 `/proc`，机器状态的读法不一样（`os.getloadavg()` / `ru_maxrss` / `os.sysconf`），报出来的负载数字跟 Linux 本来就不可比。
 
 ## 数据模型
 
@@ -4054,6 +4077,9 @@ duckdb-polars-demo/
 ├── README.md
 ├── pyproject.toml          # uv 项目定义与依赖
 ├── .python-version         # 锁定 Python 3.13
+├── .github/
+│   └── workflows/
+│       └── ci.yml          # CI：Linux + macOS matrix，跑全部 demo 并把输出存成 artifact
 ├── data/                   # 生成的数据（.gitignore 排除，用脚本重新生成）
 │   ├── orders.parquet
 │   ├── users.parquet
@@ -4116,7 +4142,8 @@ duckdb-polars-demo/
 │   ├── fault_demo.py       # 容错模式与坏数据：ignore_errors / store_errors
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
-    └── bench.sh            # 一键跑完整流程
+    ├── bench.sh            # 一键跑完整流程
+    └── ci_demos.sh         # CI 用的批量跑法：跑全部 demo，出汇总表
 ```
 
 ## 设计约定

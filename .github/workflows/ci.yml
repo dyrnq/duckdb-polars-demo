@@ -1,0 +1,107 @@
+# CI：装环境 → lint → 跑全部 demo → 把 demo 的输出存成 artifact。
+#
+# Linux 和 macOS 走同一套流程，用 matrix 分开跑。
+# 两个平台都能跑是 README 里写着的承诺（「Linux / macOS」），
+# 而 macOS 那边的三处平台差异（没有 /proc、ru_maxrss 单位是字节）
+# 已经在代码里处理掉了 —— 这个 job 的作用就是别让它们悄悄坏掉。
+#
+# macOS 那边没有 /proc，机器状态的读法不一样（os.getloadavg() /
+# ru_maxrss / os.sysconf），所以它报出来的负载数字跟 Linux 本来就不可比；
+# 两个平台各存各的 artifact，别把它们混在一起看。
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI 里把规模调小：这里要的是「跑通 + 存档」，不是测性能。
+  # 想看真实数字在本地跑：scripts/bench.sh 1000000 5
+  CI_ROWS: "200000"
+  CI_REPEAT: "3"
+
+jobs:
+  # === lint：格式 + 静态检查 ===
+  lint:
+    name: lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      # 一个平台挂了不要取消另一个 —— 两边的信号都要看得见
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # .python-version 已经锁了 3.13，直接读它，别在两处各写一个版本号
+          python-version-file: ".python-version"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install deps
+        run: uv sync --locked
+
+      - name: ruff format --check
+        run: uv run ruff format --check src/ scripts/
+      - name: ruff check
+        run: uv run ruff check src/ scripts/
+
+  # === demos：把所有 demo 跑一遍 ===
+  #
+  # 跟 lint 是两个独立 job，不加 needs —— lint 挂了不该挡住 demo 的输出存档，
+  # 两条信号要能同时看到。
+  demos:
+    name: demos (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # 全部 demo 本地跑完约 80 秒；给 30 分钟富余量，
+    # 免得某个 demo 卡死把 runner 占满六小时
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version-file: ".python-version"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install deps
+        run: uv sync --locked
+
+      - name: Run all demos
+        run: bash scripts/ci_demos.sh "$CI_ROWS" "$CI_REPEAT" ci-out
+
+      # 汇总表贴到 CI 页面里，不用下载 artifact 就能看到哪个 demo 挂了
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f ci-out/SUMMARY.md ]; then
+            cat ci-out/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # 每次 CI 的结果都留在 artifact 里：每个 demo 一个 .out（完整输出，
+      # 含性能表和逐值对账的结论），外加 SUMMARY.md。
+      # if: always() —— demo 挂了也要把已经跑出来的输出留下来。
+      - name: Upload demo outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-output-${{ matrix.os }}
+          path: ci-out/
+          retention-days: 14
+          if-no-files-found: warn
