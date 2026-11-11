@@ -72,7 +72,7 @@ jobs:
   demos:
     name: demos (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # 全部 demo 本地跑完约 150~170 秒（49 个，compress_demo 一个就占 43 秒 ——
+    # 全部 demo 本地跑完约 150~180 秒（51 个，compress_demo 一个就占 43 秒 ——
     # 它要写 zstd 的各个级别，L19 一次就十秒；quantifier_demo 占 34~37 秒 ——
     # 它的代价场景要做 20 万 × 1 千的范围连接）；给 30 分钟富余量，
     # 免得某个 demo 卡死把 runner 占满六小时

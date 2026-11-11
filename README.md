@@ -23,7 +23,8 @@
 | 性能 | 相同数据规模下的耗时对比；结果等价性校验 |
 | 语义覆盖面 | 窗口 / 聚合 / 集合运算 / 正则 / 增删改 / Schema / 时间轴 / 近似计算 —— 每个都有一份实测对账 |
 | 形状与能力 | 多维聚合 / 透视重塑 / 嵌套类型 / 查询计划 / 采样 / 约束 / DDL / 内存 —— 引擎能做什么、不能做什么 |
-| 边界与容错 | 算术边界 / 存在性查询 / 递归计算 / 坏数据 —— 出错时是「炸掉」还是「安静地算错」 |
+| 边界与容错 | 算术边界 / 值域上界 / 存在性查询 / 递归计算 / 坏数据 —— 出错时是「炸掉」还是「安静地算错」 |
+| 排序规则 | 默认码点序 vs ICU 排序规则：中文按拼音还是按码点、大小写和重音怎么折叠 |
 
 ## 环境要求
 
@@ -78,6 +79,8 @@ uv run python src/uuid_demo.py       # UUID：原生类型 vs 模拟、大小写
 uv run python src/quantifier_demo.py # 量词 ANY/ALL、相关标量子查询、LATERAL、UNNEST
 uv run python src/sql_sugar_demo.py  # SQL 语法糖逐条对账：GROUP BY ALL / EXCLUDE / FILTER …
 uv run python src/fts_demo.py        # 全文本搜索：DuckDB 有 fts 扩展，Polars 只能硬扫
+uv run python src/bounds_demo.py     # 时间戳与日期的边界：能表示到哪一年，越界时谁报错
+uv run python src/collation_demo.py  # 排序规则与中文排序：DuckDB 有 COLLATE，Polars 没有
 ```
 
 一键跑完整流程：
@@ -138,6 +141,8 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `quantifier_demo.py` | 量词 ANY/ALL、相关标量子查询（优化器改写成 delim join）、LATERAL、UNNEST vs explode |
 | `sql_sugar_demo.py` | SQL 语法糖逐条对账：GROUP BY ALL / ORDER BY ALL / EXCLUDE / REPLACE / FILTER / IS DISTINCT FROM / NULLS FIRST |
 | `fts_demo.py` | 全文本搜索：DuckDB 的 fts 扩展（倒排索引 + BM25）vs Polars 只能硬扫 |
+| `bounds_demo.py` | 时间戳与日期的边界：各类型能表示到哪一年、越界时谁报错、Python 端的静默降级 |
+| `collation_demo.py` | 排序规则与中文排序：COLLATE 改的是比较语义、144 个 ICU 规则、Polars 没有 COLLATE |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -217,7 +222,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，49 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，51 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -265,6 +270,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | `write_demo/` | 每次运行产出（目录**不清空**，旧文件会越攒越多） | 各种写入产物 | 写入路径与事务（覆盖/原子替换/压缩） |
 | `csv_demo/` | 每次运行覆盖同名文件 | 各种 CSV 样本（含坏行、超采样窗口的值） | CSV 读写与往返保真 |
 | `tz_demo/` | 每次运行覆盖同名文件 | `duckdb_ts.parquet`、`polars_ts.parquet`（两边各写一份时间戳） | 日期时间与时区（Parquet 往返） |
+| `bounds_demo/` | 每次运行覆盖同名文件 | `extreme.parquet`（上界值）、`normal.parquet`（对照组） | 时间戳与日期的边界（Parquet 往返） |
 | `compress_demo/` | 每次运行覆盖同名文件 | 压缩矩阵 / zstd 各级别 / 各种行组大小的 parquet | 压缩与编码（压缩参数、行组大小） |
 
 `index_customers_*` 的文件名里带行数：换个 `--rows` 就是另一份文件，**永远不覆盖已有数据**。
@@ -483,6 +489,25 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 169 | `ORDER BY ALL` / `NULLS FIRST` | 升序、降序默认都是 **NULLS LAST** | 升序、降序默认都是 **NULLS FIRST**；`sort()` **只有** `nulls_last` 一个开关 | Polars 侧写 `nulls_last=True`；要按列分别设 NULL 位置，只能在 SQL 侧排好 |
 | 170 | 全文本搜索 | 有 `fts` 扩展：倒排索引 + **BM25 打分** + 排序 | **一个相关 API 都没有**（字符串命名空间 47 个方法，0 个相关） | Polars 侧只能 `str.contains` 硬扫，或者自己造倒排表 —— 这条**没有对齐办法**，只能靠约定避开 |
 | 171 | `str.contains` 的语义 | —— | 默认**大小写敏感**，参数是**正则**不是字面量 | 先 `to_lowercase()`；要字面匹配加 `literal=True`；`contains_any` 反过来是字面匹配且没有 `literal` 参数 |
+| 172 | `TIMESTAMP` 的上界 | int64 **微秒** → **294247-01-10 04:00:54.775806** | `Datetime('us')` 同一个量级 | 「2262-04-11 溢出」说的是 **ns**，不是 `TIMESTAMP`（µs） |
+| 173 | 「2262」属于哪个类型 | `TIMESTAMP_NS` → **2262-04-11 23:47:16.854775806** | `Datetime('ns')` → **2262-04-11 23:47:16.854775**（转 Python 只到微秒） | 差的是一个**单位**，不是「几年」 |
+| 174 | `DATE` 的上界 | int32 天 → **5881580-07-10** | `Date` ← int32 最大值 → out-of-range date | 上界 = 整型最大值**减一**（那一格留给了 infinity / NaT） |
+| 175 | 越界时的异常类型 | `ConversionException`（`Exception` 子类，`except Exception` **接得住**） | `PanicException` —— 继承的是 **`BaseException`**，`except Exception` **接不住** | Polars 侧要兜底只能写 `except BaseException` |
+| 176 | 越界在哪一步炸 | 写进去就报错 | `cast` **成功**，Series 一直好着，炸在**转 Python 对象**那一步（`to_list()` / `print(df)`） | cast 过了不代表安全 —— 数据一直躺在那儿，直到有人看一眼 |
+| 177 | 越界值取回 Python | **静默降级成 `str`**（按列，整列都变 `str`） | panic | DuckDB 这边是「不报错但类型变了」，后面的 `.dt.year` 全 AttributeError |
+| 178 | 同一件事走 Arrow | `to_pylist()` 抛 **`OverflowError`** | panic | 两条通道两种行为：Python 驱动降级，Arrow 通道报错 |
+| 179 | 纳秒的可见性 | `::TIMESTAMP` 是**引擎里四舍五入**（.123456789 → .123457），纳秒真丢了 | `Datetime('ns')` 转 Python 是**截断**，**内部 int64 纳秒还在**（`cast(pl.Int64)` 取回 …789） | 拿 ns 当 key 两边都得自己算：DuckDB 用 `epoch_ns()`，Polars 用 `cast(pl.Int64)` |
+| 180 | naive 的纪元换算 | 按 **UTC** 算 epoch | 按 **UTC** 算 epoch | ✅ **两边一致**，不用操心（真正会分叉的是「naive 存、aware 读」的混用） |
+| 181 | 运算溢出 | `上界 + 1 微秒` → `Conversion Error: Date and time not in timestamp range` | —— | 越界不只发生在写入，发生在**算**的时候 |
+| 182 | `make_date()` 越界 | **静默给 9999-12-31**（不报错） | —— | 这类「不报错但给别的值」的函数最危险 |
+| 183 | 默认字符串排序 | **UTF-8 字节序** | **Unicode 码点序** | ✅ **逐行一致**（UTF-8 是保序编码），这条不用操心 |
+| 184 | 中文排序 | 默认**码点**（「上海」在「北京」前面）；`COLLATE "zh_cn"` 排**拼音**，`zh_tw` 排**笔画** | **只有码点**，连 `COLLATE` 这个概念都没有 | 要拼音就得让 DuckDB 出排序键（`icu_sort_key`） |
+| 185 | 排序规则的数量 | **144 个 ICU 规则**（ICU 静态链接，不用装）+ `NOCASE` / `NOACCENT` | **零个**（`Expr.sort` / `DataFrame.sort` 的参数里没有任何 collation / locale） | locale 选错**不报错**，只是给你错的顺序 |
+| 186 | `COLLATE` 的作用域 | 改的是**比较语义**，不只是顺序：`=`、`DISTINCT`、`GROUP BY` 全跟着变（apple/Apple/APPLE 合并成一个值） | —— | 想大小写不敏感的唯一键，DuckDB 侧写 `s COLLATE NOCASE = 'apple'` |
+| 187 | `GROUP BY s COLLATE NOCASE` | **Binder Error**（写不出来：分组键变了，于是抱怨「s 必须出现在 GROUP BY 里」） | —— | 改用 `GROUP BY lower(s)`，或者用列级 COLLATE |
+| 188 | 列级 COLLATE | `VARCHAR COLLATE NOCASE` —— **整列**的比较语义变掉，连 JOIN 的连接结果都不一样（3 vs 1） | **没有这个概念** | 这是「不报错但结果不一样」的典型 |
+| 189 | Polars 侧的出路 | —— | `icu_sort_key()` 拿到的键能**一字不差**复现 ICU locale 的顺序；但喂 `NOCASE` / `NOACCENT` 给它**不报错**，只是**静默回退到 root 键**，排出来的顺序跟 `COLLATE NOCASE` 对不上 | 有效范围只有 ICU 的 locale，且要求旁边有个 DuckDB |
+| 190 | `lower()` 的 Unicode 细节 | `İ` → **1 个码点**的 `'i'` | `İ` → **2 个码点**的 `'i' + U+0307` —— **长度都不一样**（`length(lower('İSTANBUL'))`：8 vs 9） | 拿 `lower(x)` 当去重键，两边的去重结果不同 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -502,7 +527,8 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 135~136 条在 `类型系统全景对照`、第 137~141 条在 `ENUM / Categorical：三种枚举，三种脾气`、
 第 142~148 条在 `BLOB / 二进制：字节、编码、base64`、第 149~156 条在 `UUID：原生类型 vs 自己模拟` 里展开；
 第 157~159 条在 `量词与相关子查询：SQL 的一等公民`、第 160~164 条在 `同一节的相关子查询 / LATERAL / UNNEST`、
-第 165~169 条在 `SQL 语法糖对照：八条糖逐条对账`、第 170~171 条在 `全文本搜索：DuckDB 有扩展，Polars 没有` 里展开。
+第 165~169 条在 `SQL 语法糖对照：八条糖逐条对账`、第 170~171 条在 `全文本搜索：DuckDB 有扩展，Polars 没有`、
+第 172~182 条在 `时间戳与日期的边界`、第 183~190 条在 `排序规则与中文排序` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -5397,6 +5423,305 @@ uv run python src/fts_demo.py --extension --rows 20000
 > 这不是纯粹的引擎速度对比，是「能力差 + 代价差」的总账。
 > 建索引的时间**不计入**查询耗时（它是一次性成本，脚本里单独打）。
 
+## 时间戳与日期的边界：能表示到哪一年，越界时谁报错
+
+`uv run python src/bounds_demo.py`
+
+`tz_demo.py` 讲的是**精度和时区** —— 值算出来对不对。这个 demo 讲的是**边界** —— 值大到某个程度之后会发生什么。
+
+边界问题的麻烦在于：**它平时不出事，出事的时候已经晚了。**
+
+### 1. 各类型能表示到哪一年
+
+DuckDB 2.0 的时间类型全是**整数计数**，不是日历：`TIMESTAMP` 数微秒、`TIMESTAMP_MS` 数毫秒、`TIMESTAMP_S` 数秒、`TIMESTAMP_NS` 数纳秒，`DATE` 数天。计数用 int64（`DATE` 用 int32），所以上界就是「整型能数到哪」。
+
+| DuckDB 类型 | 内部计数 | 能存进去的最后一个值 | 再走一步 |
+| --- | --- | --- | --- |
+| `TIMESTAMP` | int64 微秒 | 294247-01-10 04:00:54.775806 | `ConversionException` |
+| `TIMESTAMP_MS` | int64 毫秒 | 294247-01-10 04:00:54.775 | `ConversionException` |
+| `TIMESTAMP_S` | int64 秒 | 294247-01-10 04:00:54 | `ConversionException` |
+| `TIMESTAMP_NS` | int64 纳秒 | **2262-04-11 23:47:16.854775806** | `ConversionException` |
+| `DATE` | int32 天 | 5881580-07-10 | `ConversionException` |
+
+脚本**每次运行都把这张表现场验一遍**：左边那个值必须能写进去，右边那个值（多走一个单位）必须报错。哪天 DuckDB 换了实现，这里会打印 ❌，而不是继续拿一张过期的表糊弄人。
+
+上界就是「整型最大值**减一**」—— 那一格留给了 infinity / NaT：
+
+```
+epoch_us(TIMESTAMP 上界)       = 9223372036854775806   (微秒)
+epoch_ns(TIMESTAMP_NS 上界)    = 9223372036854775806   (纳秒)
+date_diff(TIMESTAMP DATE 上界) = 2147483646            (天)
+```
+
+### 2. 「2262-04-11 溢出」说的是哪个类型
+
+**不是 `TIMESTAMP`，是 `TIMESTAMP_NS`。**
+
+「2262 年 4 月 11 日」是 **int64 纳秒**的上界。DuckDB 的 `TIMESTAMP` 是微秒，能一路数到 **294247 年** —— 两者差了几十万年，差的不是「年」，是**一个单位**。
+
+Polars 侧：`Datetime('ns')` 的上界是 **2262-04-11 23:47:16.854775**，而不是 `23:59:59.999999999` —— 因为转成 Python 对象时 Python 的 `datetime` 只到微秒。
+
+所以「2262 溢出」这个说法**只在 ns 这一档成立**：两边的 `TIMESTAMP` / `Datetime('us')` 都远够不着 2262。
+
+### 3. 越界时谁报错 —— 这条比边界本身更要命
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 异常 | `ConversionException` | **`PanicException`** |
+| 继承链 | `ConversionException < Exception < BaseException` | `PanicException < **BaseException** < object` |
+| `isinstance(e, Exception)` | `True` | **`False`** |
+| `except Exception:` 接得住吗 | ✅ 接得住 | ❌ **接不住** |
+
+Polars 越界抛的 `PanicException` 直接继承 `BaseException`，**不是 `Exception`** —— 外面那层 `except Exception:` 形同虚设，异常会一路冒到最外层。**写 `try/except Exception` 兜底的代码，在这里是兜不住的。**
+
+而且 panic 发生在**转 Python 对象**那一步，不是 `cast` 那一步：
+
+```python
+pl.Series([2**63 - 1]).cast(pl.Datetime("us"))   # 成功，拿到一个合法 Series
+s.to_list()                                        # ← 炸在这里
+```
+
+数据一直躺在那儿没事，直到有人想把它看一眼。
+
+### 4. DuckDB 在 Python 端的静默降级
+
+DuckDB 的值域（294247 年）比 Python `datetime`（9999 年）大得多。值超出 Python 范围时，**DuckDB 的 Python 驱动不报错** —— 它把这一列**降级成字符串**返回：
+
+| 值 | 类型 |
+| --- | --- |
+| `TIMESTAMP '1999-01-01 00:00:00'` | `datetime.datetime(1999, 1, 1, 0, 0)` |
+| `TIMESTAMP '294247-01-10 04:00:54.775806'` | **`str`** `'294247-01-10 04:00:54.775806'` |
+| `DATE '5881580-07-10'` | **`str`** `'5881580-07-10'` |
+
+类型是**按列**变的：一列里只要有一个越界值，整列在 Python 侧就是 `str`，后面 `.dt.year` 之类全部 AttributeError。
+
+走 Arrow 通道就不一样了 —— Arrow 表本身是好的，但 `to_pylist()` 时直接抛 `OverflowError`，不静默。**同一个值，两条通道两种行为**：Python 驱动降级（静默），Arrow 转 Python 对象报错（吵但安全）。值在引擎里始终是对的，出问题的永远是 Python 这一端。
+
+### 5. Parquet 往返：读得进来，一打印就炸
+
+DuckDB 写出一个上界值 → Polars 读 parquet **成功**，dtype 还对（`Datetime(time_unit='us')`）→ `print(df)` 才炸：
+
+```
+print(df)          → PanicException: invalid or out-of-range datetime
+df['t'].to_list()  → PanicException: `NaiveDateTime + TimeDelta` overflowed
+```
+
+这就是「边界值」最麻烦的地方：**写入端不报错 → 管道一路畅通 → 到了展示/导出那一环才炸。**
+
+### 6. 纳秒存住了，显示不出来
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 内部存的是 | `epoch_ns` = 1577836800123456789 | `cast(pl.Int64)` = 1577836800123456789 |
+| 转成微秒时 | **引擎里四舍五入**（.123456789 → .123457），纳秒真丢了 | **转 Python 时截断**，内部 int64 纳秒**还在** |
+
+两边都只显示到微秒，但**原因不同**。所以「拿 ns 当 key」在两边都得自己算：DuckDB 端用 `epoch_ns(...)`，Polars 端用 `cast(pl.Int64)`（ns 列）或 `cast(pl.Datetime('us'))`（统一到微秒）。
+
+### 7. naive 的纪元换算：两边完全一致（好消息）
+
+| | DuckDB | Polars | |
+| --- | --- | --- | --- |
+| naive `2020-01-01 00:00:00` | `epoch_ms` = 1577836800000 | `dt.epoch('ms')` = 1577836800000 | ✅ 一致（都按 UTC） |
+| aware `2020-01-01 00:00:00+08:00` | `epoch_ms` = 1577808000000 | `dt.epoch('ms')` = 1577808000000 | ✅ 一致 |
+
+naive 当 UTC 处理，两边**不打架** —— 分歧不在这里。真正会分叉的是「naive 存进去、aware 读出来」这种混用，那是 `tz_demo.py` 的内容。
+
+### 8. 越界不只发生在「写入」，发生在「算」的时候
+
+表里存的都是合法值，一句算术就把结果推出了范围：
+
+```
+TIMESTAMP 上界 + 1 微秒     → 报错：Conversion Error: Date and time not in timestamp range
+DATE 上界 + 1 天           → 报错：Conversion Error: Date and time not in timestamp range
+9999-12-31 + 1 天（对照组）  → 正常：10000-01-01 23:59:59
+```
+
+对照组那行值得注意：DuckDB 算得出 `10000-01-01 23:59:59`，但 **Python 自己**的 `datetime` 到 9999-12-31 就到头了（`datetime(10000, 1, 1)` → `ValueError: year 10000 is out of range`）。**引擎能算出来的值，Python 端接不住。**
+
+而 `make_date()` 的越界行为又是另一回事 —— **不报错，静默给别的值**：
+
+```
+make_date(2147483647) → 9999-12-31      ← 静默
+make_date(2147483646) → 5881580-07-10
+```
+
+## 排序规则与中文排序：DuckDB 有 COLLATE，Polars 没有
+
+`uv run python src/collation_demo.py`
+
+`order_demo.py` 讲的是**怎么写 ORDER BY**（NULLS FIRST、ORDER BY ALL、分页）。这个 demo 讲的是**按什么规则排** —— 排序的规则本身。
+
+排序规则这件事平时看不出来，一碰到这几类数据就露馅：**中文**（「上海」在「北京」前面还是后面？）、**大小写**（`Apple` 和 `apple` 谁在前？算同一个吗？）、**重音**（`École` 和 `école` 呢？）。
+
+### 1. 默认排序：两边逐行一致
+
+DuckDB 的 `VARCHAR` 默认按 **UTF-8 字节序**排，Polars 的 `sort()` 按 **Unicode 码点序**排 —— 对 UTF-8 来说这是**同一件事**（UTF-8 是保序编码）。19 个中英混排的词逐行对得上：✅。
+
+细节也在这个顺序里：大写全排在小写前面（`'Apple' < 'apple'`）；带重音的那一组整体排在 ASCII 之后（`'École'` 是 U+00E9 > `'z'`），组内还是大写在前；中文按**码点**排（`'上海'` U+4E0A < `'中文'` U+4E2D < `'北京'` U+5317）。
+
+**默认排序两边没有分歧** —— 后面几节讲的是 DuckDB 多出来的那些能力。
+
+### 2. 中文按码点还是按拼音 —— 用本项目自带的数据实测
+
+`orders.parquet` 的 `region` / `category` / `channel` 三列都是中文，直接拿来对账：
+
+| 列 | DuckDB 默认（码点） | DuckDB `zh_cn`（拼音） | Polars 默认 |
+| --- | --- | --- | --- |
+| `region` | 华东 / 华中 / 华北 / 华南 / 西南 | **华北 / 华东 / 华南 / 华中 / 西南** | 华东 / 华中 / 华北 / 华南 / 西南 |
+| `category` | 家居 / 数码 / 服饰 / 美妆 / 运动 / 食品 | **服饰 / 家居 / 美妆 / 食品 / 数码 / 运动** | 家居 / 数码 / 服饰 / 美妆 / 运动 / 食品 |
+| `channel` | app / web / 小程序 / 门店 | **门店 / 小程序 / app / web** | app / web / 小程序 / 门店 |
+
+默认排序两边一致；一旦有人加一句 `COLLATE "zh_cn"`，DuckDB 这边的行序就变了，而 **Polars 根本没有 `COLLATE` 这个概念**。
+
+这就是「中文排序」真正的风险：**不是排错，是排的规则不一样，而两边都不报错。**
+
+### 3. DuckDB 自带 144 个 ICU 排序规则
+
+DuckDB 的 ICU 扩展是 **STATICALLY_LINKED**（编译进二进制），这些排序规则**装都不用装**：`pragma_collations()` 返回 **144** 个，其中中文相关的有 6 个（`zh` / `zh_cn` / `zh_hk` / `zh_mo` / `zh_sg` / `zh_tw`）。
+
+同一个词表换排序规则：
+
+```
+码点序       ['Apple', 'ZZZ', 'Zebra', 'apple', …, '上海', '中文', '北京', …]
+zh_cn（拼音） ['北京', '橙子', '广州', '苹果', '上海', '深圳', '香蕉', '中文', …]
+zh_tw（笔画） ['上海', '广州', '中文', '北京', '苹果', '香蕉', '深圳', '橙子', …]
+```
+
+用一组笔画数递增的汉字看「笔画」是什么意思。这组样本是**故意挑的** —— 笔画数在码点序上恰好不减（一 1 丁 2 丂 2 七 2 万 3 丈 3 三 3 上 3 下 3 不 4 世 5 丘 5），所以两种排法在这组样本上结果相同。别把它当成「笔画序 == 码点序」，换个样本就会分开。
+
+**同一个 collation 名字，选哪个会决定完全不同的顺序。** `zh_cn` 和 `zh_tw` 都是 ICU 的标准 locale，**选错不会报错**，只会给你错的顺序。
+
+DuckDB 还自带两个不是 ICU 的 collation：`NOCASE`（大小写不敏感）、`NOACCENT`（重音不敏感）。两个坑：
+
+- `COLLATE NOCASE NOACCENT` **写不出来** → `Parser Error: syntax error at or near "NOACCENT"`（想要「大小写和重音都不敏感」得用 ICU 的 locale，比如 `en_US`）
+- ICU 只能用 locale 名，不能用完整的 Unicode locale id → `Catalog Error: Collation with name und-u-co-pinyin does not exist!`
+
+### 4. `COLLATE` 不只管排序：`=` / `DISTINCT` / `GROUP BY` 都跟着变
+
+这是最容易被忽略的一点 —— `COLLATE` 改的是**比较语义**，不只是顺序。测试数据 `apple` / `Apple` / `APPLE` / `banana`：
+
+| | 默认 | `COLLATE NOCASE` |
+| --- | --- | --- |
+| `count(DISTINCT s)` | 4 | **2** |
+| `DISTINCT s` | 4 个值 | **['apple', 'banana']** |
+| `s = 'apple'` 的行数 | 1 | **3** |
+
+加上 `COLLATE NOCASE` 之后，apple / Apple / APPLE **合并成了一个值** —— 这就是「大小写不敏感的唯一键」在 DuckDB 里的写法。
+
+但 `GROUP BY s COLLATE NOCASE` **写不出来**：
+
+```
+Binder Error: column "s" must appear in the GROUP BY clause or must be part of an aggregate function.
+```
+
+DuckDB 的 binder 认为分组键变了，于是抱怨「s 必须出现在 GROUP BY 里」。想按大小写不敏感分组，得自己写 `GROUP BY lower(s)`，或者用列级 COLLATE。
+
+顺带一提：DuckDB 的 NOCASE 是**稳定排序**（折叠后并列的值保持输入顺序），Polars 的 `sort()` 默认**不保证**稳定，要稳定得传 `maintain_order=True`。
+
+### 5. 列级 COLLATE：建表时就定下比较语义
+
+`COLLATE` 不只能写在 `ORDER BY` 后面 —— 建表时就能给这一列定一个 collation，**这个列上所有的比较都按它来**：
+
+| | 普通列 | `VARCHAR COLLATE NOCASE` |
+| --- | --- | --- |
+| `count(DISTINCT s)` | 4 | **2** |
+| `WHERE s = 'apple'` | 1 | **3** |
+| `GROUP BY s` 的组数 | 4 | **2** |
+| `ORDER BY s` | APPLE / Apple / apple / banana | **apple / Apple / APPLE / banana** |
+
+同一份数据、同样四句话，**只有一列的声明不同**，结果全变了。JOIN 那一侧也一样：
+
+```
+coll.s  = other.k 的连接数 = 3      ← 一边有 collation
+plain.s = other.k 的连接数 = 1      ← 一边没有
+```
+
+**连接条件里哪一列带 collation 会影响结果** —— 这跟「NULL 参与连接」一样，是那种「不报错但结果不一样」的坑。
+
+Polars 侧**完全没有这个概念** —— 没有列级 collation，也没有 `COLLATE` 关键字。想要同样的效果，只能自己在每个查询里写 `lower(s)`。
+
+### 6. Polars 侧的出路：`icu_sort_key`
+
+Polars 没有 `COLLATE`，但 DuckDB 把 ICU 的**排序键**算出来了 —— `icu_sort_key(str, collator)`。拿这个键去排，顺序能**一字不差**地复现：
+
+```
+DuckDB  COLLATE "zh_cn"    → ['北京', '橙子', '广州', '苹果', '上海', '深圳', '香蕉', '中文', …]
+Polars  按 icu_sort_key 排  → ['北京', '橙子', '广州', '苹果', '上海', '深圳', '香蕉', '中文', …]
+                          → ✅ 完全一致
+```
+
+所以 Polars 侧的路子是：**问 DuckDB 要排序键，自己排** —— 排序规则住在 DuckDB 那边，结果在 Polars 这边用。
+
+但这条路有个**必须知道的坑**：`icu_sort_key` 只认 **ICU 的 locale 名**。给它 DuckDB 自带的 `NOCASE` / `NOACCENT`，它**不报错** —— 但也**不生效**，返回的是默认（root）排序键：
+
+```
+icu_sort_key(_, NOCASE   ) → ['2B01050105', '2B010501DC', …]
+icu_sort_key(_, NOACCENT ) → ['2B01050105', '2B010501DC', …]
+icu_sort_key(_, und      ) → ['2B01050105', '2B010501DC', …]
+icu_sort_key(_, en_US    ) → ['2B01050105', '2B010501DC', …]   ← 跟上面三行完全一样
+icu_sort_key(_, zh_cn    ) → ['A601050105', 'A6010501DC', …]   ← 这行才是真的按 locale 算的
+```
+
+于是按 NOCASE 键排出来的顺序，跟 `ORDER BY s COLLATE NOCASE` **对不上**：
+
+```
+DuckDB  ORDER BY s COLLATE NOCASE    → ['apple', 'Apple', 'banana', 'Zebra', 'zebra', 'ZZZ', …]
+Polars  按 icu_sort_key(_, 'NOCASE')  → ['apple', 'Apple', 'banana', 'école', 'École', 'zebra', …]
+                                     → ❌ 不一致
+```
+
+结论要分清楚：**ICU 的 locale（zh_cn / en_US …）能一字不差复现**；**DuckDB 自带的 NOCASE / NOACCENT 复现不了**，而 `icu_sort_key` 还**不给你报错** —— 这是最坑的地方。另外这条路要求旁边有个 DuckDB，不是纯 Polars 方案。
+
+Polars 自己的 `sort()` 有什么参数：
+
+```
+Expr.sort       = ['descending', 'nulls_last']
+DataFrame.sort  = ['by', 'more_by', 'descending', 'nulls_last', 'multithreaded', 'maintain_order']
+```
+
+**没有 collation、没有 locale，没有任何排序规则相关的参数。**
+
+### 7. 大小写折叠：`lower()` 两边不是同一个函数
+
+DuckDB 的 `lower()` 和 Polars 的 `str.to_lowercase()` 都认 Unicode，大部分字母结果一样 —— 但**土耳其语的那个点 I** 上不一样，而且**长度都不一样**：
+
+| 原文 | DuckDB `lower()` | 长度 | Polars `to_lowercase()` | 长度 | |
+| --- | --- | --- | --- | --- | --- |
+| `ÄÖÜ` | äöü | 3 | äöü | 3 | ✅ |
+| `ÉCOLE` | école | 5 | école | 5 | ✅ |
+| `İSTANBUL` | istanbul | 8 | i̇stanbul | **9** | ❌ |
+| `İ` | i | 1 | i̇ | **2** | ❌ |
+| `ß` | ß | 1 | ß | 1 | ✅ |
+
+`İ`（U+0130）在两边变成了两个**不同的字符串**：DuckDB 给 1 个码点的 `'i'`，Polars 给 2 个码点的 `'i' + U+0307`。实测 `length(lower('İSTANBUL'))`：DuckDB = **8**，Polars = **9**。
+
+这不只是「显示不一样」—— **长度不一样**。拿 `lower(x)` 当去重键的话，DuckDB 那边 `'İstanbul'` 和 `'istanbul'` 是**同一个键**，Polars 那边是两个**不同的键**。
+
+这就是「大小写规则」的真正含义：**它不只是排序时用的大小写不敏感，还是你拿来生成 key 的那个函数的语义**。两者必须对得上，否则去重结果不同。
+
+### 8. 排一次序要花多少钱
+
+`orders.parquet`，200000 行，`region` 有 5 个不同值（本机实测，**串行跑**）：
+
+| 写法 | 用时 (ms) |
+| --- | --- |
+| DuckDB 读 parquet + `ORDER BY region`（默认，码点） | 95.9 |
+| DuckDB 读 parquet + `ORDER BY region COLLATE "zh_cn"` | 96.4 |
+| Polars 读 parquet + `sort("region")`（默认，码点） | 57.4 |
+| Polars 问 DuckDB 要排序键再自己排（拼音） | **53.5** |
+
+**ICU 排序基本不额外收费**：这一轮贵 1.01×（上一轮串行实测是 1.05×），两轮都在噪声量级 —— 排序规则是现成的，代价只是排序时多算一个键。
+
+**出乎意料的一点**：Polars 侧「问 DuckDB 要排序键再自己排」这条路（53.5 ms）**和纯 Polars 排序（57.4 ms）基本一样快**，甚至比 DuckDB 自己那句 `ORDER BY ... COLLATE`（96.4 ms）还快。原因多半是 DuckDB → Arrow 的交接本身很便宜 —— 排序的活儿让给了 Polars。
+
+结论按测出来的数字说：
+
+- **要拼音排序 → 用 DuckDB**：一句 `ORDER BY`，代价只有默认排序的 1.x 倍；
+- **Polars 侧也有一条不慢的路**：让 DuckDB 出排序键，Arrow 交接过来自己排；
+- **纯 Polars（完全不碰 DuckDB）→ 只能是码点序**，想拼音就得自己实现一套排序规则。
+
+> 口径：200000 行、`region` 只有 5 个不同值，所以这部分时间大头是**读 parquet**，排序本身占的比重不大 —— 真实场景里「基数高的字符串列」上排序的占比会大得多。
+
 ## 目录结构
 
 ```
@@ -5425,6 +5750,7 @@ duckdb-polars-demo/
 │   ├── write_demo/                       # write_demo.py：写入产物
 │   ├── csv_demo/                         # csv_demo.py：CSV 样本与产物
 │   ├── tz_demo/                          # tz_demo.py：两边各写一份时间戳
+│   ├── bounds_demo/                      # bounds_demo.py：上界值与正常值的 parquet
 │   └── compress_demo/                    # compress_demo.py：压缩参数 / 行组大小的产物
 ├── src/
 │   ├── common.py           # 唯一事实来源：口径常量 + 结果等价性校验 + 终端排版
@@ -5477,6 +5803,8 @@ duckdb-polars-demo/
 │   ├── quantifier_demo.py  # 量词 ANY/ALL / 相关标量子查询 / LATERAL / UNNEST
 │   ├── sql_sugar_demo.py   # SQL 语法糖逐条对账：GROUP BY ALL / EXCLUDE / FILTER …
 │   ├── fts_demo.py         # 全文本搜索：fts 扩展 vs Polars 硬扫
+│   ├── bounds_demo.py      # 时间戳与日期的边界：值域上界 / 越界报错 / 静默降级
+│   ├── collation_demo.py   # 排序规则与中文排序：COLLATE / ICU / Polars 的码点序
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
@@ -5509,6 +5837,9 @@ duckdb-polars-demo/
 - Polars `str.json_decode`：<https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.str.json_decode.html>
 - DuckDB DECIMAL：<https://duckdb.org/docs/stable/sql/data_types/numeric>
 - DuckDB 时间类型：<https://duckdb.org/docs/stable/sql/data_types/timestamp>
+- DuckDB 排序规则（COLLATE / ICU）：<https://duckdb.org/docs/stable/sql/collations>
+- DuckDB `icu_sort_key`：<https://duckdb.org/docs/stable/sql/functions/icu>
+- Polars `Datetime` 与时间类型：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.schema.html>
 - DuckDB 时区：<https://duckdb.org/docs/stable/guides/timezones>
 - DuckDB 多文件读取：<https://duckdb.org/docs/stable/data/parquet/overview>
 - DuckDB Hive 分区：<https://duckdb.org/docs/stable/data/parquet/hive_partitioning>

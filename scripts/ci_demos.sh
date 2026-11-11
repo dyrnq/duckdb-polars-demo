@@ -28,7 +28,7 @@ OUT="${3:-ci-out}"
 mkdir -p "$OUT" || exit 1
 rm -f "$OUT"/*.out "$OUT"/summary.tsv "$OUT"/SUMMARY.md
 
-# 下面每个 demo 都用 `uv run --no-sync`（省掉 40 次重复的环境检查）。
+# 下面每个 demo 都用 `uv run --no-sync`（省掉 50+ 次重复的环境检查）。
 # 代价是虚拟环境必须已经存在 —— CI 里前面已经 uv sync 过了，
 # 本地第一次跑就先装一次。
 if [ ! -d .venv ]; then
@@ -125,6 +125,8 @@ DEMOS=(
   "quantifier_demo|--rows $ROWS --repeat $REPEAT"
   "sql_sugar_demo|"
   "fts_demo|--rows $ROWS --repeat $REPEAT"
+  "bounds_demo|"
+  "collation_demo|"
 )
 
 # 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。
