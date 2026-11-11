@@ -75,6 +75,9 @@ now_ms() {
 # 格式：脚本名|传给它的参数（空 = 用它自己的默认值）
 # 不在表里的 demo 一律不跑 —— 刻意不写成「遍历 src/*.py」：
 #   sql.py 是交互工具（要传一条 SQL），interop.py 的 --extension 要联网装扩展。
+#
+# similarity_demo 的规模开关叫 --pairs（字符串对数），不是 --rows，
+# 所以那一行只传 --repeat；它的默认规模（两万对）本身就是合适的。
 DEMOS=(
   "gen_data|--rows $ROWS"
   "duckdb_demo|"
@@ -127,6 +130,9 @@ DEMOS=(
   "fts_demo|--rows $ROWS --repeat $REPEAT"
   "bounds_demo|"
   "collation_demo|"
+  "math_demo|--rows $ROWS --repeat $REPEAT"
+  "similarity_demo|--repeat $REPEAT"
+  "parquet_meta_demo|--rows $ROWS --repeat $REPEAT"
 )
 
 # 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。
@@ -154,7 +160,7 @@ if [ -n "$missing" ]; then
   done
   echo
   echo "   把它们加进上面 DEMOS 数组（顺便定一下规模开关："
-  echo "   --rows / --repeat / --repeats / --rounds / --files / --trades / --quotes / --keys）。"
+  echo "   --rows / --repeat / --repeats / --rounds / --files / --trades / --quotes / --keys / --pairs）。"
   exit 1
 fi
 

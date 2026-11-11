@@ -81,6 +81,9 @@ uv run python src/sql_sugar_demo.py  # SQL 语法糖逐条对账：GROUP BY ALL 
 uv run python src/fts_demo.py        # 全文本搜索：DuckDB 有 fts 扩展，Polars 只能硬扫
 uv run python src/bounds_demo.py     # 时间戳与日期的边界：能表示到哪一年，越界时谁报错
 uv run python src/collation_demo.py  # 排序规则与中文排序：DuckDB 有 COLLATE，Polars 没有
+uv run python src/math_demo.py       # 数学函数语义：log() 在 DuckDB 是 log10，在 Polars 是自然对数
+uv run python src/similarity_demo.py # 字符串相似度 / 编辑距离：DuckDB 有 8 个内置函数，Polars 一个都没有
+uv run python src/parquet_meta_demo.py # Parquet 元数据内省 + 行组裁剪：zonemap 在哪儿、剪掉了多少
 ```
 
 一键跑完整流程：
@@ -143,6 +146,9 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `fts_demo.py` | 全文本搜索：DuckDB 的 fts 扩展（倒排索引 + BM25）vs Polars 只能硬扫 |
 | `bounds_demo.py` | 时间戳与日期的边界：各类型能表示到哪一年、越界时谁报错、Python 端的静默降级 |
 | `collation_demo.py` | 排序规则与中文排序：COLLATE 改的是比较语义、144 个 ICU 规则、Polars 没有 COLLATE |
+| `math_demo.py` | 数学函数语义：`log()` 在 DuckDB 是 log10、在 Polars 是自然对数；定义域边界、浮点精度、函数集合 |
+| `similarity_demo.py` | 字符串相似度 / 编辑距离：DuckDB 8 个内置函数 vs Polars 零个；且**全部按 UTF-8 字节算** |
+| `parquet_meta_demo.py` | Parquet 元数据内省 + 行组统计裁剪：zonemap 在哪儿、剪掉了多少、两边能不能看见 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -190,6 +196,9 @@ uv run python src/skew_demo.py --rows 2000000 --repeat 5
 uv run python src/quantifier_demo.py --rows 100000 --repeat 5
 uv run python src/fts_demo.py --rows 50000 --repeat 5
 uv run python src/fts_demo.py --extension            # 试装 duckdb 的 fts 扩展（要联网）
+uv run python src/math_demo.py --rows 2000000 --repeat 5
+uv run python src/similarity_demo.py --pairs 20000 --repeat 5
+uv run python src/parquet_meta_demo.py --rows 1000000 --repeat 5
 ```
 
 用 DuckDB 交互式探索数据：
@@ -222,7 +231,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，51 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，54 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -272,8 +281,9 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | `tz_demo/` | 每次运行覆盖同名文件 | `duckdb_ts.parquet`、`polars_ts.parquet`（两边各写一份时间戳） | 日期时间与时区（Parquet 往返） |
 | `bounds_demo/` | 每次运行覆盖同名文件 | `extreme.parquet`（上界值）、`normal.parquet`（对照组） | 时间戳与日期的边界（Parquet 往返） |
 | `compress_demo/` | 每次运行覆盖同名文件 | 压缩矩阵 / zstd 各级别 / 各种行组大小的 parquet | 压缩与编码（压缩参数、行组大小） |
+| `parquet_meta/` | 文件名带行数，**永远不覆盖** | `sorted_<行数>.parquet`（按 `v` 排序落盘）、`shuffled_<行数>.parquet`（同内容、顺序打乱） | Parquet 元数据内省 + 行组统计裁剪（**两份内容完全一样，只有行组布局不同**） |
 
-`index_customers_*` 的文件名里带行数：换个 `--rows` 就是另一份文件，**永远不覆盖已有数据**。
+`index_customers_*` 和 `parquet_meta/` 的文件名里带行数：换个 `--rows` 就是另一份文件，**永远不覆盖已有数据**。
 
 ## 三条对照查询
 
@@ -508,6 +518,19 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 188 | 列级 COLLATE | `VARCHAR COLLATE NOCASE` —— **整列**的比较语义变掉，连 JOIN 的连接结果都不一样（3 vs 1） | **没有这个概念** | 这是「不报错但结果不一样」的典型 |
 | 189 | Polars 侧的出路 | —— | `icu_sort_key()` 拿到的键能**一字不差**复现 ICU locale 的顺序；但喂 `NOCASE` / `NOACCENT` 给它**不报错**，只是**静默回退到 root 键**，排出来的顺序跟 `COLLATE NOCASE` 对不上 | 有效范围只有 ICU 的 locale，且要求旁边有个 DuckDB |
 | 190 | `lower()` 的 Unicode 细节 | `İ` → **1 个码点**的 `'i'` | `İ` → **2 个码点**的 `'i' + U+0307` —— **长度都不一样**（`length(lower('İSTANBUL'))`：8 vs 9） | 拿 `lower(x)` 当去重键，两边的去重结果不同 |
+| 191 | `log(x)` 的底数 | **log10**（`log(1000)` = 3.0） | **自然对数**（`log(1000)` = 6.907755278982137） | DuckDB 的 `ln` → Polars 的 `log`；DuckDB 的 `log` → Polars 的 `log10` |
+| 192 | `ln(x)` | 有 | **没有**（它的 `log` 本身就是 ln） | Polars 侧不写 `ln` |
+| 193 | 双参数 `log(b, v)` | 有，且是 **`log(底数, 真数)`** | **没有** | Polars 侧自己写 `log(v)/log(b)`，精度不如原生（见第 195 条） |
+| 194 | `log10(1000)` 的最后一位 | **精确 3.0**（`= 3.0` 判 True） | **2.9999999999999996**（差 1 ULP，`= 3.0` 判 False） | `floor(log10(x))`：3.0 vs **2.0** —— 数学函数的结果别拿来做等值判断 |
+| 195 | 任意底数对数 | `log(10, 1000)` = 3.0（精确） | `log(1000)/log(10)` = 2.9999999999999996 | 用除法凑的底数精度更低 |
+| 196 | `log1p` / `erf` / `erfc` | **都没有** | **三个都有** | 这次是 Polars 领先；DuckDB 侧用 `ln(1+x)` 拼 |
+| 197 | 数学函数集合 | 候选 32 个里**有 29 个**（独有 13 个：`ln`/`log2`/`power`/`factorial`/`gamma`/`lgamma`/`asin`/`acos`/`atan`/`atan2`/`even`/`trunc`/`pi`） | 候选 32 个里**有 19 个**（独有 3 个） | 缺的都能用初等函数拼出来，但要自己负责精度 |
+| 198 | NaN 的传播 | `nan > 0` → **True**，`nan = nan` → **True** | 同左 | 两边都**不是** IEEE 语义；NaN 会「混进」结果而不是被滤掉 —— 要挡得显式写 `NOT isnan(x)` / `~is_nan()` |
+| 199 | 字符串相似度 / 编辑距离 | **8 个内置函数**（levenshtein / damerau_levenshtein / editdist3 / hamming / mismatches / jaro_similarity / jaro_winkler_similarity / jaccard） | **一个都没有**（字符串命名空间 47 个方法，0 个相关；整个 Expr API 224 个方法也是 0） | Polars 侧只能手写 UDF —— 实测**慢 16.6×** |
+| 200 | 相似度函数的粒度 | **全部按 UTF-8 字节算**（8 个函数无一例外） | —— | 中文上「差一个字」= 2~3 个字节，阈值没法按倍数换算 |
+| 201 | Parquet 元数据内省 | **5 个表函数**（`parquet_schema` / `parquet_file_metadata` / `parquet_metadata` / `parquet_kv_metadata` / `parquet_full_metadata`） | 3 个（`read_parquet_schema` / `read_parquet_metadata` / `collect_schema`） | **行组级**（每个行组的 min/max、压缩、编码）Polars 一个都拿不到 |
+| 202 | `sniff_parquet` | **不存在**（只有 `sniff_csv`） | —— | Parquet 的 schema 在文件头里写死了，不需要「猜」 |
+| 203 | 看得见自己剪了多少 | `EXPLAIN ANALYZE` 直接报 **「Row Groups Scanned: 1 / 49」** | 只有 `use_statistics=True/False` 一个开关 | 想验证裁剪是否生效，DuckDB 侧看得到，Polars 侧只能看耗时 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -528,7 +551,10 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 142~148 条在 `BLOB / 二进制：字节、编码、base64`、第 149~156 条在 `UUID：原生类型 vs 自己模拟` 里展开；
 第 157~159 条在 `量词与相关子查询：SQL 的一等公民`、第 160~164 条在 `同一节的相关子查询 / LATERAL / UNNEST`、
 第 165~169 条在 `SQL 语法糖对照：八条糖逐条对账`、第 170~171 条在 `全文本搜索：DuckDB 有扩展，Polars 没有`、
-第 172~182 条在 `时间戳与日期的边界`、第 183~190 条在 `排序规则与中文排序` 里展开。
+第 172~182 条在 `时间戳与日期的边界`、第 183~190 条在 `排序规则与中文排序` 里展开；
+第 191~198 条在 `数学函数语义：同一个 log()，两个底数`、
+第 199~200 条在 `字符串相似度与编辑距离：DuckDB 有 8 个，Polars 有 0 个`、
+第 201~203 条在 `Parquet 元数据内省与行组裁剪` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -5722,6 +5748,479 @@ DuckDB 的 `lower()` 和 Polars 的 `str.to_lowercase()` 都认 Unicode，大部
 
 > 口径：200000 行、`region` 只有 5 个不同值，所以这部分时间大头是**读 parquet**，排序本身占的比重不大 —— 真实场景里「基数高的字符串列」上排序的占比会大得多。
 
+## 数学函数语义：同一个 log()，两个底数
+
+`uv run python src/math_demo.py`
+
+迁移 SQL 的时候最容易抄错、也最难发现的一类差异：**同名函数，含义不同**。
+
+### 1. `log()` 的底数不一样
+
+DuckDB 的 `log(x)` 是 **log10**，Polars（和 Python `math.log`）的 `log(x)` 是**自然对数**：
+
+| x | DuckDB `log(x)` | Polars `log(x)` |
+| --- | --- | --- |
+| 1 | 0.0 | 0.0 |
+| 10 | 1.0 | 2.302585092994046 |
+| 100 | 2.0 | 4.605170185988092 |
+| 1000 | 3.0 | 6.907755278982137 |
+| exp(1) | 0.4342944819032518 | 1.0 |
+
+跟确切答案（Python 的 `math`）比：x = 10/100/1000/exp(1) 四行，DuckDB 全对，Polars 全错 —— 差的倍数是 ln(10) ≈ 2.3026。
+
+**为什么这个坑特别难发现**：不报错（两边都是 DOUBLE）、不改类型（schema 对账是通的）、结果「看起来正常」（自然对数也是一条正常的曲线，画出来甚至更平滑）。而且**错的方向一致**：所有数都偏小，所以「阈值筛选」这类逻辑会系统性地多选中一批行。
+
+> DuckDB 的 `log` ≈ PostgreSQL 的 `log10`，**不是** PostgreSQL 的 `log`。从 Postgres 迁到 DuckDB（或者反过来）的人会以为两边一致 —— 实测不一致。Polars 这边跟 Python 内置一致，反而是「多数派」。
+
+### 2. 迁移对照表
+
+| DuckDB 写法 | DuckDB 实际含义 | Polars 写法 | 两边有同名函数吗 |
+| --- | --- | --- | --- |
+| `log(x)` | log10(x) | `log(x)` | ✅ 有（含义不同） |
+| `log10(x)` | log10(x) | `log10(x)` | ✅ 有 |
+| `ln(x)` | ln(x) | `log(x)` | ✅ 有 |
+| `log(b, v)` | 以 b 为底的 v 的对数 | `log(v) / log(b)` | ❌ 没有 |
+| `log2(x)` | log2(x) | `log(x) / log(2)` | ❌ 没有 |
+| `log1p(x)` | —— | `log1p(x)` | ❌ 没有 |
+| `cbrt(x)` | cbrt(x) | `cbrt(x)` | ✅ 有 |
+| `factorial(n)` | factorial(n) → HUGEINT | —— | ❌ 没有 |
+| `gamma(x)` | gamma(x) | —— | ❌ 没有 |
+| `lgamma(x)` | lgamma(x) | —— | ❌ 没有 |
+
+逐个验一遍（x = 1000、b = 10）：
+
+| 表达式 | DuckDB | Polars | 一致吗 |
+| --- | --- | --- | --- |
+| `ln(1000)` ↔ `log(1000)` | 6.907755278982137 | 6.907755278982137 | ✅ 一致 |
+| `log10(1000)` | 3.0 | 2.9999999999999996 | ❌ 不一致 |
+| `log(10, 1000)` ↔ `log(1000)/log(10)` | 3.0 | 2.9999999999999996 | ❌ 不一致 |
+| `log2(1024)` ↔ `log(1024)/log(2)` | 10.0 | 10.0 | ✅ 一致 |
+
+三条要记住的：
+
+1. **`log` 在 DuckDB 是 log10、在 Polars 是 ln** —— 抄过去必错。DuckDB 的 `ln` 写成 Polars 的 `log`；DuckDB 的 `log` 写成 Polars 的 `log10`。
+2. Polars **没有** `ln`（它的 `log` 本身就是 ln），也**没有**双参数的 `log(b, v)`。
+3. 用除法凑出来的底数（`log(v)/log(b)`）**精度不如原生函数** —— 上面那张表里 `log10(1000)` 差的就是这 1 个 ULP。
+
+另外，DuckDB 双参数 log 的**参数顺序**跟数学课本是反的：
+
+```
+DuckDB log(10, 1000)  = 3.0                 ← 以 10 为底，1000 的对数
+DuckDB log(1000, 10)  = 0.3333333333333333  ← 以 1000 为底，10 的对数
+```
+
+跟 PostgreSQL 的 `log(b, x)` 同序（先底数后真数），跟数学课本上的 `log_x(y)` 相反 —— 抄错一次就差了一个倒数。
+
+### 3. 浮点精度：`log10(1000)` 不是精确的 3
+
+| x | DuckDB `log10(x)` | Polars `log10(x)` | DuckDB 偏差 | Polars 偏差 |
+| --- | --- | --- | --- | --- |
+| 10 | 1.0 | 1.0 | 0 ULP | 0 ULP |
+| 100 | 2.0 | 2.0 | 0 ULP | 0 ULP |
+| 1000 | 3.0 | 2.9999999999999996 | 0 ULP | **1 ULP** |
+| 10000 | 4.0 | 4.0 | 0 ULP | 0 ULP |
+| 100000 | 5.0 | 5.0 | 0 ULP | 0 ULP |
+| 1000000 | 6.0 | 5.999999999999999 | 0 ULP | **1 ULP** |
+
+（ULP = unit in the last place，双精度在该数量级上的最小间隔。）
+
+`log10(1000) = 3.0` 在 DuckDB 里是**真的等于 3.0**（不是约等于）：`DuckDB log10(1000) = 3.0` 相等判定 True，`Polars log10(1000) = 3.0` 相等判定 **False**。
+
+**这 1 个 ULP 在实务里会咬人**：
+
+- 「取整后再比」：`floor(log10(x))` —— DuckDB 给 **3**（千位），Polars 给 **2**（百位）；
+- 「等值分组」：`GROUP BY log10(x)` 把本该同组的行分到了两组；
+- 「精确等于」的断言：`WHERE log10(x) = 3.0` 两边命中行数不同。
+
+> 所以「两边数值一致」这句话要打个折扣：数学函数返回的是**近似值**，两个引擎的舍入点不同，最后一位对不上是常态。**不要用浮点数学函数的结果做等值判断** —— 两个引擎都别这么用。
+
+### 4. 定义域边界：这一族两边完全一致
+
+| 表达式 | DuckDB | Polars | 一样吗 |
+| --- | --- | --- | --- |
+| `log(0)` | -inf | -inf | ✅ |
+| `log(-1)` | nan | nan | ✅ |
+| `ln(0)` | -inf | -inf | ✅ |
+| `sqrt(-1)` | nan | nan | ✅ |
+| `pow(-8, 1/3)` | nan | nan | ✅ |
+
+都是 IEEE 754 的行为：`log(0)` = **-inf**（不报错，也不是 0），`log(-1)` / `sqrt(-1)` = **nan**。
+
+顺带一个坑：同一个表达式，**Python 给的是复数**：
+
+```
+Python (-8.0) ** (1/3)  ->  (1.0000000000000002+1.7320508075688772j)
+Polars pow(-8, 1/3)    ->  nan
+DuckDB pow(-8, 1/3)    ->  nan
+```
+
+负数的分数次幂要单独处理，别指望三个地方一致。（DuckDB 和 Polars 都有 `cbrt`，对负数都给正确的实数立方根：`cbrt(-8)` = -2.0 —— 别拿 `pow(x, 1/3)` 当立方根。）
+
+### 5. NaN 与 inf：静默，但不会自己消失
+
+IEEE 754 说「NaN 参与任何比较都是 false」，**两个引擎都没照 IEEE 做**：
+
+| 表达式 | DuckDB | Polars |
+| --- | --- | --- |
+| `nan > 0` | **True** | **True** |
+| `nan < 0` | False | False |
+| `nan = nan` | **True** | **True** |
+| `nan != nan` | False | False |
+
+两边都把 NaN 当成「比任何数都大」，而且 `nan = nan` 判成 True。所以 **`WHERE log(x) > 0` 不会把 nan 行滤掉** —— 实测两边都命中 1 行，都不报错。
+
+> 结论要反着记：**NaN 会「混进去」，而不是「被滤掉」**。想把它挡在外面，得显式写 `WHERE NOT isnan(x)`（DuckDB）/ `WHERE ~pl.col('x').is_nan()`（Polars）。
+
+溢出边界两边也一致（IEEE 754 双精度上限约 1.8e308）：
+
+| 表达式 | DuckDB | Polars | 一样吗 |
+| --- | --- | --- | --- |
+| `exp(709)` | 8.218407461554972e+307 | 8.218407461554972e+307 | ✅ |
+| `exp(709.7)` | 1.6549840276802644e+308 | 1.6549840276802644e+308 | ✅ |
+| `exp(710)` | **inf** | **inf** | ✅ |
+| `exp(-800)` | 0.0 | 0.0 | ✅ |
+
+**inf 是「静默」的**：两边都不报错，inf 会顺着 `+ - *` 传播，最后拿去算平均值可能得到 nan 而不是报错。想让它炸得自己检查：`isfinite(x)` / `isinf` / `isnan`（DuckDB）、`is_finite()` / `is_infinite()` / `is_nan()`（Polars）。
+
+> 提醒：这里说的 inf 是**浮点溢出**（IEEE 754），两边一致。整数溢出是另一回事（DuckDB 报错、Polars 静默绕回，见 `数值与算术边界`）；DuckDB 还有第三种（`DOUBLE` → `DECIMAL`、超长的 `factorial` 报 Out of Range）。三种别混。
+
+### 6. 三角函数与 π：两边逐位相同
+
+| 表达式 | DuckDB | Polars | 一样吗 |
+| --- | --- | --- | --- |
+| `sin(pi)` | 1.2246467991473532e-16 | 1.2246467991473532e-16 | ✅ |
+| `cos(pi)` | -1.0 | -1.0 | ✅ |
+| `tan(pi)` | -1.2246467991473532e-16 | -1.2246467991473532e-16 | ✅ |
+| `cos(pi/2)` | 6.123233995736766e-17 | 6.123233995736766e-17 | ✅ |
+
+π 是无理数，双精度只能存一个近似值，所以 `sin(pi)` **不是 0**。两边逐位相同 —— 实务影响是 `sin(pi) == 0` 这种判断永远不成立，要判断「角度在整数圈上」得用容差（`abs(sin(pi())) < 1e-12`）。
+
+> 三角函数这一族**没有语义差异**。差异集中在**函数命名**（log / ln / log2 / log1p）上，不在数学本身。
+
+### 7. 函数集合对不齐
+
+候选 32 个数学函数名逐个查两边：
+
+| 函数名 | DuckDB | Polars |
+| --- | --- | --- |
+| `log` / `log10` / `exp` / `pow` / `sqrt` / `cbrt` | ✅ | ✅ |
+| `degrees` / `radians` / `sin` / `cos` / `tan` | ✅ | ✅ |
+| `sinh` / `cosh` / `tanh` / `abs` / `sign` | ✅ | ✅ |
+| `ln` / `log2` / `power` / `factorial` / `gamma` / `lgamma` | ✅ | ❌ |
+| `asin` / `acos` / `atan` / `atan2` / `even` / `trunc` / `pi` | ✅ | ❌ |
+| `log1p` / `erf` / `erfc` | ❌ | ✅ |
+
+- DuckDB 有 **29** 个（独有 13 个），Polars 有 **19** 个（独有 3 个），两边都有 16 个。
+- 值得注意：**Polars 有 `log1p`，DuckDB 没有** —— 这次是 Polars 领先，DuckDB 侧得自己写 `ln(1+x)`。
+- `factorial` 的返回类型是 **HUGEINT**（不是 DOUBLE）：`factorial(20)` = 2432902008176640000，用 DOUBLE 存会丢精度。负数会**报错**（`OutOfRangeException`），不是返回 nan。
+
+### 8. 代价：跑得一样快，所以更不会有人发现算错了
+
+200 万行正数（本机实测，**串行跑**，重复取中位数）：
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果 |
+| --- | --- | --- | --- |
+| DuckDB `log10(v)` | 6.3 | 5.4 | 9441288.0397 |
+| DuckDB `log(v)` ← 其实是 log10 | 6.1 | 5.9 | 9441288.0397 |
+| DuckDB `ln(v)` | 3.9 | 3.2 | 21739369.0989 |
+| Polars `log10(v)` | 13.6 | 13.2 | 9441288.0397 |
+| Polars `log(v)` ← 其实是自然对数 | 13.2 | 13.2 | 21739369.0989 |
+
+> 口径：输入已物化成 parquet，两边读同一份数据；计时的只有「对这一列做对数再求和」这一步（不含读盘）。
+
+**耗时看不出任何区别** —— 对数都是硬件级的一两条指令。也就是说：性能监控、跑批时长、profile 上**没有任何线索**提示你算错了；唯一能发现问题的只有「拿已知答案对账」。
+
+最后两行的**结果**才是重点：DuckDB 的 `log(v)` 和 `log10(v)` 结果相同，Polars 的 `log(v)` 跟它们差 ln(10) 倍 —— 性能表上这两行长得一模一样，这正是「静默算错」的可怕之处。
+
+> 实务建议：**迁移时把数学函数列成一张对照表逐个核**，不要靠「跑起来没报错」来判断迁移对了。
+
+## 字符串相似度与编辑距离：DuckDB 有 8 个，Polars 有 0 个
+
+`uv run python src/similarity_demo.py`
+
+跟 `fts_demo.py` 同一类问题：**能力差距**，而不是语义差异。
+
+### 1. API 清单：DuckDB 8 个，Polars 0 个
+
+DuckDB 里标着 `text_similarity` 分类的函数有 **8** 个：
+
+| 函数 | 返回类型 | 管什么事 |
+| --- | --- | --- |
+| `levenshtein` | BIGINT | 编辑距离（插入/删除/替换） |
+| `damerau_levenshtein` | BIGINT | 编辑距离，**允许换位**（无限制） |
+| `editdist3` | BIGINT | 编辑距离，允许**一次**相邻换位（OSA） |
+| `hamming` | BIGINT | 逐位不同的个数（要求等长） |
+| `mismatches` | BIGINT | 同上 |
+| `jaro_similarity` | DOUBLE | 相似度 0~1 |
+| `jaro_winkler_similarity` | DOUBLE | 相似度 0~1（**公共前缀加权**） |
+| `jaccard` | DOUBLE | 集合相似度 0~1 |
+
+Polars 侧：字符串命名空间一共 **47** 个方法，其中跟相似度/编辑距离相关的有 **0** 个；整个 Expr API（224 个方法）里也是 **0** 个。
+
+> 不是「弱一点」，是**这一层不存在**。要用只能自己写。
+
+「换位」这件事三个函数给出不同答案：
+
+```
+levenshtein('CA','ABC')         = 3
+editdist3('CA','ABC')           = 3
+damerau_levenshtein('CA','ABC')  = 2
+```
+
+拼写纠错一般要用 `damerau_levenshtein`。Jaro 与 Jaro-Winkler 的区别在**公共前缀加权**：`jaro('DIXON','DICKSONX')` = 0.7667，`jaro_winkler` = 0.8133。
+
+边界行为：`hamming` / `mismatches` 要求两边等长（不等长直接 `InvalidInputException`），`jaccard` 要求至少 2 个字符；`levenshtein(NULL,'a')` 返回 NULL（不报错）。
+
+### 2. 实锤：这 8 个函数**全部按 UTF-8 字节算**
+
+一个中文字占 3 个字节、一个 emoji 占 4 个字节。按字符算的话差一个字就是 1，按字节算就是 3 / 4。
+
+| a | b | DuckDB | 字符级参考 | 字节级参考 | 跟谁一致 |
+| --- | --- | --- | --- | --- | --- |
+| 无线蓝牙耳机 | 蓝牙无线耳机 | 10 | 4 | 10 | ✅ 字节级 |
+| 无线蓝牙耳机 | 无线蓝牙耳機 | 2 | 1 | 2 | ✅ 字节级 |
+| 中文 | 中 | 3 | 1 | 3 | ✅ 字节级 |
+| 🐱🐶 | 🐱 | 4 | 1 | 4 | ✅ 字节级 |
+| é | e | 2 | 1 | 2 | ✅ 字节级 |
+| kitten | sitting | 3 | 3 | 3 | 两个都一样 |
+
+Jaro 家族和 `jaccard` 也是字节级（同一个算法，换个粒度）：
+
+| a | b | DuckDB | 字符级 | 字节级 |
+| --- | --- | --- | --- | --- |
+| a中 | 中a | 0.8333 | 0.0000 | 0.8333 |
+| 无线蓝牙耳机 | 蓝牙无线耳机 | 0.9074 | 0.8889 | 0.9074 |
+| 无线蓝牙 | 无线蓝牙耳机（jaccard） | 0.7857 | 0.6667 | 0.7857 |
+
+**为什么这么设计**：编辑距离的实现是「两个等长数组的 DP」，按字节做最省事 —— 不用管 Unicode 的码点宽度。对英文（1 字母 1 字节）完全没问题，对中文就变成了「一个汉字 = 3 次编辑」。
+
+### 3. 真实用例：中文商品名去重，同一条阈值又漏又抓
+
+拿 `无线蓝牙耳机 降噪版` 当基准，三个语义上完全等价的错别字：
+
+| 商品名 | DuckDB 距离 | 字符级距离 | 阈值 2 命中？ |
+| --- | --- | --- | --- |
+| 无线蓝牙耳机 降喑版 | 2 | 1 | ✅ 命中 |
+| 无线蓝牙耳机 降暗版 | 3 | 1 | ❌ 漏掉 |
+| 无线蓝牙耳机 降燥版 | 3 | 1 | ❌ 漏掉 |
+
+为什么？看这三个字的 UTF-8 字节：
+
+```
+噪  = U+566A  ->  E5 99 AA
+喑  = U+5591  ->  E5 96 91
+暗  = U+6697  ->  E6 9A 97
+燥  = U+71E5  ->  E7 87 A5
+```
+
+「噪」和「喑」的**首字节相同**（E5），只差后 2 个字节 → 距离 2；「噪」和「暗」「燥」的首字节就不同 → 差 3 个字节 → 距离 3。
+
+**同一条阈值，对三个语义上完全等价的错别字，给出了两个不同的答案**：命中一个、漏掉两个。阈值定 2 也不对、定 3 也不对 —— 因为**字节距离不是「差几个字」的可靠代理**。
+
+整份商品名列表（23 条）上跑下来：字节级用 `levenshtein <= 2` 判近似重复，命中 **3** 条；字符级语义下应该命中 **5** 条。
+
+反过来也成立 —— 字节距离小不代表语义上近：
+
+- `无线蓝牙耳机 降噪版` vs `无线蓝牙耳机 降噪版 2` → 距离 **2**（多了「 2」两个字符，是**另一个商品**，却被 `<= 2` 判成重复）；
+- `无线蓝牙耳机 降噪版` vs `蓝牙无线耳机 降噪版` → 距离 **10**（只是把「无线蓝牙」和「耳机」调了个位置，字符级距离才 4 —— 移动在字节层面是「删掉 + 插进去」，代价翻倍）。
+
+> 中文场景下的阈值只能当「大致的量级」用，不能当「差几个字」用。想要真正的字符级语义，**只有一条路：自己算**。
+
+### 4. Polars 侧只能手写，代价是 16×
+
+20000 对「原串 + 改了一个字的串」（本机实测，**串行跑**）：
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果 |
+| --- | --- | --- | --- |
+| DuckDB `levenshtein`（内置，字节级） | 37.3 | 37.2 | 33792.0000 |
+| DuckDB `jaro_similarity`（内置，字节级） | 5.6 | 5.5 | 19139.6855 |
+| Polars `map_elements` 手写（字符级） | 618.3 | 616.7 | 20000.0000 |
+| Polars `map_elements` 手写（字节级） | 1625.7 | 1623.4 | 33792.0000 |
+
+> 口径：输入已物化成 parquet，两边读同一份数据；计时的只有「算这一列距离」这一步（不含读盘）。
+
+Polars 手写比 DuckDB 内置慢 **16.6×**。原因有三层：
+
+- DuckDB 的 `levenshtein` 是**向量化**的 C++ 实现，一列算一列，线程池铺开；
+- `map_elements` 是**逐行**调用 Python 函数，每次都要跨一次 Python ↔ Rust 边界；
+- 手写的 DP 本身还是 O(n·m) 的 Python 双层循环。
+
+所以「Polars 没有内置相似度函数」的代价不是「写起来麻烦」，是**慢一个数量级** —— 数据量小的时候无所谓，几百万对就是分钟级的差别。
+
+**Polars 侧的现实选项**：
+
+1. `map_elements` + Python 函数 —— 简单，但慢（上面这个）；
+2. 用 Polars 的 Rust 扩展（`polars-plugin` / `py-polars` 插件）自己写 —— 快，但要多一门 Rust 工具链；
+3. 换到 DuckDB 那边算 —— 这就是本项目在做的事；
+4. 实在需要字符级语义、又不想写 Rust：`str.split('')` 能把字符串拆成字符列表（实测可以），可以基于它做向量化的比较 —— 但**编辑距离本身还是得自己写**，拆字符只是省掉编码那一步。
+
+### 5. 英文对照：同样的函数，同样的结论
+
+英文的坑要小得多 —— 1 个字母 = 1 个字节，字符级和字节级完全重合：
+
+| a | b | DuckDB | 字符级 | 字节级 |
+| --- | --- | --- | --- | --- |
+| wireless earbuds | wireless earbud | 1 | 1 | 1 |
+| portable projector | portable projectors | 1 | 1 | 1 |
+| mechanical keyboard | mechanical keyboards | 1 | 1 | 1 |
+| air fryer 5l | air fryer 5L | 1 | 1 | 1 |
+
+> 三个数完全一样，所以字节级这个坑在英文数据上看不出来 —— 这就是为什么这个差异能活这么久：**英文语料上一切正常，一换中文就全错**。
+
+另外注意大小写：`levenshtein('air fryer 5l','air fryer 5L')` = 1 —— 大小写不同算**一次编辑**，不会自动忽略大小写。想忽略得自己先 `lower()`（两边都这样，没有内置的 insensitive 版本）。
+
+## Parquet 元数据内省与行组裁剪：zonemap 在哪儿，剪掉了多少
+
+`uv run python src/parquet_meta_demo.py`
+
+Parquet 不是「一坨二进制」—— 它把文件切成一组一组的 **row group**，每个 row group 是一块独立可读的数据，而且**每一列的每一块都自带 min/max 统计**。这些统计就是 **zonemap**，查询时引擎拿谓词一推，就能整组整组地跳过。
+
+这个 demo 分两条线：**内省**（文件里到底写了些什么元数据）和**裁剪**（这些统计在查询时到底起了多大作用）。
+
+### 1. 覆盖面：DuckDB 5 个元数据表函数，Polars 3 个函数
+
+DuckDB 里跟 parquet 有关的表函数有 9 个，其中**元数据**的有 5 个：`parquet_schema` / `parquet_file_metadata` / `parquet_metadata` / `parquet_kv_metadata` / `parquet_full_metadata`。
+
+Polars 侧 parquet 相关的公开函数就这些：`read_parquet` / `scan_parquet` / `read_parquet_schema` / `read_parquet_metadata`（标着 experimental，只给文件级的自定义键值对）/ `scan_parquet(...).collect_schema()`。
+
+把两边摊开对：
+
+| 想知道的元数据 | DuckDB | Polars |
+| --- | --- | --- |
+| schema（类型名） | `parquet_schema()` | `read_parquet_schema()` |
+| parquet 层的原始类型（INT64 / BYTE_ARRAY / repetition_type / logical_type） | `parquet_schema()` | ❌ |
+| 文件级：行数 / 行组数 | `parquet_file_metadata()` | ❌ |
+| 文件级：写入方 / footer 大小 | `parquet_file_metadata()` | ❌ |
+| 文件级：自定义键值对 | `parquet_kv_metadata()` | `read_parquet_metadata()` |
+| 行组级：min/max（zonemap） | `parquet_metadata()` | ❌ |
+| 行组级：压缩 / 编码 | `parquet_metadata()` | ❌ |
+| 行组级：数据页偏移 | `parquet_metadata()` | ❌ |
+
+> **Polars 缺的是「行组级」这一整层** —— 拿不到「第 3 个行组的 min/max 是多少」，也拿不到「这个文件一共有几个行组」，连文件级的行数、行组数、footer 大小都拿不到。想要行组级信息就得自己引 PyArrow（`pq.read_metadata(path)`），那就不是 Polars 的能力了。
+
+`parquet_metadata()` 一共 33 列，关键的几列是 `row_group_id` / `path_in_schema` / `row_group_num_rows` / `compression` / `encodings` / `stats_min` / `stats_max` / `min_is_exact` / `max_is_exact` / `bloom_filter_offset`。
+
+**一个要纠正的误解**：`sniff_parquet` 这个函数**不存在**。
+
+```
+SELECT * FROM sniff_parquet('…');
+-- Catalog Error: Table Function with name sniff_parquet does not exist!
+```
+
+DuckDB 2.0 只有 `sniff_csv`（给 CSV 猜 schema 和分隔符用的）。Parquet 的 schema 在文件头里写死了，用 `parquet_schema` 查就行，根本不需要「猜」。
+
+### 2. zonemap 长什么样
+
+`parquet_metadata()` 的粒度是**行组 × 列**。排好序那份文件里，`v` 列的行组统计：
+
+| 行组 | 行数 | stats_min | stats_max | 压缩 | 编码 |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 20,480 | 0 | 20479 | SNAPPY | PLAIN |
+| 1 | 20,480 | 20480 | 40959 | SNAPPY | PLAIN |
+| 2 | 20,480 | 40960 | 61439 | SNAPPY | PLAIN |
+| 3 | 20,480 | 61440 | 81919 | SNAPPY | PLAIN |
+| 4 | 20,480 | 81920 | 102399 | SNAPPY | PLAIN |
+
+**每个行组覆盖一段互不重叠的 v 区间** —— 这就是 zonemap：`(min, max)` 之外的值，这个行组里根本不可能有。
+
+打乱那份文件里，同样的列：
+
+| 行组 | 行数 | stats_min | stats_max |
+| --- | --- | --- | --- |
+| 0 | 20,480 | 0 | 999961 |
+| 1 | 20,480 | 29 | 999946 |
+| 2 | 20,480 | 15 | 999987 |
+
+**每一组的区间都盖住了整个 [0, N)** —— 区间信息等于没有。
+
+### 3. 裁剪是怎么发生的：`EXPLAIN ANALYZE` 的「Row Groups Scanned」
+
+DuckDB 的 `EXPLAIN ANALYZE` 会直接报出扫了几个行组。两份数据内容完全一样，只是落盘时的行组布局不同：
+
+| 文件 | 谓词 | 扫了几个行组 | 剪掉了 |
+| --- | --- | --- | --- |
+| 排好序 | `WHERE v = 500000` | **1 / 49** | 48/49 省掉 |
+| 打乱 | `WHERE v = 500000` | **49 / 49** | 0/49 省掉 |
+| 排好序 | `WHERE v = 0` | 1 / 49 | 48/49 省掉 |
+| 打乱 | `WHERE v = 0` | **1 / 49** | 48/49 省掉 |
+| 排好序 | `WHERE v = 999999` | 1 / 49 | 48/49 省掉 |
+| 打乱 | `WHERE v = 999999` | **1 / 49** | 48/49 省掉 |
+| 排好序 | `WHERE v BETWEEN 500000 AND 500010` | 1 / 49 | 48/49 省掉 |
+| 打乱 | `WHERE v BETWEEN 500000 AND 500010` | 49 / 49 | 0/49 省掉 |
+
+**但打乱的那份不是「一个都剪不掉」—— 这里有个反直觉的地方**：查全局最小值（v = 0）和全局最大值（v = N-1）时，**打乱的那份也只扫 1 个行组**。原因：装着 0 的那个行组，它的 `stats_min` 恰好就是 0；装着 N-1 的那个行组，它的 `stats_max` 恰好就是 N-1。
+
+> 也就是说：**打乱的数据不是完全不能剪，只是只有极值能剪。**「值在中间」的普通点查，照样得扫全部 49 个行组。
+
+三个值得注意的地方：
+
+1. **范围查也受益**：排好序时 `BETWEEN` 只扫覆盖那段区间的行组。
+2. **剪枝靠的是区间，不是「排序」本身** —— 打乱那份剪不动，是因为每组的区间都是 [0, N)；排好序那份剪得动，是因为每组区间互不重叠。
+3. **剪掉的是「读 + 解压」，不是「过滤」** —— 被跳过的行组连数据页都不用碰，这才是省时间的大头。
+
+顺带看一眼逻辑计划：`EXPLAIN` 里写的是 `PARQUET_SCAN` + `Filters: v = 100000`，**看不出**有没有剪枝 —— 真正扫了几个行组只有 `EXPLAIN ANALYZE` 知道。（`索引与点查` 那节也踩过这个坑：`EXPLAIN` 说走 Seq Scan，实际有没有用索引要看 `EXPLAIN ANALYZE`。）
+
+### 4. Polars 侧：只有一个开关，看不到过程
+
+Polars 的 `scan_parquet` 有个 `use_statistics` 参数（默认 True），但**不告诉你**剪掉了多少 —— 没有等价的「Row Groups Scanned」。能看到的只有「快了多少」。
+
+100 万行 / 49 个行组（本机实测，**串行跑**，重复 9 次取中位数）：
+
+| 文件 | use_statistics | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- | --- |
+| 排好序 | True | **1.3** | 1.1 |
+| 排好序 | False | 4.4 | 3.2 |
+| 打乱 | True | 3.2 | 2.7 |
+| 打乱 | False | 3.1 | 2.6 |
+
+排好序那份**开着快了 3.3 倍**（49 个行组里 48 个能被 min/max 直接排除）；打乱那份**开不开基本没差别** —— 49 个行组的 min/max 挨个比了一遍，结果一个也剪不掉，那份检查的钱等于白花了。
+
+> **机制是同一个**（zonemap 剪枝），只是 Polars 不告诉你内部发生了什么。
+
+### 5. 代价：剪枝到底值多少时间
+
+100 万行 / 49 个行组 / 40 MB 文件（本机实测，**串行跑**）：
+
+| 实现 | 中位数 (ms) | 最快 (ms) | 结果 | 扫了几个行组 |
+| --- | --- | --- | --- | --- |
+| DuckDB 排好序 · 点查 | **4.7** | 4.1 | 32 | **1 / 49** |
+| DuckDB 打乱 · 点查 | 7.8 | 7.3 | 32 | 49 / 49 |
+| DuckDB 排好序 · 全表扫 | 17.1 | 14.5 | 32,000,000 | 49 / 49 |
+| Polars 排好序 · 点查 `use_statistics=True` | 3.0 | 2.6 | 32 | — |
+| Polars 排好序 · 点查 `use_statistics=False` | 6.1 | 5.2 | 32 | — |
+| Polars 打乱 · 点查 `use_statistics=True` | 4.8 | 4.4 | 32 | — |
+| Polars 排好序 · 全表扫 | 13.6 | 11.9 | 32,000,000 | — |
+
+> 口径：两边读同一份文件；查的都是 payload 列的总长度（**逼引擎真的去读数据页** —— 用 `count(*)` 的话在 parquet 上是元数据优化，根本不读数据，拿它当基准等于拿「没读」跟「读了」比）；计时的只有「这一条查询」本身，重复取中位数。共享开发机，单次数字会有抖动，看趋势。
+
+**剪枝省的是「读 + 解压」的钱**：排好序的点查只需要解开 1 个行组，打乱的点查要解开全部，全表扫更是要解开全部行组的全部行。差别不在「过滤」，在「压根没读那部分数据」。
+
+### 6. 跟 `index_demo.py` 的关系：两条路，同一个结论
+
+|  | `index_demo.py` | `parquet_meta_demo.py`（这个） |
+| --- | --- | --- |
+| 问的问题 | 要不要建 ART 索引 | 文件里到底写了什么元数据 |
+| 看数据的角度 | 查询结果 + EXPLAIN ANALYZE | `parquet_metadata()` 的原始输出 |
+| 剪枝的证据 | 「Row Groups Scanned」那一行 | `stats_min` / `stats_max` 本身 |
+| Polars 侧 | 用 is_in / 哈希 join 代替索引 | 只有一个 `use_statistics` 开关 |
+| 落点 | 排序落盘 = 免费索引 | zonemap 就是那个「免费索引」本体 |
+
+**两条路是同一个工程动作的两面**：
+
+- `index_demo.py` 说：「排好序落盘，就不需要索引」；
+- 这个 demo 说：「排好序落盘，每个行组的 min/max 就互不重叠，查询时能整组跳过」。
+
+同一件事：**排好序**。一个从「要不要建索引」看，一个从「索引到底长什么样」看。
+
+**两条路的成本差别**：
+
+- **ART 索引**：要额外占磁盘，写入要维护（写放大），而且只对 DuckDB 有效 —— 索引存在 `.duckdb` 文件里，parquet 文件本身还是那个 parquet；
+- **zonemap**：**写文件的时候就免费带上了**，零额外成本，任何引擎读 parquet 都能用 —— 这就是它比索引强的地方。
+
+> 所以顺序永远是：**先排好序落盘（免费），不够再考虑索引（要钱）。**
+
+顺带说一句：`index_demo` / `parquet_meta_demo` / `partition_demo` 讲的其实是同一件事的三个面 —— **「让数据物理上挨在一起」，比在逻辑上建结构更划算。**
+
 ## 目录结构
 
 ```
@@ -5751,7 +6250,8 @@ duckdb-polars-demo/
 │   ├── csv_demo/                         # csv_demo.py：CSV 样本与产物
 │   ├── tz_demo/                          # tz_demo.py：两边各写一份时间戳
 │   ├── bounds_demo/                      # bounds_demo.py：上界值与正常值的 parquet
-│   └── compress_demo/                    # compress_demo.py：压缩参数 / 行组大小的产物
+│   ├── compress_demo/                    # compress_demo.py：压缩参数 / 行组大小的产物
+│   └── parquet_meta/                     # parquet_meta_demo.py：排好序 / 打乱两份同内容 parquet
 ├── src/
 │   ├── common.py           # 唯一事实来源：口径常量 + 结果等价性校验 + 终端排版
 │   ├── gen_data.py         # 造数
@@ -5805,6 +6305,9 @@ duckdb-polars-demo/
 │   ├── fts_demo.py         # 全文本搜索：fts 扩展 vs Polars 硬扫
 │   ├── bounds_demo.py      # 时间戳与日期的边界：值域上界 / 越界报错 / 静默降级
 │   ├── collation_demo.py   # 排序规则与中文排序：COLLATE / ICU / Polars 的码点序
+│   ├── math_demo.py        # 数学函数语义：log 的底数 / ln / 浮点精度 / NaN 与 inf
+│   ├── similarity_demo.py  # 字符串相似度：编辑距离 / Jaro / Jaccard，DuckDB 有 Polars 没有
+│   ├── parquet_meta_demo.py # Parquet 元数据内省：zonemap 与行组裁剪
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
