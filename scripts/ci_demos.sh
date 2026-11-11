@@ -37,6 +37,40 @@ if [ ! -d .venv ]; then
   echo
 fi
 
+# ---------------------------------------------------------------- 毫秒计时
+#
+# 有几个 demo 跑起来不到一秒 —— 用秒（`date +%s`）去量，它们全都是 0，
+# 看不出「快」和「更快」的区别，也看不出有没有卡住。所以这里量到毫秒。
+#
+# 为什么不用 `date +%s%3N`：那是 GNU date 的写法，macOS 的 BSD date 不认
+# `%3N`，会原样打印 "%3N"。按可用性依次退：
+#   bash 5 的 EPOCHREALTIME → Python（两个平台都有）→ 秒级 date（精度没了）
+PY_BIN=""
+for cand in "$ROOT/.venv/bin/python" python3; do
+  if command -v "$cand" >/dev/null 2>&1; then
+    PY_BIN="$cand"
+    break
+  fi
+done
+
+now_ms() {
+  if [ -n "${EPOCHREALTIME:-}" ]; then
+    # bash 5.0+：EPOCHREALTIME 形如 "1762834567.123456"。
+    # 注意它**每次被引用都会重新取一次当前时间**，所以要先存下来再用 ——
+    # 分两次引用有可能正好跨过一秒，秒和微秒就来自两个不同的时刻了。
+    local t="${EPOCHREALTIME}"
+    local sec="${t%.*}" usec="${t#*.}"
+    printf '%s%03d\n' "$sec" "$(( 10#$usec / 1000 ))"
+    return
+  fi
+  if [ -n "$PY_BIN" ]; then
+    "$PY_BIN" -c 'import time; print(int(time.time() * 1000))'
+    return
+  fi
+  # 最后的兜底：只有秒级精度
+  printf '%s\n' "$(( $(date +%s) * 1000 ))"
+}
+
 # 每个 demo 的规模开关不一样，这里一一对应。
 # 格式：脚本名|传给它的参数（空 = 用它自己的默认值）
 # 不在表里的 demo 一律不跑 —— 刻意不写成「遍历 src/*.py」：
@@ -115,7 +149,9 @@ fi
 
 failed=0
 total=0
-: > "$OUT/summary.tsv"
+{
+  printf 'demo\tstatus\tduration_ms\texit_code\n'
+} > "$OUT/summary.tsv"
 
 echo "### 规模：--rows $ROWS · --repeat $REPEAT · 输出目录 $OUT"
 echo
@@ -131,12 +167,12 @@ for entry in "${DEMOS[@]}"; do
   fi
 
   total=$((total + 1))
-  t0=$(date +%s)
+  t0=$(now_ms)
   # shellcheck disable=SC2086
   uv run --no-sync python "$script" $args > "$OUT/${name}.out" 2>&1
   rc=$?
-  t1=$(date +%s)
-  dur=$((t1 - t0))
+  t1=$(now_ms)
+  dur_ms=$((t1 - t0))
 
   if [ "$rc" -eq 0 ]; then
     status="✅"
@@ -145,8 +181,8 @@ for entry in "${DEMOS[@]}"; do
     failed=$((failed + 1))
   fi
 
-  printf '%s\t%s\t%s\t%s\n' "$name" "$status" "$dur" "$rc" >> "$OUT/summary.tsv"
-  printf '%-2s %-18s %5ss  (exit=%s)  -> %s\n' "$status" "$name" "$dur" "$rc" "$OUT/${name}.out"
+  printf '%s\t%s\t%s\t%s\n' "$name" "$status" "$dur_ms" "$rc" >> "$OUT/summary.tsv"
+  printf '%-2s %-18s %7s  (exit=%s)  -> %s\n' "$status" "$name" "${dur_ms}ms" "$rc" "$OUT/${name}.out"
 done
 
 # ---------------------------------------------------------------- 汇总表
@@ -160,9 +196,11 @@ done
 {
   echo "## Demo 运行汇总"
   echo
-  echo "| demo | 结果 | 用时 | 逐值对账结论 |"
+  echo "| demo | 结果 | 用时 (ms) | 逐值对账结论 |"
   echo "| --- | --- | --- | --- |"
-  while IFS=$'\t' read -r name status dur rc; do
+  while IFS=$'\t' read -r name status dur_ms rc; do
+    # 第一行是表头，跳过
+    [ "$name" = "demo" ] && continue
     # -e 而不是直接给模式：模式以 - 开头时会被当成选项（GNU grep 和 ugrep 都会）
     verdicts=$(grep -h -e '✅' -e '❌' "$OUT/${name}.out" 2>/dev/null \
       | grep -E -e '一致|等价|对账|相同|相等' \
@@ -172,10 +210,17 @@ done
       | awk 'NR>1 {printf " <br> "} {printf "%s", $0}')
     [ -n "$verdicts" ] || verdicts="—"
     # shellcheck disable=SC2016  # 反引号是 Markdown 的代码标记，不是命令替换
-    printf '| `%s` | %s | %ss | %s |\n' "$name" "$status" "$dur" "$verdicts"
+    printf '| `%s` | %s | %s | %s |\n' "$name" "$status" "$dur_ms" "$verdicts"
   done < "$OUT/summary.tsv"
   echo
   echo "**$((total - failed))/$total 个 demo 通过**（退出码为 0）。完整的输出在 artifact 里。"
+  echo
+  # shellcheck disable=SC2016  # 反引号是 Markdown 的代码标记，不是命令替换
+  # 单引号：写成双引号的话 `uv run` 会被当成命令替换，真的把 uv 的帮助文本跑出来
+  echo '> 「用时」是毫秒，量的是 `uv run` 从拉起到进程退出的**整段墙钟时间** ——'
+  echo "> 每个 demo 都要先付一份固定开销（启动 Python + import polars/duckdb，本机实测约 250ms），"
+  echo "> 所以「不到 300ms」的那些基本上只付了这份开销，还没开始跑业务逻辑。"
+  echo "> 跨平台比大小没意义（runner 的核数、磁盘都不一样），看趋势就好。"
   echo
   echo "> 「逐值对账结论」里的 ❌ **不一定是失败** —— 有些是 demo 故意演示的语义差异"
   echo ">（比如「❌ 直接对账会挂」「❌ 不一致 —— Polars 丢了前导零」）。"

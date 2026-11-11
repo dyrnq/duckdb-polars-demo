@@ -47,8 +47,12 @@ LIMIT_LADDER = (10, 20, 30, 40, 50, 60, 80, 100)
 # 峰值读的是 /proc/self/status 的 VmHWM（**当前地址空间**的峰值）。
 # 别用 resource.getrusage 的 ru_maxrss：Linux 上子进程 fork 之后会**继承**
 # 父进程的 ru_maxrss，父进程之前占过多少，子进程就报多少 —— 测出来会是一排相同的数。
-# （macOS 没有 /proc，那边用 posix_spawn 起子进程、不存在这个继承问题，
-#   所以回退到 ru_maxrss 是安全的 —— 注意那边 ru_maxrss 的单位是**字节**。）
+# （macOS 没有 /proc，只能回退到 ru_maxrss —— 注意那边单位是**字节**。
+#   那边不会继承：XNU 的 ru_maxrss 取自每个 task 自己的 phys_mem 账本的 lifetime max，
+#   账本是 task 级别的、fork 时从零开始；fork 共享的那部分页记在 tkm_shared 上，
+#   不进 phys_mem，所以读到的确实是子进程自己的峰值。
+#   注意这跟「macOS 用 posix_spawn」无关 —— CPython 在 macOS 上默认还是 fork+exec：
+#   macOS 没有 POSIX_SPAWN_CLOSEFROM，close_fds=True 时 posix_spawn 那条路走不通。）
 #
 # 最后一个参数是 temp_directory：DuckDB 默认的临时目录是 `.tmp`（相对于当前工作目录），
 # 不指走的话它会往仓库根目录里写东西。
@@ -111,7 +115,8 @@ try:
             if line.startswith("VmHWM:"):
                 peak_mb = int(line.split()[1]) / 1024
 except OSError:
-    # macOS 没有 /proc：退回 ru_maxrss（那边不存在「子进程继承父进程峰值」的问题）
+    # macOS 没有 /proc：退回 ru_maxrss（那边 ru_maxrss 是每个 task 自己的账本，
+    # 不会像 Linux 那样继承父进程的峰值）
     import resource
 
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -602,9 +607,13 @@ def scenario_who_controls_memory(src: Path, spill: Path, limit_mb: int) -> None:
 
     print(f"数据：parquet {src.stat().st_size / 1e6:.1f} MB")
     print("测法：每个实现单独起一个子进程，跑同一个聚合，")
-    print("      用 /proc/self/status 的 VmHWM（当前地址空间的内存峰值）报它自己占了多少。")
-    print("      （不能用 ru_maxrss：Linux 上它会被子进程从父进程继承，测出来会一排相同；")
-    print("        macOS 没有 /proc，那边才退回 ru_maxrss。）")
+    if sys.platform == "darwin":
+        # 别在 macOS 上谎称读的是 /proc —— 那边根本没有这个文件
+        print("      用 resource.getrusage 的 ru_maxrss 报它自己占了多少（macOS 没有 /proc）。")
+    else:
+        print("      用 /proc/self/status 的 VmHWM（当前地址空间的内存峰值）报它自己占了多少。")
+    print("      （Linux 上不能用 ru_maxrss：它会被子进程从父进程继承，测出来会一排相同；")
+    print("        macOS 那边不继承 —— 它的 ru_maxrss 来自每个 task 自己的账本。）")
 
     _, base_duck, _ = peak_rss("base-duckdb", str(src), "-", GROUPS, str(spill))
     _, base_polars, _ = peak_rss("base-polars", str(src), "-", GROUPS, str(spill))
