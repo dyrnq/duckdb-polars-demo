@@ -87,6 +87,8 @@ uv run python src/parquet_meta_demo.py # Parquet 元数据内省 + 行组裁剪�
 uv run python src/concurrency_demo.py  # 并发 / 锁 / 多进程：DuckDB 单写者模型 vs Polars 只剩文件
 uv run python src/attach_demo.py       # ATTACH 多库 + catalog 内省：DuckDB 有「库」，Polars 只有文件
 uv run python src/ranking_demo.py      # 排名函数全家桶：9 个函数逐个对账，4 种结局
+uv run python src/object_demo.py       # 数据库对象：生成列、注释、临时表 —— 引擎保管 vs 靠自觉
+uv run python src/config_demo.py       # 调引擎与改配置：表函数、CALL、连接级 vs 进程级设置
 uv run python src/materialize_demo.py  # 结果物化方式的代价：把数据拿出引擎的几条通道
 ```
 
@@ -119,7 +121,7 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `tz_demo.py` | 日期时间与时区：精度、会话时区、夏令时、Parquet 往返 |
 | `order_demo.py` | 排序稳定性：NULL/NaN 位置、并列顺序不确定、LIMIT 会取到不同的行 |
 | `partition_demo.py` | 多文件与分区表：glob 读法、schema 冲突、分区裁剪、分区写 |
-| `window_demo.py` | 窗口函数：默认 frame 是 RANGE 还是 ROWS、frame 家族、命名窗口、QUALIFY、LAG/LEAD |
+| `window_demo.py` | 窗口函数 + 排名全家桶：默认 frame 是 RANGE 还是 ROWS、frame 家族、命名窗口、QUALIFY、LAG/LEAD，以及 9 个排名函数逐个对账 |
 | `agg_demo.py` | 聚合函数语义：分位数插值、众数、arg_max 并列、字符串聚合顺序、整数求和溢出 |
 | `setop_demo.py` | 集合运算与去重：EXCEPT/INTERSECT 里的 NULL、UNION、去重保留哪一行 |
 | `regex_demo.py` | 正则与字符串：分组编号、整串 vs 子串、替换、切分、位置、中文与 Emoji 的字节/字符 |
@@ -156,6 +158,8 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `concurrency_demo.py` | 并发 / 锁 / 多进程：文件锁、只读连接插队、WAL 崩溃恢复、MVCC、Polars 静默丢数据 |
 | `attach_demo.py` | ATTACH 多库 + 跨库 join + catalog 内省：DuckDB 有「库」和元数据，Polars 只有文件 |
 | `ranking_demo.py` | 排名函数全家桶：DuckDB 9 个 vs Polars 对齐 4 个 / 手搓 3 个 / 语义不同 1 个 / 没有 1 个 |
+| `object_demo.py` | 数据库对象：生成列（引擎强制 vs 靠自觉、不落盘）、注释（能挂什么、存不存）、临时表（会话级、不落盘） |
+| `config_demo.py` | 调引擎与改配置：表函数与 `CALL`、Polars 自带的 SQL（方言小得多）、连接级 `SET` vs 进程级环境变量 |
 | `materialize_demo.py` | 结果物化方式的代价：Arrow / numpy / 元组 / 字典几条通道，代价差一个数量级，语义还不一样 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
@@ -209,6 +213,8 @@ uv run python src/similarity_demo.py --pairs 20000 --repeat 5
 uv run python src/parquet_meta_demo.py --rows 1000000 --repeat 5
 uv run python src/concurrency_demo.py --hold 3    # 持锁进程待多久（秒）
 uv run python src/ranking_demo.py --rows 2000000 --repeat 5
+uv run python src/object_demo.py --rows 2000000 --repeat 5
+uv run python src/config_demo.py --rows 2000000 --repeat 5
 uv run python src/materialize_demo.py --rows 2000000 --repeat 5
 ```
 
@@ -242,7 +248,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，58 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，60 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -585,6 +591,21 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 242 | Arrow 里的字符串类型 | `string`（32 位偏移） | `large_string`（64 位偏移） | 写同一个 Arrow 文件给第三方读，得留意对方认不认 |
 | 243 | pandas 通道报错 | `InvalidInputException`，说清了「该去装 pandas」 | `ModuleNotFoundError`，原因藏在异常链里 | 按异常类型 catch 的代码要改 |
 | 244 | `con.execute(sql).to_arrow_table()` | **多拷一份**（DuckDB 自己会警告） | —— | 写 `con.sql(sql).to_arrow_table()` |
+| 245 | `rank()` 的并列口径 | 按**排序键整体**数名次：`ORDER BY x, ord` 里 `(x, ord)` 是一个键，并列打破后**不算并列** | 按**被排名的值**数名次：值相同就并列同名次 | 排序键**只有一列**时两边一致；加了唯一 tiebreaker 就分叉 —— 最常见的做法恰好会踩上 |
+| 246 | 生成列 | `GENERATED ALWAYS AS (...)`，引擎强制：插入不给值、更新自动重算 | ❌ 没有，只能 `with_columns` 自己算 | 不变量由谁负责：DuckDB 引擎保证，Polars 靠自觉（改基列派生列不跟着变，也不报错） |
+| 247 | 生成列存不存 | **不存**，`PRAGMA storage_info` 里连一个 segment 都没有，读时现算 | 存不存由你决定 | 省空间、花 CPU —— 但实测多出来的是**每次查询的固定开销**（零点几毫秒），不是「每行多算一遍」 |
+| 248 | 生成列上的约束 | `CREATE INDEX` 允许，`ALTER COLUMN … SET NOT NULL` → `BinderException: Binder Error: Unsupported constraint for generated column!` | —— | 生成列不是普通列，别按普通列加约束 |
+| 249 | 注释（`COMMENT ON`） | 表 / 列 / 视图 / 索引都能挂，**schema 和库挂不上**（引擎回 not implemented） | ❌ 没有 | 注释是**可查询的元数据**（`duckdb_tables().comment`），Polars 没有 catalog 可查 |
+| 250 | 注释的持久性 | **写进 .duckdb 文件**，重开连接还在 | 没有这层 | 数据字典写在库里比维护一张 README 表可靠 |
+| 251 | 临时表 | `CREATE TEMP TABLE`：住在 `temp` 库、**不落盘**、别的连接看不见 | 最接近的是 `pl.SQLContext` 里的表（跟着那个 Python 对象活） | 中间结果用临时表；Polars 侧就写成个 Python 变量 |
+| 252 | 表函数（`FROM` 位置） | `FROM range(3)` / `generate_series` / `unnest` / `glob` / `read_csv` / `duckdb_tables()` 等，输入零行直接产出一张表 | 有对应函数（`pl.int_range` / `explode` / `scan_csv`），但**不能出现在 FROM 位置** | DuckDB 的表函数能进 FROM、能被规划器当成一张表；Polars 侧是表达式 |
+| 253 | `CALL` | 有：`CALL range(3)` / `CALL pragma_version()`；不存在时报 **CatalogException**（表函数不存在），不是语法错误 | ❌ 没有 `CALL` 这个语句 | `CALL` 和 `FROM` 是同一个函数的两种位置，走的是同一条 catalog 解析路 |
+| 254 | Polars 的 SQL | —— | `pl.SQLContext` 里 `create table` 是**真建表**；全局 `pl.sql()` **每次都是新上下文**（建完就丢） | 想让表活下来必须自己攥着 `SQLContext`；`pl.sql()` 只当「跑个 SELECT」用 |
+| 255 | SQL 方言 | 完整方言 | 小得多：`insert` 不支持（"statement type is not supported"）、`current_setting` 不支持、`pragma` 不认、`describe select 1` 给的是逻辑计划 | 「Polars 支持 SQL」只在「能跑 SELECT」这个层面成立 |
+| 256 | 配置的作用域 | **连接级**：`SET threads=2` 只影响这个连接（另一个连接还是默认值），`RESET` 能还原 | **进程级**：环境变量，整个进程共享 | 一个进程要跑多套配置 → DuckDB 开两个连接，Polars 只能起两个进程 |
+| 257 | 配置什么时候能改 | 运行时随时改 | **只能启动时**（运行中改 `os.environ` 对 `pl.thread_pool_size()` 纹丝不动） | Polars 这条要写进部署脚本 —— 改完得重启进程 |
+| 258 | 配置能不能读回 | 能：`current_setting()` 能读，`duckdb_settings()` 能列全部 **170 个** | 只有 `pl.thread_pool_size()`；`pl.Config` 的 25 个 setter 全是**表格打印格式**，跟执行无关 | Polars 没有「读回当前配置」这个概念 |
+| 259 | 设置值的校验 | 不认识的名字报 CatalogException；但**上界不校验** —— `threads=999` 照单全收 | —— | 别指望引擎替你拦下离谱的值 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那次拷贝会让基准测试不公平地惩罚 DuckDB。
 
@@ -611,8 +632,12 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 201~203 条在 `Parquet 元数据内省与行组裁剪` 里展开；
 第 204~214 条在 `并发、锁与多进程访问：DuckDB 拒绝，Polars 不设防`、
 第 215~226 条在 `ATTACH 与 catalog 内省：DuckDB 有「库」，Polars 只有「文件」` 里展开；
-第 227~235 条在 `排名函数全家桶：DuckDB 有 9 个，Polars 直接对齐 4 个`、
-第 236~244 条在 `结果物化方式的代价：把数据拿出引擎的几条通道` 里展开。
+第 227~235 条在 `排名函数全家桶：DuckDB 有 9 个，Polars 直接对齐 4 个` 里展开、
+第 236~244 条在 `结果物化方式的代价：把数据拿出引擎的几条通道` 里展开；
+第 245 条（rank 的并列口径）在 `窗口函数` 和 `排名函数全家桶` 两节里都展开，
+第 246~251 条（生成列 / 注释 / 临时表）在 `数据库对象：生成列、注释、临时表` 里、
+第 252~255 条（表函数 / CALL / Polars 的 SQL）在 `调引擎与改配置：表函数、CALL、会话设置` 里、
+第 256~259 条（配置的作用域 / 时机 / 读回 / 校验）同样在 `调引擎与改配置` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -1965,8 +1990,30 @@ DuckDB 的 `WINDOW w AS (PARTITION BY g ORDER BY x, ord)` 把「分区 + 排序�
 Polars 没有命名窗口 —— 想共用就得把 `over('g', order_by=[...])` 抄两遍，
 改口径时很容易只改一处，然后两边悄悄对不上了。
 
-顺带对齐一下 rank：SQL 的 `rank()` 是「并列同名次、后面跳号」（= RANK），Polars 对应 `rank('min')`；
-`rank('ordinal')` 是「每行一个号」，对应 `row_number()`。
+**这个场景里累计和对上了、名次没对上**，原因是并列口径：
+
+| | 实测结果（`g='a'`，`x` = 1,2,2,3） |
+| --- | --- |
+| 累计和 DuckDB / Polars | `[10.0, 30.0, 60.0, 100.0]` / 同上 ✅ |
+| 名次 DuckDB | `[1, 2, 3, 4]` |
+| 名次 Polars | `[1, 2, 2, 4]` ❌ |
+
+- DuckDB 的 `rank()` 是**按排序键整体数名次**：`ORDER BY x, ord` 里 `(x, ord)` 是**一个**排序键，
+  `x` 相同但 `ord` 不同的两行**不算并列**，所以名次是 1,2,3,4；
+- Polars 的 `rank('min')` 是**按被排名的那个值**算名次：`x=2` 的两行并列同名次 → 1,2,2,4。
+
+也就是说：**DuckDB 的 rank 是「行序的名次」，Polars 的 rank 是「值的名次」。**
+排序键只有一列时两者一致，加了并列打破键就分叉 —— 而「加个唯一 tiebreaker」恰恰是最常见的做法。
+
+三种 rank 口径的对照：
+
+| SQL | 含义 | Polars |
+| --- | --- | --- |
+| `row_number()` | 每行一个号 | `cum_count().over(...)` |
+| `rank()` | 并列同名次，后面**跳号** | `rank('min').over(...)` |
+| `dense_rank()` | 并列同名次，**不跳号** | `rank('dense').over(...)` |
+
+Polars 的 `rank()` **默认值是 `average`**（并列取平均名次），DuckDB 没有对应函数 —— 别用默认值。
 
 ### 5. QUALIFY
 
@@ -2009,7 +2056,8 @@ Polars shift(1) 不加 over： [None, 1, 2, 2, 3, 2, 2]
 | Polars | **31.8** | 29.4 |
 
 Polars 快 **3.23×**。口径：输入已物化（Parquet 落盘、DuckDB 建表、Polars 读进内存），
-计时的只有「窗口计算 + 结果物化」这一段。窗口函数贵的主因是排序：分区越大，要排的键越多。
+计时的只有「窗口计算 + 结果物化」这一段；两边**交错**跑（避免「谁先跑谁吃亏」）。
+窗口函数贵的主因是排序：分区越大，要排的键越多。
 
 ## 聚合函数语义
 
@@ -4311,6 +4359,386 @@ DuckDB 的物化表存在 `.duckdb` 文件里、Polars 的物化写在 parquet �
 - DuckDB 2.0 没有 `CREATE MATERIALIZED VIEW` 这条命令，
   但上面这四行数字说明：**这件事你本来就得自己做** ——
   在别的数据库里你靠一条 DDL 声明，在 DuckDB 里你靠一张真表。
+
+## 数据库对象：生成列、注释、临时表
+
+`src/object_demo.py`。`attach_demo.py` 讲了 catalog（有哪些库、怎么跨库查），
+`ddl_demo.py` 讲了 DDL 语法。这一层还有个东西没单独讲过：
+**CREATE 出来的东西本身带哪些属性、由谁保证、活多久**。
+
+### 1. 生成列：引擎强制的派生列
+
+DuckDB 的 `y INTEGER GENERATED ALWAYS AS (x * 2)`：
+
+```sql
+CREATE TABLE gen (x INTEGER, y INTEGER GENERATED ALWAYS AS (x * 2));
+```
+
+| 操作 | DuckDB 实测 |
+| --- | --- |
+| `INSERT INTO gen (x) VALUES (5)` | `[(5, 10)]` —— 只给基列，生成列自动算 |
+| `INSERT INTO gen VALUES (9, 99)` | ❌ `BinderException: table "gen" has 1 columns but 2 values were supplied` |
+| `UPDATE gen SET x = 7` | `[(7, 14)]` —— **自动重算** |
+
+引擎自己也记着这列是「生成的」（`duckdb_columns()` 里查得到）：
+
+| 列 | 类型 | `is_generated` | `generation_expression` |
+| --- | --- | --- | --- |
+| `x` | INTEGER | False | NULL |
+| `y` | INTEGER | **True** | `CAST((x * 2) AS INTEGER)` |
+
+Polars 侧只有 `with_columns`，那是**你自己**算的：
+
+```
+with_columns(x * 2)          -> [{'x': 1, 'y': 2}, {'x': 2, 'y': 4}, {'x': 3, 'y': 6}]
+之后改基列 x = x + 10         -> [{'x': 11, 'y': 2}, {'x': 12, 'y': 4}, {'x': 13, 'y': 6}]
+```
+
+→ `x` 变成 11/12/13，`y` 还是 2/4/6 —— **不重算，也不报错**。
+
+Polars 命名空间里跟生成列有关的东西是**零**（`pl` 顶层和 `pl.Expr` 里含 `generat` 的符号都是空）。
+
+> 这不是「谁功能多」的问题，是**不变量由谁负责**的问题：
+> DuckDB 拦得住你（插不进去、改了自动重算），Polars 拦不住 —— 派生列过期了还不报错。
+
+### 2. 生成列存在哪：不落盘，读的时候现算
+
+`PRAGMA storage_info('gen2')` 看这张表在磁盘上到底存了什么：
+
+| 列 | 落盘的段类型 | 段数 | 是不是生成列 |
+| --- | --- | --- | --- |
+| `x` | INTEGER, VALIDITY | 23 | 否 |
+| `y` | **（一个段都没有）** | 0 | **是** |
+
+→ 生成列**连一个 segment 都没有** —— 它不是存出来的，是每次读的时候按 `x * 2` 现算的。
+
+约束也不能随便加：
+
+| 语句 | 实测 |
+| --- | --- |
+| `CREATE INDEX idx_gen2 ON gen2(y)` | 允许 |
+| `ALTER TABLE gen2 ALTER COLUMN y SET NOT NULL` | ❌ `BinderException: Binder Error: Unsupported constraint for generated column!` |
+
+代价实测（两张表行数、列类型都一样，只差「`y` 是存出来的还是现算的」；
+计时只包住 `SELECT sum(y)` 这一句，两边**交错**跑）：
+
+| 行数 | 普通列（存好的） | 生成列（现算的） | 中位比值 | 最小比值 |
+| --- | --- | --- | --- | --- |
+| 200,000 | 0.520 / 0.510 ms | 0.624 / 0.619 ms | 1.20× | 1.21× |
+| 1,000,000 | 0.680 / 0.633 ms | 0.803 / 0.778 ms | 1.18× | 1.23× |
+| 2,000,000 | 0.885 / 0.870 ms | 1.058 / 0.959 ms | 1.20× | 1.10× |
+
+（每格是「中位数 / 最小值」，毫秒）
+
+- 三档的**绝对差**（生成列多花的 CPU）：0.104 / 0.122 / 0.173 ms，
+  折算成每行：0.52 / 0.12 / 0.09 ns；
+- 比值三档都落在 **1.18×~1.20×** —— 生成列**确实慢一截**，而且**没有随行数变差**；
+- 行数翻了 10×，多出来的时间只从 0.104 ms 变到 0.173 ms ——
+  说明多出来的是**每次查询的固定开销**，不是每行都要付的 CPU。
+
+> 口径：这个 demo 全程跑在**内存库**上（`duckdb.connect()` 不给路径），
+> 所以量到的是 CPU + 内存带宽，**没有磁盘 I/O** —— 落盘场景的代价要另算，
+> 别把这个数字当「从磁盘读」的数字。
+
+> **空间省了，CPU 花了 —— 但花的不是「每行多算一遍」那种钱。**
+> 多出来的是**每次查询的固定开销**（零点几毫秒），行数翻十倍它基本不动。
+> 真正要算账的是**读得比写得多**的场景：每扫一遍就多付一遍。
+>
+> 生成列适合「派生规则稳定、读得少」的列；
+> 要是这张表被反复扫，存的还是算的，得自己拿这个数算账。
+
+### 3. COMMENT ON：挂在对象上的注释
+
+能注释哪些对象？逐个试：
+
+| 对象 | 实测 |
+| --- | --- |
+| 表 | 允许 |
+| 列 | 允许 |
+| 视图 | 允许 |
+| 索引 | 允许 |
+| **schema** | ❌ `NotImplementedException: Not implemented Error: Adding comments to schemas is not implemented` |
+| **库（DATABASE）** | ❌ `NotImplementedException: Not implemented Error: Adding comments to databases is not implemented` |
+
+→ 表 / 列 / 视图 / 索引能挂；**schema 和库挂不上**，引擎自己回「not implemented」——
+注释这一层也是半截的。
+
+注释存到哪去了 —— `duckdb_tables()` / `duckdb_columns()` / `duckdb_views()` 都带 `comment` 列，
+**注释是「可查询的元数据」，不是塞在旁边的备注**：
+
+| 对象 | `comment` |
+| --- | --- |
+| 表 `t1` | 订单表 |
+| 列 `t1.a` | 主键 |
+| 列 `t1.b` | NULL |
+| 视图 `v1` | 一个视图 |
+
+**注释会不会写进 .duckdb 文件？** 会。往 `.duckdb` 文件里写一张带注释的表，关掉连接、重开：
+
+```
+重开连接后读回来：[('写进文件了吗',)]
+```
+
+→ **写进文件了** —— 注释跟着数据一起持久化，重开还在。
+
+Polars 侧：`pl.DataFrame` 没有 `comment` 属性，`pl` 顶层和 `pl.Expr` 里含 `comment` 的符号都是空。
+DataFrame 是内存里的一个**值**，没有「对象元数据」这一层。
+
+### 4. TEMP TABLE：会话级的对象
+
+临时表住在哪个库？
+
+| 库 | schema | 表 | `temporary` | `internal` |
+| --- | --- | --- | --- | --- |
+| `temp` | `main` | `tmp` | **true** | false |
+
+→ 它是个**正经的表对象**，能查、能 join、能建索引 —— 只是活在一个会话里。
+
+| 问题 | 实测 |
+| --- | --- |
+| 落盘吗？ | **不落盘** —— 重开连接后：持久表 1 行，临时表 **0 张** |
+| 别的连接看得见吗？ | **看不见** —— 另一个连接查 `duckdb_tables()`：0 张 |
+
+Polars 侧最接近的东西是 `pl.SQLContext`：
+
+```python
+ctx = pl.SQLContext()
+ctx.register("df", pl.DataFrame({"a": [1, 2]}))
+ctx.execute("create table t as select 1 as a")
+ctx.execute("show tables")   # -> [{'name': 'df'}, {'name': 't'}]
+```
+
+→ 表**活在一个 Python 对象里**：对象在，表就在；对象没了，表也没了。
+生命周期跟 DuckDB 的「连接」对上了，但作用域从「整个数据库」缩到了「一个对象」。
+
+但有个关键差别：DuckDB 的临时表**能被别的 SQL 语句看见**（能 join、能子查询）；
+Polars 的 `SQLContext` 表**只在你自己 execute 的那几句 SQL 里可见** —— 它不是全局注册表。
+
+### 5. 小结：对象这一层，谁有什么
+
+| 能力 | DuckDB | Polars |
+| --- | --- | --- |
+| 生成列（引擎强制） | 有：`GENERATED ALWAYS AS (...)` | ❌ 没有，只能 `with_columns` 自己算 |
+| 生成列的不变量 | 引擎保证：插入不给、更新自动重算 | 靠自觉：改基列派生列不跟着变 |
+| 生成列存不存 | **不存**，读时现算（有实测代价） | 存不存由你决定 |
+| 注释（表/列/视图/索引） | 有：`COMMENT ON ... IS '...'` | ❌ 没有 |
+| 注释（schema / 库） | ❌ 引擎说 not implemented | ❌ 没有 |
+| 注释存不存 | **写进 .duckdb 文件**，重开还在 | 没有这层 |
+| 临时表 | 有：`CREATE TEMP TABLE`，会话级 | 最接近的是 `pl.SQLContext` 里的表 |
+| 临时表落盘吗 | 不落盘 | 本来就没有「落盘」这回事 |
+| 对象元数据能查吗 | 能：`duckdb_tables()` 等带 `comment` 列 | 没有 catalog 可查 |
+
+**实务建议**：
+
+- 派生列的口径是业务规则 → 放 DuckDB 的生成列里，引擎帮你守住；
+  放 Polars 就得自己保证每次重算（或者干脆别派生）；
+- 数据字典（列是干什么的）→ DuckDB 的 `COMMENT ON` 写进文件，比在 README 里维护一张表可靠；
+- 中间结果别急着建表 → DuckDB 用 `CREATE TEMP TABLE`，不落盘、连接关了自动消失；
+  Polars 侧就写成个 Python 变量（LazyFrame 甚至可以不物化）。
+
+## 调引擎与改配置：表函数、CALL、会话设置
+
+`src/config_demo.py`。`object_demo.py` 讲了「CREATE 出来的东西」，这一层是**引擎本身怎么被调用、怎么被调**：
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 造数据 | `FROM range(10)` | `pl.select(pl.int_range(10))` |
+| 调引擎 | `CALL pragma_version()` | —— |
+| 写 SQL | `con.sql("select ...")` | `pl.sql("select ...")` |
+| 改配置 | `SET threads=2`（连接级） | `POLARS_MAX_THREADS=2`（进程级） |
+
+### 1. 表函数：不建表也能产生数据
+
+DuckDB 的表函数直接放在 `FROM` 后面：
+
+| 写法 | 实测结果 |
+| --- | --- |
+| `FROM range(3)` | `[(0,), (1,), (2,)]` |
+| `FROM generate_series(1, 5, 2)` | `[(1,), (3,), (5,)]` |
+| `FROM unnest([1, 2])` | `[(1,), (2,)]` |
+| `FROM query('select 42 as z')` | `[(42,)]` |
+| `FROM glob('*.csv')` | 文件名列表 |
+| `FROM read_csv('a.csv')` | 直接读文件 |
+| `FROM duckdb_tables()` | catalog 里的表 |
+
+→ 这些是**表函数**：不需要先建表，输入零行，直接产生一张表。
+`glob()` 给文件列表、`read_csv()` 直接读文件、`duckdb_tables()` 给 catalog。
+
+Polars 侧功能上大体对得上（造序列 / 拆数组 / 读文件），但**形态不一样**：
+
+| Polars 写法 | 实测结果 |
+| --- | --- |
+| `pl.select(pl.int_range(3))` | `[0, 1, 2]` |
+| `pl.col('a').explode()` | `[{'a': 1}, {'a': 2}]` |
+| `pl.scan_csv('a.csv').collect()` | `(2, 2)` |
+
+DuckDB 的表函数能进 `FROM`、能被规划器当成一张表；
+Polars 侧是表达式，**不能出现在 FROM 位置**。
+`pl.glob` 也不存在（DuckDB 有 `FROM glob('*.csv')`）。
+
+### 2. CALL：同一个表函数，放到语句位置
+
+| 语句 | 实测结果 |
+| --- | --- |
+| `CALL range(3)` | `[(0,), (1,), (2,)]` |
+| `CALL pragma_version()` | `[('v2.0.0', 'd54cbbe3df', 'Cyanoptera')]` |
+| `CALL unnest([1, 2])` | `[(1,), (2,)]` |
+| `CALL duckdb_tables()` | catalog 里的表 |
+| `CALL dbstat('t')` | ❌ `CatalogException: Catalog Error: Table Function with name dbstat does not exist!` |
+| `CALL no_such_function()` | ❌ `CatalogException: Catalog Error: Table Function with name no_such_function does not exist!` |
+| `CALL pragma_database_list()` | ❌ `CatalogException: Catalog Error: Table Function with name pragma_database_list does not exist!` |
+
+→ 报的是 **CatalogException**，说的是「表函数不存在」—— **不是「语法错误」**。
+说明 `CALL` 走的是 catalog 解析，跟 `FROM` 位置是同一条路。
+
+Polars 侧没有 `CALL` 这个语句，也没有「语句位置调表函数」这个概念 ——
+能调的东西都是 Python 函数（`pl.scan_csv` / `pl.read_parquet` / ...）。
+
+### 3. Polars 自带的 SQL：能写，但不是 DuckDB 的 SQL
+
+`pl.SQLContext` —— 表**真建得出来**：
+
+```
+ctx.execute('create table t as select 1 as x') -> [{'Response': 'CREATE TABLE t'}]
+ctx.execute('show tables')                     -> [{'name': 'df'}, {'name': 't'}]
+ctx.execute('select * from t')                 -> [{'x': 1}]
+```
+
+→ 这不是「回了个字符串」而已 —— 表建出来了，`show tables` 查得到。
+
+但全局 `pl.sql()` **每次都是新上下文**：
+
+```
+pl.sql('create table g ...') 之后再 pl.sql('select * from g')
+  -> SQLInterfaceError: relation 'g' was not found
+```
+
+→ 全局的 `pl.sql()` 是**一次性**的：每次调用都新建一个空上下文。
+想让表活下来，必须自己攥着一个 `SQLContext` 对象。
+
+方言也不一样 —— 逐个试 DuckDB 常见的写法：
+
+| 语句 | 实测 |
+| --- | --- |
+| `select 42` | OK `[{'literal': 42}]` |
+| `insert into t values (2)` | ❌ `SQLInterfaceError: statement type is not supported` |
+| `drop table t` | ❌ `SQLInterfaceError: table 't' does not exist` —— 上一步的表建在 `SQLContext` 里，全局 `pl.sql()` 看不见 |
+| `show tables` | OK，但返回 `[]` —— 全局上下文是空的 |
+| `select current_setting('threads')` | ❌ `SQLInterfaceError: unsupported function 'current_setting'` |
+| `pragma version` | ❌ `SQLInterfaceError: statement type is not supported` |
+| `describe select 1` | OK，但给的是**逻辑计划**（`{'Logical Plan': 'DF ["literal"]; PROJE…'}`），不是字段描述 |
+
+→ 所以「Polars 支持 SQL」这句话，只在「能跑 SELECT」这个层面成立。
+
+跟 DuckDB 的差别摆一起：
+
+| 维度 | DuckDB | Polars |
+| --- | --- | --- |
+| 表存在哪 | catalog 里，`duckdb_tables()` 查得到 | `SQLContext` 对象里，`show tables` 查得到 |
+| 生命周期 | 跟着连接 / 跟着数据库文件 | 跟着那个 Python 对象 |
+| 全局入口 | `con.sql()`，连接级 | `pl.sql()` 存在，但每次都是新上下文 |
+| DML | insert / update / delete 都支持 | 只支持 select / create table |
+| 系统函数 | 170 个设置 + 几百个函数 | 少很多，`current_setting` 就没有 |
+
+### 4. 配置：连接级 vs 进程级
+
+DuckDB 一共有 **170 个设置**，全部能列出来（`duckdb_settings()`）：
+
+| 名称 | 值 | 说明 |
+| --- | --- | --- |
+| `threads` | 8 | 设置查询执行时要使用的线程数量 |
+| `memory_limit` | 视机器而定（本机 100.3 GiB） | 内存使用量的软限制 |
+| `preserve_insertion_order` | true | 保留插入顺序（禁用流式查询） |
+| `default_null_order` | NULLS_LAST | NULL 值的默认排序顺序 |
+| `TimeZone` | 视机器而定（本机 Asia/Shanghai） | 当前时区 |
+
+`SET` 是**连接级**的：
+
+```
+本连接 SET threads=2 之后 current_setting('threads') -> 2
+另一个连接读到的是                                  -> 8
+RESET threads 之后 -> 8
+```
+
+→ 另一个连接**不受影响** —— 配置跟着连接走，不跟着进程走。`RESET` 还能还原回默认值。
+
+但校验很松：
+
+| 语句 | 实测 |
+| --- | --- |
+| `SET threads=999` | **接受**，当前设置里就写着 999（**上界不校验**） |
+| `SET threads=-5` | ❌ `SyntaxException: Syntax Error: Must have at least 1 thread!` |
+| `SET no_such_setting=1` | ❌ `CatalogException: Catalog Error: unrecognized configuration parameter "no_such_setting"` |
+
+Polars 侧：执行配置是**进程启动时**的环境变量。
+
+```
+改之前 pl.thread_pool_size() -> 8
+运行中改 os.environ['POLARS_MAX_THREADS'] = '2'
+改之后 pl.thread_pool_size() -> 8        ← 纹丝不动
+换个进程、启动时就设上：子进程输出 -> 2
+```
+
+→ **启动前设才有效。** 这是两种完全不同的配置模型：
+DuckDB 连接级（运行时可改、可读回、可还原），
+Polars 进程级（启动时定死，运行时改不动，也读不回配置本身）。
+
+Polars 的 `pl.Config` 呢？它有 **25 个 setter**，全是这一类：
+`set_tbl_formatting` / `set_tbl_rows` / `set_tbl_width_chars` / `set_tbl_cell_padding` /
+`set_tbl_hide_column_data` / `set_tbl_hide_dtype` / `set_tbl_hide_header` / `set_tbl_hide_index` /
+`set_tbl_hide_row_count` / `set_tbl_width_chars` / `set_fmt_str_lengths` / `set_tbl_precision` /
+`set_tbl_float_precision` / `set_tbl_round_decimals` / `set_tbl_auto_num_to_ljust` /
+`set_tbl_auto_str_to_ljust` / `set_tbl_align_header` / `set_tbl_column_header_align` /
+`set_tbl_dataframe_shape` / `set_tbl_total_rows` / `set_tbl_convert_string` / `set_effective_color` /
+`set_tbl_footnote` / `set_tbl_styles` / `set_tbl_dataframe_shape`。
+
+→ 全是**表格打印格式**（列宽、小数位、对齐方式……），跟执行性能没关系。
+真正管执行的那个（线程数）藏在环境变量里，而且没有对应的「读回当前配置」接口 ——
+唯一的窗口是 `pl.thread_pool_size()`。
+
+`pl.current_setting` / `pl.pragma` / `pl.set_config` 也都不存在。
+
+设置 threads 到底有没有用？拿一个能并行的聚合试试（20 万行，97 个分组，**交错**跑 3 轮）：
+
+| 线程数 | 中位数 | 最小值 |
+| --- | --- | --- |
+| `threads=1` | 1.92 ms | 1.84 ms |
+| `threads=8` | 1.47 ms | 1.40 ms |
+
+比值 **1.31×** —— 设置是**真的生效**的，不是摆设；
+只是 DuckDB 把它做成了连接级的开关，
+Polars 那边的对应物在环境变量里、而且只能在启动时定。
+
+### 5. 小结：调引擎与改配置，谁有什么
+
+| 能力 | DuckDB | Polars |
+| --- | --- | --- |
+| 表函数（FROM 位置） | 有：`range` / `generate_series` 等 | 有对应函数，但不是表函数 |
+| 表函数（CALL 位置） | 有：`CALL range(3)` | ❌ 没有 `CALL` 概念 |
+| 自己写 SQL | `con.sql(...)`，完整方言 | `pl.sql()`，**方言小得多** |
+| SQL 里建表 | 建在 catalog 里，别的语句能看见 | `SQLContext` 里能建；全局建完就丢 |
+| SQL 里 INSERT | 支持 | ❌ "statement type is not supported" |
+| 系统函数 / 设置 | 几百个函数 + 170 个设置 | 少很多，`current_setting` 就没有 |
+| 配置的作用域 | **连接级**：别的连接不受影响 | **进程级**：整个进程共享 |
+| 配置什么时候能改 | 运行时随时改，`RESET` 能还原 | **只能启动时**（环境变量） |
+| 配置能不能读回 | 能：`current_setting()` 能读 | 只有 `pl.thread_pool_size()` |
+
+三个必须记住的实测结论：
+
+1. **表函数是「零行输入的表」。** `FROM` 位置和 `CALL` 位置是同一个函数的两种用法，
+   引擎报的是 `CatalogException`（表函数不存在），不是语法错误。
+2. **Polars 也有 SQL，但不是 DuckDB 的 SQL。** `SQLContext` 里 `create table` 是真建表；
+   但全局 `pl.sql()` 每次都是新上下文，建完就丢；`insert` 不支持、`current_setting` 不支持。
+3. **配置的作用域和时机都不一样。** DuckDB 连接级（运行时可改、可读回、可 `RESET`）；
+   Polars 进程级（环境变量，**启动时定死**）。这一条在「一个进程要跑多个不同配置的查询」时最要命 ——
+   DuckDB 开两个连接就行，Polars 只能起两个进程。
+
+**实务建议**：
+
+- 造序列、拆数组、读文件 → DuckDB 写成 `FROM range(...)` 一行；
+  Polars 侧写成表达式，注意它不能出现在 FROM 位置；
+- 要写 SQL 逻辑 → DuckDB 侧是完整方言；Polars 侧的 `pl.sql()` 只当「跑个 SELECT」用，别指望它有 catalog；
+- 要按连接调参 → DuckDB 的 `SET`；Polars 侧只能改环境变量**并重启进程** —— 这条要写进部署脚本里。
 
 ## 内存上限与落盘
 
@@ -6671,6 +7099,22 @@ a 组 = `[10, 20, 20, 30]`，b 组 = `[5, 5, 40, 40]`。
 对应的是 SQL 的 `RANK()` **加**并列求平均，DuckDB 没有这个函数。
 所以 Polars 侧要显式写 `rank('min')`，别用默认值。
 
+**还有一条更容易踩的：排序键超过一列时，两边的并列口径就分叉了。**
+
+demo 里的小表是 8 行（a 组 4 行 + b 组 4 行），`tag` 列每行都不同，正好当并列打破键：
+
+| 排序键 | DuckDB `rank()` | Polars `rank('min')` | 一致 |
+| --- | --- | --- | --- |
+| `ORDER BY v`（单键） | `1, 2, 2, 4, 1, 1, 3, 3` | `1, 2, 2, 4, 1, 1, 3, 3` | ✅ |
+| `ORDER BY v, tag`（双键） | `1, 2, 3, 4, 1, 2, 3, 4` | `1, 2, 2, 4, 1, 1, 3, 3` | ❌ |
+
+DuckDB 把 `(v, tag)` 当**一个**排序键：`v` 相同但 `tag` 不同的两行**不算并列**。
+Polars 的 `rank('min')` 是**按被排名的值**算名次：`v` 相同就并列同名次。
+
+→ **DuckDB 的 rank 是「行序的名次」，Polars 的 rank 是「值的名次」。**
+要两边对齐，Polars 侧得按 `(v, tag)` 的**组合**去排名，而不是只按 `v` ——
+「加个唯一 tiebreaker」恰恰是最常见的做法，也恰恰是踩到这个坑的时刻。
+
 ### 3. 没有的三个：percent_rank / cume_dist / ntile
 
 在 Polars 的命名空间里搜一遍：
@@ -6793,18 +7237,18 @@ DuckDB 给 `percent_rank` = **0.0**（不是 NaN、不是除零报错）。
 
 | 函数 | Polars 侧写法 | DuckDB 中位 | Polars 中位 | Polars / DuckDB |
 | --- | --- | --- | --- | --- |
-| `row_number` | `cum_count().over(g, order_by=v)` | 16.0 ms | 7.1 ms | 0.45× |
-| `rank` | `rank('min').over(g, order_by=v)` | 16.1 ms | 6.5 ms | 0.40× |
-| `dense_rank` | `rank('dense').over(g, order_by=v)` | 15.2 ms | 6.5 ms | 0.43× |
-| `percent_rank` | 手搓：`(rank−1)/(n−1)` | 17.9 ms | 11.2 ms | 0.62× |
-| `cume_dist` | 手搓：`rank('max')/n` | 16.7 ms | 10.8 ms | 0.64× |
-| `ntile(4)` | 手搓：`(cum_count−1)*4÷n +1` | 16.7 ms | 12.4 ms | 0.75× |
+| `row_number` | `cum_count().over(g, order_by=v)` | 16.3 ms | 7.6 ms | 0.47× |
+| `rank` | `rank('min').over(g, order_by=v)` | 17.5 ms | 6.6 ms | 0.38× |
+| `dense_rank` | `rank('dense').over(g, order_by=v)` | 15.7 ms | 6.9 ms | 0.44× |
+| `percent_rank` | 手搓：`(rank−1)/(n−1)` | 15.4 ms | 9.9 ms | 0.64× |
+| `cume_dist` | 手搓：`rank('max')/n` | 16.4 ms | 10.3 ms | 0.63× |
+| `ntile(4)` | 手搓：`(cum_count−1)*4÷n +1` | 15.9 ms | 8.9 ms | 0.56× |
 
 > 口径：同一份数据（Polars 造，Arrow 零拷贝灌进 DuckDB），
 > 两边**交错**跑 3 轮取中位数和最快（避免「谁先跑谁吃亏」）。
 > 共享开发机，单次数字会抖，看趋势。
 
-**6 个函数 Polars 全部更快，差距在 0.40~0.75 倍之间** —— 排名本身不是瓶颈
+**6 个函数 Polars 全部更快，差距在 0.38~0.64 倍之间** —— 排名本身不是瓶颈
 （Polars 侧是原生算子，DuckDB 侧要过一遍通用窗口框架）。
 手搓的那三个（percent_rank / cume_dist / ntile）差距最小，
 因为公式本身要算好几遍 `rank` —— **越依赖手搓公式，越追不上现成函数**。
@@ -6833,7 +7277,7 @@ DuckDB 给 `percent_rank` = **0.0**（不是 NaN、不是除零报错）。
 - 要 `percent_rank` / `cume_dist` / `ntile` → 优先在 **DuckDB 侧**算，
   别在 Polars 侧手搓（公式要自己负责，边界也要自己负责）；
 - 要「分组最后一行」→ **别用 `last_value`**，DuckDB 侧写全 frame，Polars 侧写 `last().over()`；
-- 要「组内第 k 名」→ 记得加一个**唯一的** tiebreaker，不然并列行的名次是不确定的。
+- 要「组内第 k 名」→ 记得加一个**唯一的** tiebreaker，不然并列行的名次是不确定的；**但加了之后要重算口径** —— DuckDB 的 rank 会变成「不并列」，Polars 的 `rank('min')` 仍然是「按值并列」。
 
 ## 结果物化方式的代价：把数据拿出引擎的几条通道
 
@@ -6967,10 +7411,10 @@ to_numpy() 之后：  big_int = 9007199254740992.0          big_int_clean = 9007
 
 | 通道 | DuckDB 中位 | Polars 中位 | 比值（Polars / DuckDB） |
 | --- | --- | --- | --- |
-| Arrow 表 | 15.9 ms | 9.3 ms | 0.58× |
-| numpy | 26.6 ms | 66.7 ms | **2.51×** |
-| Python 元组 | 188.0 ms | 187.4 ms | 1.00× |
-| Python 字典 | 375.9 ms | 333.1 ms | 0.89× |
+| Arrow 表 | 17.6 ms | 11.3 ms | 0.64× |
+| numpy | 28.6 ms | 63.0 ms | **2.20×** |
+| Python 元组 | 187.1 ms | 189.0 ms | 1.01× |
+| Python 字典 | 369.1 ms | 335.1 ms | 0.91× |
 
 体积（同一个结果，不同包装）：
 
@@ -6990,16 +7434,16 @@ to_numpy() 之后：  big_int = 9007199254740992.0          big_int_clean = 9007
 
 三条结论：
 
-1. **通道之间的差距是量级上的，跨引擎的差距是零头。** Arrow 16 ms 对字典 376 ms —— 差 20 倍以上；
+1. **通道之间的差距是量级上的，跨引擎的差距是零头。** Arrow 17.6 ms 对字典 369 ms —— 差 20 倍以上；
    而同一个通道上两个引擎的差距，除了 numpy 那条之外都在 **1.8 倍以内**
-   （元组那一条几乎一模一样：188.0 vs 187.4 ms）。
+   （元组那一条几乎一模一样：187.1 vs 189.0 ms）。
    **选通道比选引擎重要得多。**
 2. **两个引擎内部都是「dict 比 tuple 贵」**：DuckDB 2.0×、Polars 1.8× ——
    dict 每个键都要一个 PyObject 外加哈希表，tuple 是连续的一块。
-3. **Arrow 通道 DuckDB 比 Polars 慢**（15.9 vs 9.3 ms，差 6.6 ms）——
+3. **Arrow 通道 DuckDB 比 Polars 慢**（17.6 vs 11.3 ms，差 6.3 ms）——
    DuckDB 得先从自己的列存格式转成 Arrow，Polars 本来就活在 Arrow 里。
 
-**唯一反过来的通道是 numpy**：Polars 66.7 ms vs DuckDB 26.6 ms（慢 2.5 倍）。
+**唯一反过来的通道是 numpy**：Polars 63.0 ms vs DuckDB 28.6 ms（慢 2.2 倍）。
 原因是这份 parquet 里有 DECIMAL 列 —— Polars 的 `to_numpy()` 退成 `object` dtype，
 每一格都得装箱成一个 Python 对象；DuckDB 把 DECIMAL 转成 float64，代价小得多，
 但**精度丢了**（见上一节）。**「快」和「准」在这里是二选一。**
@@ -7048,10 +7492,10 @@ use con.sql(query).to_arrow_table() instead.
 
 | 写法 | 耗时 |
 | --- | --- |
-| `con.execute(sql).to_arrow_table()`（多拷一份） | 13.0 ms |
-| `con.sql(sql).to_arrow_table()`（正确写法） | 14.2 ms |
+| `con.execute(sql).to_arrow_table()`（多拷一份） | 12.7 ms |
+| `con.sql(sql).to_arrow_table()`（正确写法） | 13.4 ms |
 
-差 **−1.2 ms** —— **在这个行数下，那份额外的拷贝淹没在噪声里了**（±1 ms 量级）。
+差 **−0.7 ms** —— **在这个行数下，那份额外的拷贝淹没在噪声里了**（±1 ms 量级）。
 
 这是本项目里少数几个「测不出差别」的结论，如实记下来：
 **拷贝确实存在**（DuckDB 自己会警告），但在这个规模上它的**时间**代价量不出来；
@@ -7135,7 +7579,7 @@ duckdb-polars-demo/
 │   ├── tz_demo.py          # 日期时间与时区：精度 / 会话时区 / 夏令时 / Parquet 往返
 │   ├── order_demo.py       # 排序稳定性：NULL 位置 / 并列顺序 / LIMIT 后果
 │   ├── partition_demo.py   # 多文件与分区表：glob / schema 冲突 / 分区裁剪
-│   ├── window_demo.py      # 窗口函数：默认 frame / frame 家族 / 命名窗口 / QUALIFY
+│   ├── window_demo.py      # 窗口函数与排名全家桶：frame / 命名窗口 / QUALIFY / 9 个排名函数
 │   ├── agg_demo.py         # 聚合语义：分位数插值 / 众数 / arg_max 并列 / 整数溢出
 │   ├── setop_demo.py       # 集合运算与去重：NULL 参与比较 / UNION / DISTINCT ON
 │   ├── regex_demo.py       # 正则与字符串：分组编号 / 切分 / 位置 / 字节与字符
@@ -7172,6 +7616,8 @@ duckdb-polars-demo/
 │   ├── concurrency_demo.py  # 并发 / 锁 / 多进程：文件锁、WAL、MVCC、Polars 静默丢数据
 │   ├── attach_demo.py       # ATTACH 多库 + catalog 内省：DuckDB 有「库」，Polars 只有文件
 │   ├── ranking_demo.py      # 排名函数全家桶：9 个函数逐个对账 / 手搓公式 / frame 语义
+│   ├── object_demo.py      # 数据库对象：生成列 / 注释 / 临时表
+│   ├── config_demo.py      # 调引擎与改配置：表函数 / CALL / Polars 的 SQL / 会话设置
 │   ├── materialize_demo.py  # 结果物化方式的代价：几条通道的代价与语义
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/

@@ -260,13 +260,37 @@ def scenario_named_window(con: duckdb.DuckDBPyConnection) -> None:
     common.print_frame(duck_df, "DuckDB 命名窗口 w", max_rows=10)
     common.print_frame(polars_df, "Polars 两个表达式各写一遍", max_rows=10)
 
+    duck_running = duck_df["running"].to_list()
+    pol_running = polars_df["running"].to_list()
+    duck_rnk = duck_df["rnk"].to_list()
+    pol_rnk = polars_df["rnk"].to_list()
+    print(f"\n累计和：DuckDB {duck_running}")
+    print(f"        Polars {pol_running}   一致：{'✅' if duck_running == pol_running else '❌'}")
+    print(f"名次  ：DuckDB {duck_rnk}")
+    print(f"        Polars {pol_rnk}   一致：{'✅' if duck_rnk == pol_rnk else '❌'}")
+
     print("\nDuckDB 的 WINDOW 子句把「分区 + 排序」命名一次，后面可以反复引用：")
     print("  sum(v) OVER w、rank() OVER w，两个窗口函数共用一套 frame，口径改一处就够。")
     print("Polars 没有命名窗口 —— 想共用就得把 over('g', order_by=[...]) 抄两遍，")
     print("改口径的时候很容易只改一处，然后两边悄悄对不上了。")
-    print("\n顺带对齐一下 rank：SQL 的 rank() 是「并列同名次、后面跳号」（RANK），")
-    print("Polars 对应的是 rank('min')；rank('ordinal') 是「每行一个号」，对应的是 row_number()。")
-    print("这里 x 在每个分区内都不重复，两种 rank 看起来一样 —— 换成分组内有并列值就能看出差别。")
+
+    print("\n→ **累计和对上了，名次没对上** —— 这是第二个坑：")
+    print("  DuckDB 的 `rank()` 是**按排序键整体数名次**。w 里写的是 `ORDER BY x, ord`，")
+    print("  (x, ord) 是**一个**排序键：x 相同但 ord 不同的两行**不算并列**，")
+    print("  所以名次是 1, 2, 3, 4。")
+    print("  Polars 的 `rank('min')` 是**按被排名的那个值**算名次：")
+    print("  x=2 的两行并列同名次 → 1, 2, 2, 4。")
+    print()
+    print("  也就是说：**DuckDB 的 rank 是「行序的名次」，Polars 的 rank 是「值的名次」。**")
+    print("  排序键只有一列时两者一致；一旦加了并列打破键就分叉 ——")
+    print("  而「加个唯一 tiebreaker」恰恰是最常见的做法。")
+    print()
+    print("  顺带对齐一下三种 rank 口径：")
+    print("    SQL rank()       = 并列同名次、后面跳号  → Polars rank('min')")
+    print("    SQL dense_rank() = 并列同名次、不跳号    → Polars rank('dense')")
+    print("    SQL row_number() = 每行一个号            → Polars cum_count()")
+    print("  Polars 的 rank() **默认值是 'average'**（并列取平均名次），")
+    print("  DuckDB **没有**对应的函数 —— 别用默认值。")
 
     print("\nDuckDB 侧的写法位置（WINDOW 关键字在 FROM 之后）：")
     print("  FROM w")
@@ -428,6 +452,8 @@ def scenario_performance(con: duckdb.DuckDBPyConnection, rows: int, repeat: int)
     duck_run()
     polars_run()
 
+    # **交错**地跑：固定「先 DuckDB 再 Polars」的话，谁先跑谁要付「第一次」的
+    # 冷启动代价，这份代价会被算进那一边。交错着跑，两边轮流当第一个，噪声摊平。
     duck_times: list[float] = []
     polars_times: list[float] = []
     for _ in range(repeat):
@@ -449,7 +475,9 @@ def scenario_performance(con: duckdb.DuckDBPyConnection, rows: int, repeat: int)
         print(f"\nDuckDB / Polars = {duck_med / polars_med:.2f}×（中位数口径）")
 
     print("\n口径：输入已物化（Parquet 落盘、DuckDB 建表、Polars 读进内存），")
-    print("      计时的只有「窗口计算 + 结果物化」这一段。")
+    print("      计时的只有「窗口计算 + 结果物化」这一段；")
+    print(f"      两边**交错**跑 {repeat} 轮（避免「谁先跑谁吃亏」）。")
+    print("      共享开发机，单次数字会抖，看趋势。")
     print("窗口函数贵的主因是排序：分区越大，要排的键越多。")
 
 

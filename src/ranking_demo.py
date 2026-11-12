@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import statistics
 import time
 
@@ -155,6 +156,53 @@ def scenario_alignable(con: duckdb.DuckDBPyConnection, df: pl.DataFrame) -> None
     print("    对应的是 SQL 的 `RANK()` **加**并列求平均 —— DuckDB 没有这个函数，")
     print("    所以 Polars 侧要显式写 `rank('min')`，别用默认值。")
 
+    # ---- 排序键超过一列时，两边的并列口径就分叉了 ----
+    print()
+    print("  但有个例外：**排序键超过一列**的时候，两边的并列口径就分叉了。")
+    print("  表里的 tag 列每行都不同，正好可以当并列打破键：")
+    print()
+    print(
+        "    "
+        + common.pad("排序键", 24)
+        + common.pad("DuckDB rank()", 20)
+        + common.pad("Polars rank('min')", 22)
+        + "一致"
+    )
+    print("    " + "-" * 74)
+    for order_by, pol_order in (("v", "v"), ("v, tag", ["v", "tag"])):
+        d_rows = con.execute(
+            f"SELECT g, v, rank() OVER (PARTITION BY g ORDER BY {order_by}) AS r "
+            "FROM t ORDER BY g, v, tag"
+        ).fetchall()
+        p_rows = (
+            df.with_columns(pl.col("v").rank("min").over("g", order_by=pol_order).alias("r"))
+            .sort("g", "v", "tag")
+            .select("g", "v", "r")
+            .rows()
+        )
+        same = d_rows == p_rows
+        print(
+            "    "
+            + common.pad(f"ORDER BY {order_by}", 24)
+            + common.pad(str([r[2] for r in d_rows]), 20)
+            + common.pad(str([r[2] for r in p_rows]), 22)
+            + ("✅ 是" if same else "❌ 否")
+        )
+    print()
+    print("    → DuckDB 把 `(v, tag)` 当**一个**排序键：v 相同但 tag 不同的两行**不算并列**。")
+    print("      Polars 的 `rank('min')` 是**按被排名的值**算名次：v 相同就并列同名次。")
+    print()
+    print("    也就是说：**DuckDB 的 rank 是「行序的名次」，Polars 的 rank 是「值的名次」。**")
+    print("    排序键只有一列时两者一致；一旦加了并列打破键就分叉 ——")
+    print("    而「加个唯一 tiebreaker」恰恰是最常见的做法，也恰恰是踩到这个坑的时刻。")
+    print()
+    print("    要两边对齐，Polars 侧得按**组合键**去排名，而不是只按被排名的那个值：")
+    print("      pl.col('v').rank('min').over('g', order_by=['v', 'tag'])   ← 还是按 v 排的")
+    print("      正确做法：把 (v, tag) 合成一个可比较的值再排名，")
+    print("                或者用 row_number()（它数的是窗口内的行序，与值无关）。")
+    print()
+    print("    → **要「按值并列」就只写一个排序键；要「每行一个确定的号」就用 row_number()。**")
+
 
 # ---------------------------------------------------------------- 场景 3
 
@@ -171,7 +219,7 @@ def scenario_missing_three(con: duckdb.DuckDBPyConnection, df: pl.DataFrame) -> 
             f"    pl.{name:14s} 顶层：{'有' if top else '**没有**'}"
             f"    pl.Expr.{name:14s}：{'有' if expr else '**没有**'}"
         )
-    hits = [n for n in dir(pl.Expr) if any(k in n.lower() for k in ("percent", "cume", "ntile"))]
+    hits = [n for n in dir(pl.Expr) if re.search(r"(?:^|_)(?:percent|cume|ntile)", n.lower())]
     print(f"    整个 Expr API 里带 percent / cume / ntile 的方法：{hits or '（一个都没有）'}")
     print()
     print("  → **不是「藏在别处」，是真的没有。** 这三个在 DuckDB 里都是一行 SQL。")

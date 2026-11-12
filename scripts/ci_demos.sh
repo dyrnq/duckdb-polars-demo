@@ -139,6 +139,8 @@ DEMOS=(
   "concurrency_demo|--hold 1"
   "attach_demo|"
   "ranking_demo|--rows $ROWS --repeat $REPEAT"
+  "object_demo|--rows $ROWS --repeat $REPEAT"
+  "config_demo|--rows $ROWS --repeat $REPEAT"
   "materialize_demo|--rows $ROWS --repeat $REPEAT"
 )
 
