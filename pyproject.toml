@@ -12,6 +12,9 @@ dependencies = [
 ]
 
 [dependency-groups]
+demo = [
+    "carquet>=0.8",
+]
 dev = [
     "ruff>=0.14",
 ]

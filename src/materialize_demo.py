@@ -639,15 +639,19 @@ def scenario_pandas(con: duckdb.DuckDBPyConnection, pq: Path, rows: int, repeat:
     print("    DuckDB 自己会警告：")
     print(f"      {warn_text[:150]}")
     print(f"    实测 {rows:,} 行（两条路**交错**跑，避免「谁先跑谁吃亏」）：")
-    print(f"      con.execute(sql).to_arrow_table()  {t_exec:.1f} ms   ← 多拷一份")
-    print(f"      con.sql(sql).to_arrow_table()      {t_rel:.1f} ms   ← 正确写法")
+    print(f"      con.execute(sql).to_arrow_table()  {t_exec:.1f} ms   ← DuckDB 会警告的那条")
+    print(f"      con.sql(sql).to_arrow_table()      {t_rel:.1f} ms   ← DuckDB 推荐的那条")
     print(f"      差 {diff:+.1f} ms")
-    if diff > 0.5:
-        print("      → 这个行数下，那份额外的拷贝还能看出来。")
+    if diff > 1.0:
+        print("      → 这个行数下，那份额外的拷贝在时间上还看得出来。")
+    elif diff < -1.0:
+        print("      → 实测**被警告的那条反而更快** —— 警告讲的是内存，不是时间。")
     else:
         print("      → 这个行数下拷贝淹没在噪声里了（差在 ±1 ms 内）；")
         print("        但那份额外的内存是实打实的，行数越大越明显 —— 别赌。")
-    print("      结论：**要 Arrow 就写 `con.sql(sql).to_arrow_table()`。**")
+    print("      两边的**结果完全一样**。哪条路更快**取决于文件的行组数** ——")
+    print("      1 个行组的文件里 execute() 更快，8 个行组的文件里反过来 sql() 更快")
+    print("      （实测见 `src/reader_demo.py` 的场景 2）。**别照着警告改代码。**")
 
 
 # ---------------------------------------------------------------- 小结

@@ -7,6 +7,29 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "carquet"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/45/af/d21fb449aca4d7f9d48faaf3509cf612c26b19026a0d3d765f7e6cdc576e/carquet-0.8.0.tar.gz", hash = "sha256:cead41f4c3f57f34900aff7abf30610d888bb593e2324a10e270443173c431d9", size = 637093, upload-time = "2026-11-09T23:01:40.421Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/98/59/9e9c52ca431b2cdbe1b495025e989088cd7ecad004d5370a61a8ab1fc0f3/carquet-0.8.0-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:401231eb6e57c47029e715487d8ea60198e9eddfc883a406565730c7bb2e3229", size = 1215018, upload-time = "2026-11-09T23:01:04.808Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/5c/b255cc05d83fec6069c067486c8f31a7b16beee9e8359f40935284c5e9fe/carquet-0.8.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:1edf6e551b1dfe2a5cb896fd9425ccd419ddc36e6dc22d06d2aab2d9b020f834", size = 1043966, upload-time = "2026-11-09T23:01:06.242Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/ab/cd2b9ca091354e46af168c59e60ede210d9162ae7a4e80477dd8f1aeee2a/carquet-0.8.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d9965fbc64f42d437fb25abebad62620cb7ae01ffe81c86b44a2b98ae00676a0", size = 1378868, upload-time = "2026-11-09T23:01:08.16Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/71/26f25734241aef31b7754d2b2d5f0c4a7e88070fb843050fd2939fe9ebfe/carquet-0.8.0-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:72799af8506365ba08936ea9b505895605d1165b0f7cb69ef020f565d7cf2ed7", size = 1423367, upload-time = "2026-11-09T23:01:09.869Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/9a/8dce62dc5dd14b0ac1069d542a87961c90d824660ff49778fdb597969a01/carquet-0.8.0-cp311-cp311-win_amd64.whl", hash = "sha256:18b69f929558248adeeb38a1125d9808ed3a6551eff26bb30ea6ff43f1d39188", size = 947174, upload-time = "2026-11-09T23:01:11.497Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/6b/99f0f47b8a79de361469abfc82fef29cab0be53cd6712a02f6f219d215e3/carquet-0.8.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:69f0d0de37edf8f4a920b55ceca0bed684aa2bb6d3cd56e9ab389b6d04eadd33", size = 1222651, upload-time = "2026-11-09T23:01:12.99Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/1a/74cc0289599029beb3ac41d10a4ff50efb90e52b11839d2b4a256bbf4977/carquet-0.8.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:61cd40ec3fc4fe9fa625696e078178f45e35ab8e6eadab604db16c2d433ca6d9", size = 1043966, upload-time = "2026-11-09T23:01:15.228Z" },
+    { url = "https://files.pythonhosted.org/packages/99/fe/edda6b8e385ccb773844f8019c986064d8429565e292635ae93c9e25eea2/carquet-0.8.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:51c5fadb35bcf6091f658b6e7cb74cd2a4e3c9df106429227550d7f9c98c1fc8", size = 1378867, upload-time = "2026-11-09T23:01:16.865Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/b4/a20ad2c125a54e740e1b419f55d96a25b2095f34cd0f9268b6223df0e587/carquet-0.8.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bd8ebc494d91ceda5ff43c8991d1511b0dc4843e4b0be14c3cb963633e1e3cad", size = 1423367, upload-time = "2026-11-09T23:01:19.14Z" },
+    { url = "https://files.pythonhosted.org/packages/13/c7/3138c5eec1fe079cae970688bb71ecc6f8f78111cdd1e0a08d62e5f4b9aa/carquet-0.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:0f02c19c17006b942d2ba960c889f45ad71d7e24e9c7b8c4fde5f9f5239b4e36", size = 947173, upload-time = "2026-11-09T23:01:20.78Z" },
+    { url = "https://files.pythonhosted.org/packages/05/65/c883ab59b729c87ced557586117a6f43099802fc47ba7f068d21f56d25c1/carquet-0.8.0-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:874147d9297c21cd91a6d10a147b27b418d21c7283b46206094415f4801c9a16", size = 1222650, upload-time = "2026-11-09T23:01:22.239Z" },
+    { url = "https://files.pythonhosted.org/packages/87/4b/a1314e578bd095a7788cbb7671adb620e8703b809de7cccc229ca8a9d0ba/carquet-0.8.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:8ec692e34d5163e4fdd1af834755db9f1caf6e6c3bc5d43b48ca72d430e7ea5b", size = 1043967, upload-time = "2026-11-09T23:01:23.963Z" },
+    { url = "https://files.pythonhosted.org/packages/67/62/97af9f03ce205bbda8564b75346381cfe194382c7de0c2db50381fd84ac9/carquet-0.8.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:dc538df2f8b16c8275157383e0790b73ea5aa305f12416b104011e2ca70bad43", size = 1378868, upload-time = "2026-11-09T23:01:25.894Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/86/c3c24dab715e8dd16a04038a82deef55d7e44dc7e79182611e9d64132f88/carquet-0.8.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:586f999c37482a2dc8c74c7919e2dc68d79cd3a560f6f8f12c3907494f8df280", size = 1423368, upload-time = "2026-11-09T23:01:27.625Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/e5/1230add5194db4d282cefd96173942ead04e9434718adef4de48be36c033/carquet-0.8.0-cp313-cp313-win_amd64.whl", hash = "sha256:cb62c6891a39203b1d4aa386eccfe5bb36d698f33cfe9efa1d45677339ca6be8", size = 947174, upload-time = "2026-11-09T23:01:29.501Z" },
+]
+
+[[package]]
 name = "duckdb"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -41,6 +64,9 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+demo = [
+    { name = "carquet" },
+]
 dev = [
     { name = "ruff" },
 ]
@@ -54,6 +80,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+demo = [{ name = "carquet", specifier = ">=0.8" }]
 dev = [{ name = "ruff", specifier = ">=0.14" }]
 
 [[package]]
