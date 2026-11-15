@@ -10,6 +10,10 @@
 
 这个场景要回答：两个引擎的计划能不能对读，以及「计划好看」到底意味着什么。
 
+场景 3 还往下追了一层：**「过滤被塞进扫描节点」是计划层面的事，
+不等于「reader 真的跳过了数据」** —— 同一份数据写成 parquet / csv / json 三种格式，
+量每个 reader 实测读了多少字节、剪了几个行组。
+
 用法：
     uv run python src/plan_demo.py
     uv run python src/plan_demo.py --rows 5000000 --repeat 5
@@ -119,6 +123,84 @@ def scan_extra_info(prof: dict) -> str:
             parts.append(f"Filters: {info['Filters']}")
         return " | ".join(parts)
     return "（没找到扫描节点）"
+
+
+# ---------------------------------------------------------------- 下推实测的辅助设施
+
+# 下推实测用的规模：小到跑得快，但行组数够多，裁剪才看得出差别。
+# 200000 行 / 每行组 25000 行 → 8 个行组。
+PUSHDOWN_ROWS = 200_000
+PUSHDOWN_ROW_GROUP = 25_000
+
+
+def make_pushdown_files(con: duckdb.DuckDBPyConnection, tmpdir: Path) -> dict[str, Path]:
+    """同一份数据写成三种格式 —— parquet 显式固定行组大小，好让裁剪看得见。"""
+    src = "SELECT i AS id, i * 2 AS v, 'a' || (i % 50) AS s FROM range(?) t(i)"
+    files: dict[str, Path] = {}
+    for name, opts in [
+        ("parquet", f"FORMAT parquet, ROW_GROUP_SIZE {PUSHDOWN_ROW_GROUP}"),
+        ("csv", "FORMAT csv, HEADER"),
+        ("json", "FORMAT json"),
+    ]:
+        path = tmpdir / f"push.{name}"
+        con.execute(f"COPY ({src}) TO ? ({opts})", [PUSHDOWN_ROWS, str(path)])
+        files[name] = path
+    return files
+
+
+def operator_types(node: dict) -> list[str]:
+    """把算子树的类型摊平（profiling JSON 里 operator 是嵌套的）。"""
+    out = [node.get("type", "?")]
+    for child in node.get("children", []):
+        out.extend(operator_types(child))
+    return out
+
+
+def scan_filters(prof: dict) -> str:
+    """扫描节点上的 Filters —— 空字符串说明过滤没进到 reader 里。"""
+    for node in prof.get("operator", []):
+        scan = find_operator(node, "TABLE_SCAN")
+        if scan is not None:
+            return scan.get("extra_info", {}).get("Filters") or ""
+    return ""
+
+
+def scan_metrics(
+    con: duckdb.DuckDBPyConnection,
+    sql: str,
+    params: list,
+    tmpdir: Path,
+    tag: str,
+    rg_total: int | None = None,
+) -> dict:
+    """跑一条查询，量它**实际**读了多少盘、剪了多少行组。
+
+    两份证据：
+      · profiling JSON  →  `io.total_bytes_read`（真正读了多少字节）
+                         + 算子树里有没有独立的 FILTER 节点
+      · EXPLAIN ANALYZE →  `Row Groups Scanned: x / y`（剪了几个行组）
+
+    `rg_total` 用来认领行组数：EXPLAIN ANALYZE 的盒式图会把多个扫描
+    并排画，`small_keys` 那张内存表也会报 `1 / 1` —— 按分母认才认得对。
+    """
+    prof = duck_profiling(con, sql, params, tmpdir / f"prof_{tag}.json")
+    types: list[str] = []
+    for node in prof.get("operator", []):
+        types.extend(operator_types(node))
+
+    plan = con.sql("EXPLAIN ANALYZE " + sql, params=params).fetchall()[0][1]
+    row_groups = ""
+    for scanned, total in re.findall(r"Row Groups Scanned:\s*(\S+)\s*/\s*(\S+)", plan):
+        if rg_total is None or total == str(rg_total):
+            row_groups = f"{scanned} / {total}"
+            break
+
+    return {
+        "bytes": prof.get("io", {}).get("total_bytes_read", 0),
+        "row_groups": row_groups,
+        "has_filter_node": "FILTER" in types,
+        "filters": scan_filters(prof),
+    }
 
 
 # ---------------------------------------------------------------- 1. 两边的 EXPLAIN
@@ -289,6 +371,220 @@ def scenario_filter_pushdown(con: duckdb.DuckDBPyConnection) -> None:
     print("  · 真正要看「过滤是不是真的在扫描时做掉的」，DuckDB 的 `EXPLAIN ANALYZE`")
     print("    会给出扫描节点的行数；Polars 这边没有对应物 ——")
     print("    它的 `ESTIMATED ROWS` 是**估算**，不是实测。")
+
+    # ---- 下半段：计划层面 ≠ 真的少读了 -------------------------------
+    #
+    # 上面证的是「过滤被塞进了扫描节点」。但那只是**计划层面**的：
+    # 计划里写着 `Filters:`，不代表 reader 真的少读了数据。
+    # 这一段把两件事分开测。
+
+    print()
+    print("  " + "=" * 70)
+    print("  往下 —— 计划里塞进去了，**真的少读了吗**")
+    print("  " + "=" * 70)
+
+    files = make_pushdown_files(con, tmpdir)
+    pq = files["parquet"]
+    groups = int(
+        con.sql(
+            "SELECT count(DISTINCT row_group_id) FROM parquet_metadata(?)",
+            params=[str(pq)],
+        ).fetchall()[0][0]
+    )
+    rg_rows = [
+        int(r[0])
+        for r in con.sql(
+            "SELECT max(row_group_num_rows) FROM parquet_metadata(?)"
+            " GROUP BY row_group_id ORDER BY row_group_id",
+            params=[str(pq)],
+        ).fetchall()
+    ]
+    id_chunk_bytes = int(
+        con.sql(
+            "SELECT sum(total_compressed_size) FROM parquet_metadata(?)"
+            " WHERE path_in_schema = 'id'",
+            params=[str(pq)],
+        ).fetchall()[0][0]
+    )
+    print()
+    print(f"  数据：同一份 {PUSHDOWN_ROWS:,} 行 × 3 列（id / v / s），写成三种格式；")
+    print(f"  parquet 显式按 {PUSHDOWN_ROW_GROUP:,} 行一个行组写 → **{groups} 个行组**")
+    print(
+        f"    parquet {pq.stat().st_size:,} 字节 · "
+        f"csv {files['csv'].stat().st_size:,} 字节 · "
+        f"json {files['json'].stat().st_size:,} 字节"
+    )
+    print(
+        f"  行组行数：{rg_rows[0]:,} × {groups - 1} + {rg_rows[-1]:,}"
+        f"（最后一个是余数；DuckDB 会把行组向上取整到 2048 的倍数）"
+    )
+
+    print()
+    print("  (1) 同一个过滤（`id < 100`），每个 reader **实测**读了多少：")
+    print()
+    rows = []
+    raw: dict[str, int] = {}
+    json_cols = "read_json(?, columns={id:'INT64', v:'INT64', s:'VARCHAR'})"
+    cases = [
+        ("parquet", "read_parquet(?)", "有过滤"),
+        ("parquet", "read_parquet(?)", "无过滤"),
+        ("csv", "read_csv(?)", "有过滤"),
+        ("csv", "read_csv(?)", "无过滤"),
+        ("json", "read_json_auto(?)", "有过滤"),
+        ("json", "read_json_auto(?)", "无过滤"),
+        ("json 显式", json_cols, "有过滤"),
+        ("json 显式", json_cols, "无过滤"),
+    ]
+    for i, (label, reader, kind) in enumerate(cases):
+        where = " WHERE id < 100" if kind == "有过滤" else ""
+        sql = f"SELECT sum(id) FROM {reader}{where}"
+        path = files["json"] if label.startswith("json") else files[label]
+        m = scan_metrics(con, sql, [str(path)], tmpdir, f"t{i}", groups)
+        size = path.stat().st_size
+        raw[f"{label}{kind}"] = m["bytes"]
+        if kind == "无过滤":
+            where_at = "（没过滤）"
+        elif m["has_filter_node"]:
+            where_at = "**独立 Filter 节点**"
+        else:
+            where_at = "扫描节点内"
+        rows.append(
+            [
+                f"{label}（{kind}）",
+                where_at,
+                f"{m['bytes']:,}",
+                f"{m['bytes'] / size:.1%}",
+                m["row_groups"] or "—",
+            ]
+        )
+    print(
+        "    "
+        + common.pad("读法", 20)
+        + common.pad("过滤在哪", 19)
+        + common.pad_left("实际读盘", 13)
+        + common.pad_left("占文件", 8)
+        + common.pad_left("行组扫描", 10)
+    )
+    print("    " + "-" * 70)
+    for r in rows:
+        print(
+            "    "
+            + common.pad(r[0], 20)
+            + common.pad(r[1], 19)
+            + common.pad_left(r[2], 13)
+            + common.pad_left(r[3], 8)
+            + common.pad_left(r[4], 10)
+        )
+    print()
+    print("    · 「过滤在哪」是从 **profiling JSON 的算子树**里读出来的：")
+    print("      过滤在扫描节点里 → 写在扫描的 `Filters:`，reader 拿得到；")
+    print("      过滤是独立的 `FILTER` 节点 → 它压在扫描**上面**，reader 拿不到。")
+    print("    · 「实际读盘」是 profiling JSON 的 `io.total_bytes_read`，")
+    print("      「行组扫描」来自 `EXPLAIN ANALYZE` 的 `Row Groups Scanned`。")
+    print("    · parquet 那两行只读了 `id` 这一列（列存只读用得到的列块，见场景 2），")
+    print("      所以「无过滤」也只有 50.6% —— 剩下的是 `v` / `s` 两个列块。")
+    pq_filt = raw["parquet有过滤"]
+    pq_all = raw["parquet无过滤"]
+    footer = pq_all - id_chunk_bytes
+    print()
+    print("    → csv / json：加不加过滤，读盘字节**一模一样** ——")
+    print("      整个文件都得读一遍，因为它们没有行组统计可依，")
+    print("      reader 只能把行读回来再扔掉。")
+    print(f"    → parquet：加过滤后从 {pq_all:,} 掉到 {pq_filt:,} 字节，行组 {groups} → 1 ——")
+    print(f"      reader 拿着行组的 min/max 统计，直接**跳过了 {groups - 1} 个行组**。")
+    print(f"      （字节不是正好 1/8：行组行数是 {rg_rows[0]:,} × {groups - 1} + {rg_rows[-1]:,}，")
+    print(f"        最后一个是余数；再加上两次都要读的 parquet footer/元数据约 {footer:,} 字节，")
+    print(f"        合计 {pq_filt / pq_all:.1%}。）")
+    print("    → json 前两行还有个额外的坑：`read_json_auto` 为了探测 schema，")
+    print(
+        f"      **把整个文件多读了一遍** —— {raw['json有过滤']:,}"
+        f" = 2 × {files['json'].stat().st_size:,}。"
+    )
+    print("      显式给列（`read_json(?, columns=...)`）就只读一遍。")
+    print("    → 差的不是「哪个引擎快」，是**过滤有没有送到 reader 手里**：")
+    print("      parquet 的 reader 能跳行组；csv / json 的 reader 只能全读。")
+
+    print()
+    print("  (2) 计划里写着 `Filters:`，**也可能一个字节都省不下** ——")
+    print("      同一份 parquet，换几种谓词（统计能不能证明是另一回事）：")
+    print()
+    rows = []
+    preds = [
+        ("id < 100", "id < 100"),
+        ("id % 2 = 0", "(id % 2) = 0"),
+        ("lower(s) = 'a1'", "lower(s) = 'a1'"),
+        ("s = 'a1'", "s = 'a1'"),
+        ("id + 1 < 100", "id + 1 < 100"),
+    ]
+    for i, (label, where) in enumerate(preds):
+        sql = f"SELECT sum(id) FROM read_parquet(?) WHERE {where}"
+        m = scan_metrics(con, sql, [str(pq)], tmpdir, f"p{i}", groups)
+        rows.append(
+            [
+                label,
+                m["filters"] or "—",
+                m["row_groups"] or "—",
+                f"{m['bytes']:,}",
+            ]
+        )
+    print(
+        "    "
+        + common.pad("谓词", 16)
+        + common.pad("计划里的 Filters", 18)
+        + common.pad_left("行组扫描", 10)
+        + common.pad_left("读盘字节", 13)
+    )
+    print("    " + "-" * 57)
+    for r in rows:
+        print(
+            "    "
+            + common.pad(r[0], 16)
+            + common.pad(r[1], 18)
+            + common.pad_left(r[2], 10)
+            + common.pad_left(r[3], 13)
+        )
+    print()
+    print("    → 第 2 行 `id % 2 = 0`：**计划里照样写着** `Filters: ((id % 2) = 0)`，")
+    print(f"      但 {groups} 个行组一个都没剪 —— parquet 的统计是列的 min/max，")
+    print("      证明不了「这一组全是偶数」。")
+    print("    → 所以「下推」得分两层看：**下推到扫描节点**（计划层面，什么谓词都能塞进去）")
+    print("      和**下推到 reader 让它跳数据**（统计层面，得统计能证明才行）。")
+    print("    → 最后一行是个彩蛋：`id + 1 < 100` 在计划里被优化器**先改写**成 `id < 99`，")
+    print("      于是照样能剪 —— 能被代数改写的谓词，等于白捡一次下推。")
+
+    print()
+    print("  (3) 连接侧的下推（运行时的 dynamic filters）：")
+    print()
+    con.execute(
+        "CREATE OR REPLACE TABLE small_keys AS SELECT 5 AS id UNION ALL SELECT 199990 AS id"
+    )
+    join_sql = "SELECT count(*) FROM read_parquet(?) b JOIN small_keys s ON b.id = s.id"
+    static_plan = con.sql("EXPLAIN " + join_sql, params=[str(pq)]).fetchall()[0][1]
+    print(
+        "    `EXPLAIN`（静态计划）里有没有 `Dynamic Filters`：",
+        "有" if "Dynamic Filters" in static_plan else "**没有**",
+    )
+    runtime_lines = (
+        con.sql("EXPLAIN ANALYZE " + join_sql, params=[str(pq)]).fetchall()[0][1].splitlines()
+    )
+    for i, line in enumerate(runtime_lines):
+        if "Dynamic Filters" in line:
+            print("    `EXPLAIN ANALYZE`（真跑一遍）里就有了：")
+            for cont in runtime_lines[i : i + 2]:
+                # 盒式图会把两个扫描并排画，取左边那个框的内容
+                cells = cont.split("│")
+                print(f"      {cells[1].strip()}")
+            break
+    m = scan_metrics(con, join_sql, [str(pq)], tmpdir, "join", groups)
+    print()
+    print(f"    效果（实测）：probe 侧的 parquet 扫描了 **{m['row_groups']}** 个行组")
+    print(f"    （同样 {groups} 个行组的文件，没有这个下推的话是全扫）。")
+    print()
+    print("    → 所以「谓词下推」在 DuckDB 里至少有**三个地方**在发生：")
+    print("      扫描节点（静态）、连接侧（运行时 dynamic filters）、")
+    print("      以及优化器自己的代数改写。")
+    print("      第三个最容易被忽略 —— 改写是在下推**之前**发生的，")
+    print("      改写得好不好直接决定下推有没有用。")
 
 
 # ---------------------------------------------------------------- 4. 优化开关
