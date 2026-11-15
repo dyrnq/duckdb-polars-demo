@@ -150,9 +150,7 @@ def scenario_basic(con: duckdb.DuckDBPyConnection) -> None:
     polars = polars_merge(tgt_df, src_df)
     show_frame(polars, "Polars 合并后")
 
-    ok, detail = common.compare_frames(
-        to_frame(duck, TARGET_COLUMNS), polars, keys=["id"]
-    )
+    ok, detail = common.compare_frames(to_frame(duck, TARGET_COLUMNS), polars, keys=["id"])
     print()
     print(f"  逐行对账：{'✅ 两侧完全一致' if ok else '❌ 不一致'} —— {detail}")
     print()
@@ -193,9 +191,7 @@ def scenario_delete(con: duckdb.DuckDBPyConnection) -> None:
     print()
     show_frame(polars, "Polars 合并后")
 
-    ok, detail = common.compare_frames(
-        to_frame(duck, TARGET_COLUMNS), polars, keys=["id"]
-    )
+    ok, detail = common.compare_frames(to_frame(duck, TARGET_COLUMNS), polars, keys=["id"])
     print()
     print(f"  逐行对账：{'✅ 两侧完全一致' if ok else '❌ 不一致'} —— {detail}")
     print()
@@ -218,9 +214,7 @@ def scenario_delete(con: duckdb.DuckDBPyConnection) -> None:
     )
     print()
     show_frame(polars2, "Polars 合并后")
-    ok2, detail2 = common.compare_frames(
-        to_frame(duck2, TARGET_COLUMNS), polars2, keys=["id"]
-    )
+    ok2, detail2 = common.compare_frames(to_frame(duck2, TARGET_COLUMNS), polars2, keys=["id"])
     print()
     print(f"  逐行对账：{'✅ 两侧完全一致' if ok2 else '❌ 不一致'} —— {detail2}")
     print()
@@ -289,9 +283,7 @@ def scenario_conditional(con: duckdb.DuckDBPyConnection) -> None:
     polars = pl.concat([polars, new_lo], how="vertical_relaxed")
     show_frame(polars, "Polars 合并后")
 
-    ok, detail = common.compare_frames(
-        to_frame(duck, TARGET_COLUMNS), polars, keys=["id"]
-    )
+    ok, detail = common.compare_frames(to_frame(duck, TARGET_COLUMNS), polars, keys=["id"])
     print()
     print(f"  逐行对账：{'✅ 两侧完全一致' if ok else '❌ 不一致'} —— {detail}")
     print()
@@ -442,9 +434,7 @@ def scenario_null_keys(con: duckdb.DuckDBPyConnection) -> None:
     print()
     show_frame(polars, "Polars 合并后")
 
-    ok, detail = common.compare_frames(
-        to_frame(duck, TARGET_COLUMNS), polars, keys=["id", "v"]
-    )
+    ok, detail = common.compare_frames(to_frame(duck, TARGET_COLUMNS), polars, keys=["id", "v"])
     print()
     print(f"  逐行对账：{'✅ 两侧完全一致' if ok else '❌ 不一致'} —— {detail}")
     print()
@@ -534,12 +524,9 @@ def scenario_cost(con: duckdb.DuckDBPyConnection, rows: int, repeat: int) -> Non
         dbfile = workdir / "merge_demo.duckdb"
         con2 = duckdb.connect(str(dbfile))
         con2.execute(
-            "CREATE TABLE tgt(id INT, v INT, note VARCHAR);"
-            "CREATE TABLE src(id INT, v INT);"
+            "CREATE TABLE tgt(id INT, v INT, note VARCHAR);CREATE TABLE src(id INT, v INT);"
         )
-        con2.execute(
-            "INSERT INTO tgt SELECT i, i * 10, 'n' FROM range(?) t(i)", [rows]
-        )
+        con2.execute("INSERT INTO tgt SELECT i, i * 10, 'n' FROM range(?) t(i)", [rows])
         # 源：一半的键命中目标（0 .. half-1），另一半是新键（rows .. rows+half-1）
         half = rows // 2
         con2.execute(

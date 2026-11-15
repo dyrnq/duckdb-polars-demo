@@ -147,6 +147,8 @@ DEMOS=(
   "arrow_demo|"
   "prune_probe_demo|--rows $ROWS --repeat $REPEAT"
   "merge_demo|--rows $ROWS --repeat $REPEAT"
+  "temporal_demo|--rows $ROWS --repeat $REPEAT"
+  "unicode_demo|--rows $ROWS --repeat $REPEAT"
 )
 
 # 漏了新加的 demo？—— src/ 下能直接跑、却不在上面清单里的脚本，CI 是不会跑的。

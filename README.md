@@ -97,6 +97,8 @@ uv run python src/reader_demo.py       # 四个 reader 读同一份 parquet：�
 uv run python src/arrow_demo.py        # Arrow 的三层版本 + 零拷贝的边界 + 三个框架的脾气：共享靠什么、断在哪
 uv run python src/prune_probe_demo.py  # 行组裁剪的探针：把「跳没跳过」变成「报没报错」
 uv run python src/merge_demo.py        # MERGE INTO vs Polars 的手工复刻：逐行对账 + 重复键的两种错法
+uv run python src/temporal_demo.py     # 时间分桶：closed / label / every / period 四个旋钮，三个会静默改数
+uv run python src/unicode_demo.py      # Unicode 文本：规范等价性、规范化工具箱、grapheme cluster
 ```
 
 一键跑完整流程：
@@ -173,6 +175,8 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `arrow_demo.py` | Arrow 的三层版本 + 零拷贝的边界 + 三个框架的脾气：ABI 里没有版本号、共享靠的是布局与所有权回调、零拷贝是列的性质、类型会断也会改、Arrow IPC 文件只有一边能读、polars 吃 DuckDB relation 会静默给错形状 |
 | `prune_probe_demo.py` | 行组裁剪的探针：把「跳没跳过」变成「报没报错」，不靠计数器就测出 Polars 到底剪没剪 |
 | `merge_demo.py` | MERGE INTO：一条语句里的改、插、删，和 Polars 侧的手工复刻逐行对账 |
+| `temporal_demo.py` | 时间分桶：`closed` / `label` / `every` / `period` 四个旋钮，三个会静默改数（多算、丢行、重复计） |
+| `unicode_demo.py` | Unicode 文本：预组合 vs 分解形、去重多一个 join 漏一半、NFC 是唯一公共路径、grapheme 只有 DuckDB 有 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -261,7 +265,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，65 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，67 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -639,6 +643,17 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 279 | 源里有重复键 | **更新分支报错**（不能影响同一目标行两次）；**插入分支不查重** —— 插两行也不报错 | 静默把目标行**复制成两行** | DuckDB 靠主键约束兜底；Polars 侧得自己先 `unique()` |
 | 280 | 合并的键是 NULL | NULL = NULL 不是 TRUE → 算「没匹配」→ 插进去 → 目标表出现两行 id=NULL | 结果**一致**；但键列全是 NULL 时 dtype 推断成 `Null`，join 直接 `SchemaError`（报的是**类型错**，不是「键不能是 NULL」） | 两边语义一致；Polars 侧先把 dtype 统一 |
 | 281 | 合并是不是原子的 | 一条语句 —— 事务里 `ROLLBACK` 撤得干干净净 | 三步操作，中间失败停在半路；而且**没有事务**这个概念 | 要原子性得自己写临时文件再原子替换（那是另一回事） |
+| 282 | 同一批时间戳分桶，两边一样吗 | 默认参数下**逐桶完全一致** —— `time_bucket(INTERVAL 1 MINUTE, t)` ↔ `group_by_dynamic(every='1m', period='1m')` | 默认参数一致，但多四个旋钮：`closed` / `label` / `every` / `period` | 默认值别依赖 —— **把参数钉死**（`closed='left'`, `label='left'`, `every=period`） |
+| 283 | 改一个旋钮会怎样 | 没有旋钮：`time_bucket` 只有一种语义 | `closed='both'` 总量 15→26（边界行算两遍）；`closed='none'` 总量 15→4（**丢 4 行**，桶也从 4 个变成 2 个） | 静默改数，不报错 —— **看表格看不出来少了行** |
+| 284 | `every` 和 `period` 分别是什么 | 没有这两个旋钮 | `every` = **步长**，`period` = **宽度**（官方 docstring）：步长>宽度留空档（丢行），宽度>步长重叠（重复计） | 「重叠窗口」在 DuckDB 侧没有一一对应的写法；且方向相反 —— Polars 向前看，DuckDB 的 RANGE frame 向后看 |
+| 285 | 按时间列做滚动窗口 | 窗口函数 RANGE frame 能做 | `rolling_mean` **没有 `by=`** —— 按时间列滚动没有直接对应物；且默认 `min_samples=window_size`，开头几行给 NULL，DuckDB 给的是部分窗口的平均值 | 对齐要显式写 `min_samples=1` |
+| 286 | 指数加权移动平均 | **没有 `ewm_mean`**（Catalog Error），得自己写递归 CTE | `ewm_mean(alpha=…)` | 一边倒的能力差：Polars 有、DuckDB 没有 |
+| 287 | 「看起来一样」的字符串是不是同一个 | 不是 —— 两边都按字节比 | 不是 —— 两边都按字节比 | 预组合 `é`(U+00E9) 和分解形 `e`+U+0301 是**两个键**：去重多一个、join 漏一半 |
+| 288 | 规范化函数有几种 | **只有 `nfc_normalize`**（NFD / NFKC / NFKD 全是 Catalog Error） | `str.normalize('NFC'/'NFD'/'NFKC'/'NFKD')` 四种全有 | **NFC 是唯一的公共路径** —— 实测 14 个样本逐样本一致 |
+| 289 | 兼容性分解（①→1、ﬁ→fi、Ⅻ→XII） | **补不了** —— 没有 `nfkc_normalize` | NFKC / NFKD 都能做 | `①` 和 `1` 在 DuckDB 侧永远是两个键；要对齐只能进 DuckDB 之前先在 Python 侧规范化 |
+| 290 | `strip_accents` 是不是 NFKD | 不是 —— 它是**拉丁重音剥离器**：é→e、ğ→g 会动，**ı/ø/ß/ﬁ/①/Ⅻ 原样不动** | 没有 `strip_accents`，只能 `NFKD` + 去组合标记凑 | 10 个样本里两边只有 7 个结果一样 —— 当去重键，两边的键集合不同 |
+| 291 | 「一个字」是几个（grapheme） | **有**：`length_grapheme` / `left_grapheme` / `right_grapheme` / `substring_grapheme` | **一个都没有** —— `str` 命名空间 47 个方法，没有一个带 grapheme | 家庭 emoji = 1 个字但 7 个码点；「取前 N 个字」在 Polars 侧做不到 |
+| 292 | 大小写映射会不会改长度 | `upper('ß')` = `ẞ`（1 个字符，**简单映射**） | `to_uppercase('ß')` = `SS`（2 个字符，**完整映射**） | 拿 `upper(x)` 当去重键，两边结果不一样；Polars 另有 `to_titlecase`，DuckDB 一个 titlecase 函数都没有 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.execute(sql).to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那份拷贝是**内存**代价；**时间**上哪条路快取决于文件的行组数（本项目这份 1 行组的 fixture 上，反而是 `execute()` 快 1.43×），所以别照着警告改代码。
 
@@ -681,7 +696,11 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 276~277 条（过滤下推的计划层面 vs 统计层面 / 「跳没跳过」能不能测）在
 `查询计划：EXPLAIN 与投影裁剪` 和 `行组裁剪的探针` 里展开；
 第 278~281 条（一条语句改插删 / 重复键 / NULL 键 / 原子性）在
-`MERGE INTO：一条语句里的改、插、删` 里展开。
+`MERGE INTO：一条语句里的改、插、删` 里展开；
+第 282~286 条（分桶默认值 / 旋钮静默改数 / every 与 period / 按时间列滚动 / 指数加权移动平均）在
+`时间分桶：同一批时间戳，两边怎么切` 里展开；
+第 287~292 条（规范等价性 / 规范化函数 / 兼容性分解 / strip_accents / grapheme / 大小写映射改长度）在
+`Unicode 文本：肉眼一样，字节可以不一样` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -3066,6 +3085,315 @@ DuckDB 快约 **2.0×**（DuckDB / Polars = 0.49×）。
 Polars 快 **4.37×**。口径：输入已物化，计时的只有「按天聚合 + 结果物化」和「生成时间轴」。
 注意 DuckDB 的 `generate_series` 是**列表函数**，聚合时还得再 `unnest` 一次，
 这里为了两边做同一件事，用 `count(*)` 只测生成本身的成本。
+
+## 时间分桶：同一批时间戳，两边怎么切
+
+`src/temporal_demo.py`。DuckDB 的 `time_bucket` 和 Polars 的 `group_by_dynamic` 都能把时间戳分桶，
+**默认参数下逐桶对账完全一致** —— 但 Polars 那一边多了一堆旋钮，
+其中三个**静默改数**（`closed` 的两种边界语义 + `every`/`period` 不等）：
+
+| 旋钮 | 取值 | 后果 |
+| --- | --- | --- |
+| `closed` | `left` / `right` / `both` / `none` | 闭哪一边；`both` 把边界行算两遍，`none` 把行丢掉 |
+| `label` | `left` / `right` / `datapoint` | 桶用哪个端点命名 —— **只改名字，不改内容** |
+| `every` | 步长 | 相邻窗口之间隔多远 |
+| `period` | 宽度 | 每个窗口有多宽（默认等于 `every`） |
+
+没有一个会报错 —— 桶还在，行还在，就是总数不对了。
+DuckDB 的 `time_bucket` 只有一种语义，没有这些旋钮。
+
+跟 `时间轴与序列生成` 的分工：那一节讲**时间轴本身怎么生成**（序列、补空档、`month_start` 的名字），
+这一节讲**同一批时间戳，两边怎么切**。
+
+### 1. 默认参数：两边一模一样
+
+小数据集故意把点打在桶边界上 —— 边界正是闭区间语义的分水岭：
+
+| 时间 | v |
+| --- | --- |
+| 2024-01-01 00:00:00 | 0 |
+| 2024-01-01 00:00:30 | 1 |
+| 2024-01-01 00:01:00 | 2 |
+| 2024-01-01 00:01:30 | 3 |
+| 2024-01-01 00:02:00 | 4 |
+| 2024-01-01 00:07:00 | 5 |
+
+真实总量 = **15**。
+
+```sql
+-- DuckDB
+SELECT time_bucket(INTERVAL 1 MINUTE, t) AS b, sum(v) FROM ev GROUP BY 1
+```
+
+```python
+# Polars
+df.group_by_dynamic('t', every='1m', period='1m').agg(pl.col('v').sum())
+```
+
+| 桶 | DuckDB sum | DuckDB 行数 | Polars sum | Polars 行数 |
+| --- | --- | --- | --- | --- |
+| 00:00 | 1 | 2 | 1 | 2 |
+| 00:01 | 5 | 2 | 5 | 2 |
+| 00:02 | 4 | 1 | 4 | 1 |
+| 00:07 | 5 | 1 | 5 | 1 |
+| **合计** | **15** | 6 | **15** | 6 |
+
+→ ✅ 逐桶对账**完全一致（4 个桶）**。这是好消息 —— 默认参数下两边对得上。
+后面几节讲的是「改了旋钮之后会发生什么」。
+
+### 2. closed × label：八种组合，只有一格和 DuckDB 对得上
+
+同一批数据，DuckDB 那一列是基准。Polars 换 `closed` / `label`：
+
+| closed | label | 桶数 | 合计 sum | 和 DuckDB 一样？ |
+| --- | --- | --- | --- | --- |
+| `left` | `left` | 4 | 15 | ✅ 和 DuckDB 完全一致 |
+| `left` | `right` | 4 | 15 | ❌ 桶名不同（桶里的行一样） |
+| `right` | `left` | 4 | 15 | ❌ 桶名不同（桶里的行一样） |
+| `right` | `right` | 4 | 15 | ❌ 桶名不同（桶里的行一样） |
+| `both` | `left` | 5 | 26 | ❌ 总量变了（静默改数） |
+| `both` | `right` | 5 | 26 | ❌ 总量变了（静默改数） |
+| `none` | `left` | 2 | 4 | ❌ 总量变了（静默改数） |
+| `none` | `right` | 2 | 4 | ❌ 总量变了（静默改数） |
+
+→ 默认那组（`closed='left'`、`label='left'`）和 DuckDB 一模一样。
+换任何一格，桶的**归属**就变了 —— 有的是总量变了（静默改数），
+有的只是桶的**名字**变了（`label='right'`，桶内容没变）。
+
+→ 特别注意 `label`：它只改桶的名字（用左端点还是右端点命名），**不改桶里装了什么**。
+看着像变了，其实只是换了个标签 —— 但如果下游拿桶名去 join，这就是实打实的对不上。
+
+### 3. 静默改数 ①：`closed='both'` 把边界行算两遍
+
+| 桶 | DuckDB sum | DuckDB 行数 | Polars `closed='both'` sum | 行数 |
+| --- | --- | --- | --- | --- |
+| 00:00 | 1 | 2 | 3 | 3 |
+| 00:01 | 5 | 2 | 9 | 3 |
+| 00:02 | 4 | 1 | 4 | 1 |
+| 00:06 | — | — | 5 | 1 |
+| 00:07 | 5 | 1 | 5 | 1 |
+| **合计** | **15** | 6 | **26** | 10 |
+
+→ DuckDB 合计 15，Polars 合计 26 —— 差了 11。
+
+为什么？看 `00:01:00` 这一行：
+
+- `closed='left'` 时它只属于 `[00:01, 00:02)` 这一个桶；
+- `closed='both'` 时它同时属于 `[00:00, 00:01]` 和 `[00:01, 00:02]` —— **两个桶各算它一次**。
+
+→ 而且多出来一个桶：`closed='left'` 没有 00:06 这一桶，`closed='both'` 有
+（因为 `00:07:00` 那行同时是 00:06 桶的上界）。
+→ **行还是那些行，桶多了一个，总数变大了，没有任何报错。**
+
+### 4. 静默改数 ②：`closed='none'` 把装不下窗口的行丢掉
+
+| 桶 | DuckDB sum | DuckDB 行数 | Polars `closed='none'` sum | 行数 |
+| --- | --- | --- | --- | --- |
+| 00:00 | 1 | 2 | 1 | 1 |
+| 00:01 | 5 | 2 | 3 | 1 |
+| **合计** | **15** | 6 | **4** | 2 |
+
+→ DuckDB 合计 15，Polars 合计 4 —— 少了 11。
+
+丢的是哪些行？
+
+| 时间 | v | 去哪了 |
+| --- | --- | --- |
+| 2024-01-01 00:00:00 | 0 | ❌ 谁的桶都没进 |
+| 2024-01-01 00:00:30 | 1 | 进了桶 |
+| 2024-01-01 00:01:00 | 2 | ❌ 谁的桶都没进 |
+| 2024-01-01 00:01:30 | 3 | 进了桶 |
+| 2024-01-01 00:02:00 | 4 | ❌ 谁的桶都没进 |
+| 2024-01-01 00:07:00 | 5 | ❌ 谁的桶都没进 |
+
+→ `closed='none'` 的意思是「两个端点都不算」，于是**落在桶边界上的那几行**
+`00:00:00`、`00:01:00`、`00:02:00`、`00:07:00` 全都不属于任何窗口，被静默丢掉
+（丢掉 4 行，v = [0, 2, 4, 5]）。
+→ 这是最危险的一种错法：**不报错，而且剩下的那几个桶看着都正常** ——
+DuckDB 4 个桶 → Polars 只剩 2 个（`00:02` 和 `00:07` 直接没了），
+6 行只剩 2 行。
+**光看剩下的桶根本看不出来少了行**，只能对总量。
+→ DuckDB 没有这个旋钮，也就没有这个坑。
+
+### 5. every / period：步长 ≠ 宽度，要么丢行要么重复计
+
+Polars 的窗口是这么排的（官方 docstring 的原话）：
+
+```
+[start, start + period)
+[start + every,  start + every  + period)
+[start + 2*every, start + 2*every + period)
+```
+
+也就是：**every 是步长，period 是宽度**（`period` 默认等于 `every`）。
+两个相等时就是普通分桶；一旦不等，就分两种情况。
+数据：40 条，每 30 秒一条，跨 20 分钟，真实总量 = **780**。
+
+| every | period | 窗口数 | 合计 | 关系 |
+| --- | --- | --- | --- | --- |
+| `1m` | `1m` | 20 | 780 | 等宽不重叠 ✅ |
+| `2m` | `1m` | 10 | 370 | 步长 > 宽度 → **有空档**，中间的行谁都不属于 |
+| `1m` | `2m` | 20 | 1559 | 宽度 > 步长 → **重叠**，同一行被算进几个桶 |
+| `5m` | `1m` | 4 | 124 | 步长 > 宽度 → **有空档**，中间的行谁都不属于 |
+
+→ `every='5m', period='1m'`：每 5 分钟才开一个 1 分钟的窗口，
+中间 4 分钟的行**不属于任何桶** —— 合计从 780 掉到 124。
+→ `every='1m', period='2m'`：每个窗口宽 2 分钟、每分钟开一个 ——
+窗口重叠，同一行被算两遍，合计翻倍。
+
+→ DuckDB 的 `time_bucket` 只有一种语义：等宽、不重叠。
+它没有 `every` / `period` 这一对旋钮，所以也没有这两种坑。
+想要重叠窗口，DuckDB 得用窗口函数自己写（下一节）。
+
+### 6. DuckDB 侧的对应物：窗口函数，但方向相反
+
+Polars 的重叠窗口（`every='1m', period='2m'`）是**向前看**：每个桶 = `[t, t + 2 分钟)`。
+
+DuckDB 没有这个函数，最接近的是窗口函数的 RANGE frame —— 但它是**向后看**的：
+
+```sql
+SELECT t, sum(v) OVER (ORDER BY t
+                 RANGE BETWEEN INTERVAL 1 MINUTE PRECEDING AND CURRENT ROW)
+```
+
+| t | v | sum |
+| --- | --- | --- |
+| 00:00:00 | 0 | 0 |
+| 00:00:30 | 1 | 1 |
+| 00:01:00 | 2 | 3 |
+| 00:01:30 | 3 | 6 |
+| 00:02:00 | 4 | 9 |
+| 00:07:00 | 5 | 5 |
+
+→ 两个都是「一段时间的滑动和」，但：
+
+- Polars 的 `group_by_dynamic` 是**向前**（含未来），DuckDB 的 RANGE frame 是**向后**（含过去）；
+- Polars 的结果里时间戳是**窗口的起点**，DuckDB 的结果里时间戳是**那一行自己的时间**。
+
+→ 所以「Polars 的重叠窗口」在 DuckDB 侧没有一一对应的写法 ——
+得自己用窗口函数 + LEAD/LAG 拼。**能力上有，但直觉得多。**
+
+### 7. 滚动窗口：Polars 没有 `by=`，边界行也给得不一样
+
+Polars 2.1 的 `rolling_mean` 签名：
+
+```
+rolling_mean(window_size, weights=None, *, min_samples=None, center=False)
+```
+
+→ **没有 `by=` 参数** —— 也就是说「按时间列滚动」（每分钟一个窗口，
+而不是每 N 行一个窗口）在 Polars 侧没有直接对应物，
+只能拿 `group_by_dynamic` + `rolling` 自己拼。
+
+同一条查询（每行看自己 + 前一行）：
+
+| v | DuckDB `avg()` | Polars `rolling_mean(2)` |
+| --- | --- | --- |
+| 1 | 1.0 | NULL ❌ |
+| 2 | 1.5 | 1.5 |
+| 3 | 2.5 | 2.5 |
+| 4 | 3.5 | 3.5 |
+| 5 | 4.5 | 4.5 |
+
+→ **前几行不一样**：DuckDB 的窗口函数把「不满一窗」的部分也算进去
+（第一行只有它自己，avg = 1.0）；
+Polars 默认 `min_samples=window_size`，不满一窗直接给 NULL。
+
+→ 补一句：Polars 想跟 DuckDB 对齐，得显式写 `min_samples=1`。
+写成 `rolling_mean(2)` 的人，拿到的是「开头几行是 NULL」的版本 ——
+而 NULL 往下游一传，`avg()` 和 `sum()` 的结果就全变了。
+
+### 8. 指数加权移动平均：Polars 有，DuckDB 根本没这个函数
+
+```python
+pl.col('v').ewm_mean(alpha=0.5)
+```
+
+| v | ewm_mean(alpha=0.5) |
+| --- | --- |
+| 1.0 | 1.000000 |
+| 2.0 | 1.666667 |
+| 3.0 | 2.428571 |
+| 4.0 | 3.266667 |
+| 5.0 | 4.161290 |
+
+DuckDB：`❌ Catalog Error: Scalar Function with name ewm_mean does not exist!`
+
+→ DuckDB 2.0 **压根没有指数加权移动平均**这个函数（`ewm_mean` / `ewm_std` 都没有）。
+要算只能自己写递归 CTE，或者退化成普通移动平均。
+
+→ 这是个**一边倒**的能力差：Polars 有、DuckDB 没有。
+和前面几节「两边都有但语义不同」是两种完全不同的问题 ——
+后面这种是「移植不过去」，前面那种是「移植过去会算错」。
+
+### 9. 月末边界：这一条两边居然是一致的
+
+日期：2024-01-15、2024-01-31、2024-02-29、2024-03-31
+
+| 桶 | DuckDB `time_bucket(INTERVAL 1 MONTH)` | Polars `group_by_dynamic(every='1mo')` |
+| --- | --- | --- |
+| 2024-01-01 | sum=3 | sum=3 |
+| 2024-02-01 | sum=3 | sum=3 |
+| 2024-03-01 | sum=4 | sum=4 |
+
+→ ✅ **完全一致**。「1 月 31 日归到 1 月、2 月 29 日归到 2 月」—— 两边都这么干。
+闰年和月末这一类边界，日历型分桶反而是安全的。
+（真正会出事的是前面那几节：**闭区间**和**步长/宽度**。）
+
+### 10. 代价：两个规模各跑一遍
+
+两边跑的是同一批数据（时间戳均匀铺在 2,000,000 秒 ≈ 23 天里），
+做的是同一件事：**切桶 + 求和 + 把结果物化**。
+
+**小规模（100,000 行）**
+
+| 实现 | 桶数 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- | --- |
+| DuckDB `time_bucket` | 1667 | 7.7 | 7.7 |
+| Polars `group_by_dynamic` | 1667 | **2.2** | 1.9 |
+
+→ 桶数一致（1667 vs 1667）—— 分桶结果本身没有差异，同样的时间戳切出同样的桶。
+→ 这一档 **Polars 更快**（2.2 ms vs 7.7 ms，Polars 是 DuckDB 的 0.29×）。
+
+**大规模（1,000,000 行）**
+
+| 实现 | 桶数 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- | --- |
+| DuckDB `time_bucket` | 16667 | 27.2 | 25.8 |
+| Polars `group_by_dynamic` | 16667 | **15.7** | 14.5 |
+
+→ 桶数一致（16667 vs 16667）。
+→ 这一档还是 **Polars 更快**（15.7 ms vs 27.2 ms，Polars 是 DuckDB 的 0.58×）。
+
+但快慢这件事得拆开看 —— 把两边各自拆成几步（大规模）：
+
+| 步骤 | 中位数 (ms) |
+| --- | --- |
+| DuckDB `count(*)`（全表，不分桶） | 0.61 |
+| DuckDB 只算 `time_bucket`，不聚合 | 0.98 |
+| DuckDB `time_bucket` + `GROUP BY` + `sum` | 26.63 |
+| Polars 只 `sort`，不分桶 | 7.57 |
+| Polars `group_by_dynamic` + `agg` | 15.24 |
+
+→ DuckDB 那一侧：**切桶这一步几乎不花时间**
+（`count(*)` 0.61 ms → 只算 `time_bucket` 0.98 ms），
+大头在后面的哈希聚合：`time_bucket` + `GROUP BY` + `sum` 26.63 ms，
+是「只算 `time_bucket`」的 **27.2×**。
+→ Polars 那一侧：`group_by_dynamic` 要求输入**已排序**，
+光 `sort` 就 7.57 ms —— 占它整个 `group_by_dynamic` + `agg`（15.24 ms）的 **50%**。
+
+→ 也就是说：**这里比的不是「谁的分桶算法更聪明」，
+是「谁把切分、排序、聚合合成了更少的步数」**。
+
+→ 顺带一提：**分桶的语义对不对，比分桶快不快重要得多**。
+前面那几节的 `closed` / `every` / `period` 改一个参数，总量就变了，
+而这一节里两个实现都是对的 —— 快的那个不一定对，对的那个也不一定快。
+
+> 口径：时间戳在 2,000,000 秒里均匀铺开，`repeat = 5` 取中位数；
+> 两个规模是同一份数据的 1/10 和 1/1，所以桶数正好差 10 倍（1667 vs 16667）。
+> **结论只按实测说**：这两个规模上都是 Polars 快。
+> （快慢的原因这一节没有单独拆开量，所以不写「谁为什么快」——
+> 唯一拆开量过的是上面那张分解表：Polars 要先 sort，DuckDB 的时间大头在哈希聚合。）
 
 ## 近似计算 vs 精确
 
@@ -6817,6 +7145,346 @@ DuckDB 的 `lower()` 和 Polars 的 `str.to_lowercase()` 都认 Unicode，大部
 
 > 口径：1000000 行、`region` 只有 5 个不同值，所以这部分时间大头是**读 parquet**，排序本身占的比重不大 —— 真实场景里「基数高的字符串列」上排序的占比会大得多。
 
+## Unicode 文本：肉眼一样，字节可以不一样
+
+`src/unicode_demo.py`。两个引擎都把字符串当 UTF-8 字节序列处理，**存得下、读得出** ——
+但「看起来是同一个字符串」这件事，两边都会判成**不是同一个**。
+
+这一层的风险不在「存不下」，在「看起来是同一个」。
+
+### 1. 肉眼一样，字节不一样
+
+两串长得一模一样的「é」：
+
+```
+预组合   é          字节 = b'\xc3\xa9'    码点 = U+00E9
+分解形   e+U+0301   字节 = b'e\xcc\x81'   码点 = U+0065 U+0301
+```
+
+（第二种是 `e` 后面跟一个组合尖音符 U+0301 —— 终端里长得一样，字节多一个。）
+
+Python 里 `PRE_E == DEC_E` → `False`。
+
+两边都认为它们不是同一个串，而且长度不一样：
+
+| 样本 | DuckDB 相等？ | DuckDB `length()` | DuckDB `strlen()` | Polars `len_chars` | Polars `len_bytes` |
+| --- | --- | --- | --- | --- | --- |
+| 预组合 | False | 1 | 2 | 1 | 2 |
+| 分解形 | False | 2 | 3 | 2 | 3 |
+
+→ **两个引擎的口径是一样的**：
+`length()` / `len_chars()` 数的是**码点**（不是人看到的字），
+`strlen()` / `len_bytes()` 数的是 **UTF-8 字节**。
+预组合 1 码点 2 字节，分解形 2 码点 3 字节 —— 两边数出来完全一致。
+
+→ 麻烦不在「数得对不对」，在于**相等判断只看字节**：
+DuckDB 里 `'é' = 'é'` → `False`（左边预组合、右边分解形）。
+所以下面这组数据，在两个引擎眼里是**两个不同的键**。
+
+### 2. 静默漏匹配：去重多一个、join 少一半
+
+一张「用户输入」表和一个「字典」表，逻辑上是同一个词，
+但用户敲进去的是分解形、字典里存的是预组合形。
+
+`inp` = [预组合 é, 分解形 e+U+0301]，`dict` = [预组合 é]
+
+| 指标 | DuckDB | Polars | 说明 |
+| --- | --- | --- | --- |
+| `count(DISTINCT k)`（原始） | 2 | 2 | 两个键 —— 其实是一个词 |
+| `count(DISTINCT nfc(k))` | 1 | 1 | 规范化后并成一个 |
+| `JOIN ... ON k = k` | 1 | 1 | 只匹配上 1 行，漏了一半 |
+| `JOIN ... ON nfc(k) = nfc(k)` | 2 | 2 | 两行都匹配上 |
+
+→ **两个引擎在这里是一样错的** —— 都按字节比，都漏了一半。
+这不是「谁更好」的问题，是**两边都需要显式规范化**。
+
+→ 而且两边**都提供** NFC 规范化（第 3、4 节实测过），
+所以这一类问题可以靠「两边都套同一个 NFC」根治。
+
+→ 注意去重那行：规范化前 2 个键、规范化后 1 个键。
+拿原始串当字典键，**同一份用户数据会多出一倍的条目**。
+
+### 3. 规范化工具箱：两边各有什么
+
+先把 DuckDB 里跟「规范化 / 重音 / grapheme」沾边的函数全捞出来：
+
+```
+collate_noaccent      icu_collate_noaccent  json_normalize
+left_grapheme         length_grapheme        nfc_normalize
+normalized_interval   right_grapheme         strip_accents
+substring_grapheme    unicode                variant_normalize
+```
+
+（`json_normalize` / `variant_normalize` / `normalized_interval` 是同名不同义的，
+`unicode` 是个取码点的辅助函数 —— 真正相关的是下面这几个。）
+
+逐个试：
+
+| 想要的规范化形式 | DuckDB 的写法 | 结果 | Polars 的写法 | 结果 |
+| --- | --- | --- | --- | --- |
+| NFC（预组合） | `nfc_normalize` | ✅ U+00E9 | `str.normalize("NFC")` | ✅ U+00E9 |
+| NFD（分解） | `nfd_normalize` | ❌ Catalog Error | `str.normalize("NFD")` | ✅ U+0065 U+0301 |
+| NFKC（兼容+预组合） | `nfkc_normalize` | ❌ Catalog Error | `str.normalize("NFKC")` | ✅ U+00E9 |
+| NFKD（兼容+分解） | `nfkd_normalize` | ❌ Catalog Error | `str.normalize("NFKD")` | ✅ U+0065 U+0301 |
+
+→ **DuckDB 2.0 只有 NFC**（NFD / NFKC / NFKD 都不存在，报 Catalog Error）；
+**Polars 四种全有**。
+
+→ 两边唯一的交集是 **NFC**。第 4 节会拿一批样本实测：
+这唯一的一条公共路径，两边的输出是不是真的逐样本一样。
+
+→ 另外 DuckDB 自带 grapheme 家族（第 7 节）：
+
+| 函数 | 有没有 |
+| --- | --- |
+| `length_grapheme` | ✅ 有（`length_grapheme('abc')` = `3`） |
+| `left_grapheme` | ✅ 有（`left_grapheme('abc', 2)` = `ab`） |
+| `right_grapheme` | ✅ 有（`right_grapheme('abc', 2)` = `bc`） |
+| `substring_grapheme` | ✅ 有（`substring_grapheme('abc', 1, 2)` = `ab`） |
+
+Polars 2.1 的 `str` 命名空间一共 47 个方法，
+里面带 `grapheme` 的有 **0** 个（一个都没有）。
+
+→ **grapheme 是 DuckDB 独有的能力**，Polars 侧完全没有对应物。
+
+### 4. NFC 是唯一的公共路径 —— 实测逐样本一致
+
+拿一批「同一串字符的不同形态」当样本：
+拉丁带重音、组合形、预组合形、谚文、天城文、连字、带圈数字、罗马数字。
+
+- 样本数 = **14**
+- DuckDB `nfc_normalize` 与 Polars `normalize('NFC')` 不一致的 = **0**
+
+→ ✅ **逐样本一致，没有一个不一样。**
+所以要跨两个引擎做「同一个字符串」的比较，
+**两边都套 NFC 就能对上** —— 这是唯一有实测支撑的公共路径。
+
+→ 但注意这条结论的**适用面**：它只覆盖 NFC。
+下一节要看兼容性分解（NFKC/NFKD）—— 那一路只有 Polars 有。
+
+### 5. 兼容性分解：只有 Polars 有，DuckDB 补不了
+
+NFC 只解决「同一串字符的不同写法」；
+**兼容性分解（NFKC / NFKD）解决的是「长得像但根本不是同一个字符」**：
+① → 1、ﬁ → fi、Ⅻ → XII —— 这类在 NFC 下**永远不会**被统一。
+
+| 输入 | 含义 | DuckDB `nfc_normalize` | Polars NFC | Polars NFKC | NFKC 变了没 |
+| --- | --- | --- | --- | --- | --- |
+| ① | 带圈数字一 | U+2460 | U+2460 | U+0031 | ✅ 变了 |
+| ② | 带圈数字二 | U+2461 | U+2461 | U+0032 | ✅ 变了 |
+| Ⅻ | 罗马数字十二 | U+216B | U+216B | U+0058 U+0049 U+0049 | ✅ 变了 |
+| ﬁ | 连字 fi | U+FB01 | U+FB01 | U+0066 U+0069 | ✅ 变了 |
+| ² | 上标二 | U+00B2 | U+00B2 | U+0032 | ✅ 变了 |
+| ㎏ | 兼容单位 kg | U+338F | U+338F | U+006B U+0067 | ✅ 变了 |
+| é | 预组合 | U+00E9 | U+00E9 | U+00E9 | — 一样 |
+| e+U+0301 | 分解形 | U+00E9 | U+00E9 | U+00E9 | — 一样 |
+
+→ 这 8 个样本里有 **6** 个被 NFKC 改了写。
+而 DuckDB 侧**没有 `nfkc_normalize` 这个函数**（第 3 节实测过 Catalog Error）。
+
+→ 后果是实打实的：拿「带圈数字」和「普通数字」当同一个键，
+Polars 侧（NFKC 之后）是一个键，DuckDB 侧永远是两个。
+
+实测 `['①', '1']` 的不同键个数：
+
+| 做法 | 不同键个数 |
+| --- | --- |
+| DuckDB（只有 NFC） | 2 |
+| Polars `normalize('NFC')` | 2 |
+| Polars `normalize('NFKC')` | 1 |
+
+→ **要跨引擎对齐「兼容字符」这一层，Polars 侧得做 DuckDB 侧做不到的事。**
+没有第二条路：要么两边都接受「① 和 1 是两个键」，
+要么 DuckDB 侧在进 DuckDB 之前先在 Python 侧规范化好。
+
+### 6. DuckDB 的 strip_accents 不等于 NFKD + 去组合标记
+
+听起来像是「去掉重音」，实际做的事比这少得多 ——
+而且和 Polars 那条路的结果不一样。
+
+Polars 侧没有 `strip_accents`，能凑出来的等价物是：
+
+```python
+str.normalize('NFKD').str.replace(r'\p{M}', '', literal=False)
+```
+
+| 输入 | 含义 | DuckDB `strip_accents` | Polars NFKD+去标记 | 两边一样？ |
+| --- | --- | --- | --- | --- |
+| é | 预组合带尖音符 | U+0065 | U+0065 | ✅ 一样 |
+| e+U+0301 | 分解带尖音符 | U+0065 | U+0065 | ✅ 一样 |
+| ü | 预组合 | U+0075 | U+0075 | ✅ 一样 |
+| ğ | 带下钩 | U+0067 | U+0067 | ✅ 一样 |
+| ı | 无点小写 i | U+0131 | U+0131 | ✅ 一样 |
+| ø | 带斜杠 o | U+00F8 | U+00F8 | ✅ 一样 |
+| ß | 德语小写 sharp s | U+00DF | U+00DF | ✅ 一样 |
+| ﬁ | 连字 fi | U+FB01 | U+0066 U+0069 | ❌ 不一样 |
+| ① | 带圈数字一 | U+2460 | U+0031 | ❌ 不一样 |
+| Ⅻ | 罗马数字十二 | U+216B | U+0058 U+0049 U+0049 | ❌ 不一样 |
+
+→ 10 个样本里，两边结果相同的只有 **7** 个。
+
+→ 差在哪：
+
+- DuckDB 的 `strip_accents` 是**拉丁字母的重音剥离器**：
+  é→e、ü→u、ğ→g 都会动；但 **ı、ø、ß、ﬁ、①、Ⅻ 原样不动**。
+- Polars 那条路先做 NFKD（兼容性分解），所以 **ﬁ→fi、①→1、Ⅻ→XII**；
+  再去组合标记，所以 é→e、ü→u。
+
+→ 所以「拿 `strip_accents` 当去重键」这件事，两边给出的键集合不一样：
+
+| 做法 | `['①', '1']` 处理后的不同键个数 |
+| --- | --- |
+| DuckDB `strip_accents` | 2 |
+| Polars NFKD + 去标记 | 1 |
+
+→ **别把这两个函数当成同一个东西**。DuckDB 那个是「拉丁重音剥离」，
+Polars 那条是「兼容分解 + 剥标记」，覆盖面大得多，
+但也**破坏得更多**（连字、带圈数字、罗马数字都被拆开了）。
+
+### 7.「一个字」是几个：grapheme cluster
+
+一个用户看到的字，可能由好几个码点拼出来：
+
+| 样本 | 构成 | 码点 |
+| --- | --- | --- |
+| 家庭 emoji | 4 个 emoji + 3 个零宽连接符（U+200D） | U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466 |
+| 国旗 | 2 个区域指示符 | U+1F1E8 U+1F1F3 |
+| 肤色 | 1 个 emoji + 1 个肤色修饰符 | U+1F44D U+1F3FD |
+| 天城文 | 4 码点拼成合体字 | U+0915 U+094D U+0937 U+093F |
+| 组合符 | e + U+0301 | U+0065 U+0301 |
+| 汉字 | 两个汉字 | U+4E2D U+6587 |
+
+数「用户看到几个字」，得按 **grapheme cluster** 数，不能按码点数。
+
+| 样本 | 码点数 | DuckDB `length_grapheme` | Polars `len_chars` | 两边差 |
+| --- | --- | --- | --- | --- |
+| 家庭 emoji | 7 | 1 | 7 | ❌ 差 6 |
+| 国旗 | 2 | 1 | 2 | ❌ 差 1 |
+| 肤色 | 2 | 1 | 2 | ❌ 差 1 |
+| 天城文 | 4 | 1 | 4 | ❌ 差 3 |
+| 组合符 | 2 | 1 | 2 | ❌ 差 1 |
+| 汉字 | 2 | 2 | 2 | ✅ 数字相同 |
+
+→ DuckDB 的 `length_grapheme` 数的是**用户看到的字**：
+家庭 emoji = 1、国旗 = 1、肤色修饰 = 1、天城文合体字 = 1。
+
+→ **Polars 2.1 没有任何 grapheme 函数**（第 3 节实测过）：
+它只有 `len_chars`（码点数）和 `len_bytes`（字节数），
+上面那一列 Polars 的数字全是码点数 —— 家庭 emoji 算 7 个。
+
+→ 所以「这个昵称显示几个字」这种问题：
+**DuckDB 能答，Polars 答不了**（只能答「几个码点」，那不是同一个问题）。
+
+### 8. 截断到 2 个字：一边切碎 emoji，一边切不动
+
+「取前两个字符」在有 emoji 的文本上很容易出事。样本 = 家庭 emoji（7 码点，1 个字）：
+
+| 写法 | 结果（码点） | 码点数 | 是不是完整的字 |
+| --- | --- | --- | --- |
+| DuckDB `substring(s, 1, 2)` | U+1F468 U+200D | 2 | ❌ 切碎了 |
+| DuckDB `left(s, 2)` | U+1F468 U+200D | 2 | ❌ 切碎了 |
+| DuckDB `substring_grapheme(s, 1, 2)` | U+1F468 U+200D U+1F469 U+200D U+1F467 U+200D U+1F466 | 7 | ✅ 完整 |
+| DuckDB `left_grapheme(s, 2)` | 同上（7 个码点） | 7 | ✅ 完整 |
+| Polars `str.slice(0, 2)` | U+1F468 U+200D | 2 | ❌ 切碎了 |
+| Polars `str.head(2)` | U+1F468 U+200D | 2 | ❌ 切碎了 |
+
+→ DuckDB 的 `substring` / `left` 按**码点**切，
+家庭 emoji 被切成「U+1F468 + 一个零宽连接符」—— 半个 emoji，渲染出来是方块。
+
+→ DuckDB 的 `substring_grapheme` / `left_grapheme` 按**字**切，
+要 2 个字就给你 2 个字（这串本来就只有 1 个字，7 个码点一个不少）。
+
+→ **Polars 侧两个写法都按码点切**，出来的结果和 DuckDB 的 `substring` 一样：
+
+- `str.slice(0, 2)` = U+1F468 U+200D
+- `str.head(2)` = U+1F468 U+200D
+
+—— 也就是说 **Polars 没有「按字截断」这条路**。
+
+→ 这不是「Polars 少个函数」这么轻：**「取前 N 个字」在 Polars 侧要么做不到，
+要么拿 `len_chars` 近似 —— 而近似出来的是码点数，emoji 会被切碎。**
+
+### 9. 大小写映射会改长度（这次是 upper）
+
+`collation_demo.py` 第 7 节讲过 `lower()`：
+DuckDB `lower('İ')` = `'i'`（1 个码点），Polars = `'i'` + U+0307（2 个码点）。
+这一节看 **upper**，分歧的形态不一样 —— 不是「多了个组合标记」，
+而是**一个字符变成两个字符**。
+
+| 输入 | 含义 | DuckDB `upper()` | 长度 | Polars `to_uppercase()` | 长度 | 一样？ |
+| --- | --- | --- | --- | --- | --- | --- |
+| ß | 德语小写 sharp s（U+00DF） | U+1E9E | 1 | U+0053 U+0053 | 2 | ❌ 不一样 |
+| ﬁ | 连字 fi（U+FB01） | U+FB01 | 1 | U+0046 U+0049 | 2 | ❌ 不一样 |
+| İ | 带点大写 I（U+0130） | U+0130 | 1 | U+0130 | 1 | ✅ |
+| ǅ | 小写的带车刀 dz（U+01C5） | U+01C4 | 1 | U+01C4 | 1 | ✅ |
+| ẞ | 大写 sharp s（U+1E9E） | U+1E9E | 1 | U+1E9E | 1 | ✅ |
+
+→ `ß` 的完整大写映射是 **'SS'**（两个字符），`ﬁ` 的是 **'FI'**。
+DuckDB 用的是**简单映射**，只给 `'ẞ'`（U+1E9E，仍是 1 个字符）、`ﬁ` 原样不动；
+Polars 用的是**完整映射**，真的给 `'SS'`（2 个字符）、`'FI'`（2 个字符）。
+
+→ 长度变了意味着：**同一列里 `ß` 和 `ss` 在 DuckDB 侧是两个键，
+在 Polars 侧（upper 之后）会撞成一个键。**
+拿 `upper(x)` 当去重键，两边的去重结果就不一样。
+
+→ 顺带：Polars 还有 `to_titlecase`，DuckDB **一个 titlecase 函数都没有**：
+
+| 写法 | 结果 |
+| --- | --- |
+| DuckDB `initcap` | ❌ Catalog Error: Scalar Function with name initcap does not exist! |
+| DuckDB `title` | ❌ Catalog Error: Scalar Function with name title does not exist! |
+| DuckDB `to_titlecase` | ❌ Catalog Error: Scalar Function with name to_titlecase does not exist! |
+| Polars `to_titlecase('istanbul ßeta')` | `'Istanbul Sseta'` |
+
+### 10. 代价：200,000 行字符串规范化各要多久
+
+用 `orders.parquet` 的列拼一条中文长文本，再叠上重音拉丁字母和 emoji。
+
+- 数据源：`orders.parquet`，1,000,000 行
+- 实际取用 200,000 行，每行一条中文长文本（含重音字母和 ZWJ emoji）
+- 口径核对：NFC 之后的总长度 DuckDB = 3,600,000，Polars = 3,600,000，一致 = True
+
+| 写法 | 做什么 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- | --- |
+| DuckDB `sum(length(s))` | 只测基线（不规范化） | 3.0 | 3.0 |
+| Polars `sum(len_chars)` | 只测基线（不规范化） | 2.1 | 2.1 |
+| DuckDB `nfc_normalize` | NFC 规范化 | 124.5 | 124.0 |
+| Polars `normalize('NFC')` | NFC 规范化 | **112.2** | 111.1 |
+| DuckDB `strip_accents` | 剥拉丁重音 | 119.2 | 118.7 |
+| Polars NFKD + 去组合标记 | NFKD 再剥标记 | 110.3 | 109.8 |
+
+→ **NFC 两边基本一个量级**：DuckDB 124.5 ms vs Polars 112.2 ms
+（各自的基线是 3.0 / 2.1 ms，规范化本身大约是基线的 **41.5× / 53.4×**）
+
+→ **strip_accents 那两行不是一回事，别拿它们比速度**：
+DuckDB 119.2 ms 做的是「拉丁重音剥离」，
+Polars 110.3 ms 做的是「NFKD 分解 + 剥标记」——
+后者多做一整趟分解，而且**输出的字符串也不一样**（第 6 节）。
+
+→ 口径说明：200,000 行、每行一条含中文 + 重音字母 + ZWJ emoji 的文本；
+测的是「规范化 + 取长度 + 求和」整条链路，两边的求和结果一致，
+所以比的是时间不是不同的活儿。
+
+### 小结
+
+1. **肉眼一样不等于字节一样**：预组合 é 和分解形在两个引擎眼里都是两个不同的键 ——
+   去重多一个、join 漏一半，**两边一样错**。
+2. **两边都支持 NFC，实测逐样本一致** —— 这是唯一的跨引擎安全路径。
+   规范化之后再去重、再 join，结果才对得上。
+3. **DuckDB 只有 NFC**：NFD / NFKC / NFKD 都不存在（Catalog Error）。
+   ①→1、ﬁ→fi、Ⅻ→XII 这类兼容字符，DuckDB 侧补不了。
+4. **`strip_accents` ≠ NFKD + 去组合标记**：DuckDB 那个是拉丁重音剥离器，
+   ﬁ/①/Ⅻ/ø/ß 原样不动；Polars 那条路把兼容字符也拆开了 —— 两边给出的键集合不一样。
+5. **grapheme 是 DuckDB 独有的能力**：`length_grapheme` / `substring_grapheme` /
+   `left_grapheme` / `right_grapheme` 都有，Polars 2.1 一个都没有 ——
+   「取前 N 个字」在 Polars 侧做不到。
+6. **大小写映射会改长度**：`upper('ß')` 在 DuckDB 侧是 `'ẞ'`（1 字符），
+   在 Polars 侧是 `'SS'`（2 字符）。拿 `upper(x)` 当去重键，两边结果不同。
+
+→ 一句话：**Unicode 这层的风险不在「存不下」，在「看起来是同一个」。**
+两边的共同解法是「比较前先 NFC」；两边各自缺的函数
+（DuckDB 缺 NFKD，Polars 缺 grapheme）得看业务是否真的用到。
+
 ## 数学函数语义：同一个 log()，两个底数
 
 `uv run python src/math_demo.py`
@@ -8786,6 +9454,8 @@ duckdb-polars-demo/
 │   ├── arrow_demo.py       # Arrow 三层版本 / ABI 无版本号 / 零拷贝边界 / 三种性格 / 类型断点 / IPC 互通范围 / relation 陷阱
 │   ├── prune_probe_demo.py # 行组裁剪的探针：把行组的数据页弄坏，用「报不报错」量「跳没跳过」
 │   ├── merge_demo.py       # MERGE INTO：一条语句里的改插删 vs Polars 手工复刻，逐行对账
+│   ├── temporal_demo.py    # 时间分桶：closed / label / every / period 四个旋钮，三个会静默改数
+│   ├── unicode_demo.py     # Unicode 文本：规范等价性 / 规范化工具箱 / grapheme cluster
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程

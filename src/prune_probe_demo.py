@@ -78,9 +78,7 @@ def build_file(con: duckdb.DuckDBPyConnection, path: Path, rows: int) -> int:
     return int(n)
 
 
-def column_chunks(
-    con: duckdb.DuckDBPyConnection, path: Path
-) -> list[tuple[int, str, int, int]]:
+def column_chunks(con: duckdb.DuckDBPyConnection, path: Path) -> list[tuple[int, str, int, int]]:
     """每个行组 × 每列的 (行组号, 列名, 数据页偏移, 压缩后字节数)。
 
     这四个数就是「这一列块的数据在文件的哪儿、有多大」——
@@ -437,10 +435,7 @@ def scenario_optimizer_switch(con: duckdb.DuckDBPyConnection, good: Path, workdi
     for disabled, label in switches:
         verdict, _ = probe(bad1, disabled)
         print(
-            "  "
-            + common.pad(label, 38)
-            + common.pad(plan_has_filter_scan(disabled), 22)
-            + verdict
+            "  " + common.pad(label, 38) + common.pad(plan_has_filter_scan(disabled), 22) + verdict
         )
     print()
     print("  → **关掉 `filter_pushdown`，坏 rg1 的文件立刻报错** ——")
@@ -523,8 +518,10 @@ def scenario_timing(con: duckdb.DuckDBPyConnection, good: Path, repeat: int) -> 
     if len(medians) == 4 and medians[0] > 0:
         duck_ratio = medians[1] / medians[0]
         pol_ratio = medians[3] / medians[2]
-        print(f"  → DuckDB：不剪比剪慢 **{duck_ratio:.2f}×**；"
-              f"Polars：不剪比剪慢 **{pol_ratio:.2f}×**。")
+        print(
+            f"  → DuckDB：不剪比剪慢 **{duck_ratio:.2f}×**；"
+            f"Polars：不剪比剪慢 **{pol_ratio:.2f}×**。"
+        )
         print()
     print("  → 计时能看出「快慢」，但**看不出「跳了哪几个行组」**：")
     print("    两边快慢的量级差不多（都是同一套 parquet + 同一套统计），")
