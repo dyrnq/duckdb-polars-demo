@@ -21,6 +21,7 @@
 | 写入与事务 | 覆盖还是追加、原子性、事务与并发读写 |
 | 文件布局 | 多文件与分区表：schema 冲突、分区裁剪、往返保真 |
 | 读取路径 | 同一个 parquet 文件换个 reader 能差多少 —— 口径（冷热进程 / 物化端点）、物化代价、行组数决定谁能并行 |
+| 跨框架共享 | Arrow 是怎么让两个框架互通数据的 —— 三层版本、ABI 为什么没有版本号、零拷贝在哪儿断 |
 | 性能 | 相同数据规模下的耗时对比；结果等价性校验 |
 | 语义覆盖面 | 窗口 / 聚合 / 集合运算 / 正则 / 增删改 / Schema / 时间轴 / 近似计算 —— 每个都有一份实测对账 |
 | 形状与能力 | 多维聚合 / 透视重塑 / 嵌套类型 / 查询计划 / 采样 / 约束 / DDL / 内存 —— 引擎能做什么、不能做什么 |
@@ -93,6 +94,7 @@ uv run python src/config_demo.py       # 调引擎与改配置：表函数、CAL
 uv run python src/materialize_demo.py  # 结果物化方式的代价：把数据拿出引擎的几条通道
 uv run python src/columnar_demo.py     # 列式存储：行组里按列分段、投影下推、按列压缩
 uv run python src/reader_demo.py       # 四个 reader 读同一份 parquet：口径决定数字，行组数决定谁能并行
+uv run python src/arrow_demo.py        # Arrow 的三层版本 + 零拷贝的边界：共享靠什么、断在哪
 ```
 
 一键跑完整流程：
@@ -166,6 +168,7 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `materialize_demo.py` | 结果物化方式的代价：Arrow / numpy / 元组 / 字典几条通道，代价差一个数量级，语义还不一样 |
 | `columnar_demo.py` | 列式存储：行组里按列分段、投影下推的代价、按列压缩，以及「列式不是 DuckDB 对 Polars 的差异点」 |
 | `reader_demo.py` | 读 parquet 的四个 reader 对照：口径不对数字能差 40 倍、DuckDB 慢在物化不在读、行组数决定谁能用上并行 |
+| `arrow_demo.py` | Arrow 的三层版本 + 零拷贝的边界：ABI 里没有版本号、共享靠的是布局与所有权回调、零拷贝是列的性质、类型会断也会改 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -254,7 +257,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，62 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，63 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -619,6 +622,10 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 266 | 读 parquet 的口径 | 冷进程 **115.2 ms** / 热进程 **97.8 ms** | 冷进程 **76.9 ms** / 热进程 **48.8 ms** | 同一个文件换个 reader 能差 3 倍；**报数字必须带口径**（冷热进程、整表还是单列、哪个物化端点） |
 | 267 | 「读 parquet 慢」慢在哪 | 扫描只占 **34%**，七成在「收集结果 + 转 Arrow」 | —— | DuckDB 的 reader 不慢，是**产物管道**长 |
 | 268 | 读 parquet 的并行粒度 | parquet 扫描**按行组并行** —— 1 个行组的文件用不上，线程数 1→8 扫描时间不变 | 行组级并行，拆成 8 个行组后快 **2.5×** | **行组数是选 reader 之前必须看的第一个数** |
+| 269 | Arrow 的「版本」有几层 | 发行版 / 磁盘格式版本（文件外层**永远 V5**，消息版本 V1~V5 可选、**向后兼容**） / ABI | —— | 别把发行版当 ABI：pyarrow 26 / polars 2.1 / duckdb 2.0 版本差很远照样互通 |
+| 270 | ABI 里有没有版本号 | —— | —— | **没有**：`ArrowSchema` / `ArrowArray` 里只有布局 + `release` 回调；共享靠的是**约定**（布局标准化 + 所有权回调 + `__arrow_c_stream__` 入口），不靠版本协商 |
+| 271 | 零拷贝是不是整个表的性质 | 过 DuckDB **一律要拷**（Arrow 是它的输入/输出格式，不是内部表示） | 定宽列过 polars **地址不变**（连续两次导出还是同一块）；字符串列**每次导出都重建缓冲区** | **零拷贝是列的性质**：定宽列成立、变宽列不成立 |
+| 272 | 跨框架的类型会不会断 | —— | pyarrow 26 的 decimal256 / run_end_encoded / list_view，polars 2.1 **直接不认**（decimal256 是 Rust panic，`except Exception` 接不住）；`string`/`list`/`map`/`dictionary` 被**改型** | 数据一个字节不差，**schema 变了**；跨框架传数据前先在两边各读一遍 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.execute(sql).to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那份拷贝是**内存**代价；**时间**上哪条路快取决于文件的行组数（本项目这份 1 行组的 fixture 上，反而是 `execute()` 快 1.43×），所以别照着警告改代码。
 
@@ -655,6 +662,8 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 在 `列式存储：行组里按列分段` 里展开；
 第 266~268 条（读 parquet 的口径 / 「读慢」慢在哪 / 并行粒度）在
 `读 parquet 到底谁快：四个 reader 的口径对照` 里展开。
+第 269~272 条（Arrow 的三层版本 / ABI 里没有版本号 / 零拷贝是列的性质 / 类型会断会改）在
+`Arrow 的三层版本，和「零拷贝」到底在哪儿断` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -674,7 +683,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 实测要点：
 
 - 两个引擎读同一个 `data/orders.parquet`，schema 一致、`equals()` 为 True —— 这是「比谁快」能站得住脚的前提
-- DuckDB → Arrow → Polars 转换后，**Arrow 底层 buffer 地址不变**（脚本里直接比对了地址），没有 Python 层的行拷贝
+- DuckDB → Arrow → Polars 转换后，**Arrow 底层 buffer 地址不变**（脚本里直接比对了地址），没有 Python 层的行拷贝 —— 准确说是**那一列**（`revenue`，float64）地址不变；字符串列过 polars 会重建缓冲区，详见 `Arrow 的三层版本，和「零拷贝」到底在哪儿断`
 - 接力流水线成立：DuckDB 做谓词下推 + 并行聚合 → Arrow → Polars 算窗口函数收尾，结果与纯 DuckDB、纯 Polars 三者逐值一致 ✅
 
 ```python
@@ -7878,6 +7887,163 @@ use con.sql(query).to_arrow_table() instead.
    它是第三方 0.x 的纯 C 库，进依赖要掂量。
    真正值得抄的是它提醒的那件事：**reader 本身是个可以选的部件。**
 
+## Arrow 的三层版本，和「零拷贝」到底在哪儿断
+
+`uv run python src/arrow_demo.py` 把「Arrow 是两个引擎之间的通用货币」这句话拆开、逐条实测。
+前面的 demo 比的是**引擎**；这一节往下一格，问的是**两个框架之间那道缝**是怎么架起来的。
+
+### 1. 「Arrow 的版本」是三层，别混着说
+
+| 层 | 实测值 | 谁管它 |
+| --- | --- | --- |
+| 发行版 | pyarrow 26.0.1 / polars 2.1.0 / duckdb 2.0.0 | 各自独立，谁也不约束谁 |
+| 磁盘格式版本 | 文件格式 **4 (V5)**；body 消息 **V1~V5** | Arrow 规范 |
+| ABI（C Data Interface） | `struct ArrowSchema` / `struct ArrowArray` 里**没有 version 字段** | C Data Interface 规范 |
+
+第 2 层有个容易搞混的地方：IPC 文件里有**两个**版本号。
+同一份数据，换 `metadata_version` 写出来（实测）：
+
+| 写入选项 | 文件格式版本 (footer) | body 消息的 MessageVersion | 字节数 |
+| --- | --- | --- | --- |
+| V1 | 4 (V5) | 0 (V1) | 666 |
+| V2 | 4 (V5) | 1 (V2) | 666 |
+| V3 | 4 (V5) | 2 (V3) | 666 |
+| V4 | 4 (V5) | 3 (V4) | 666 |
+| V5 | 4 (V5) | 4 (V5) | 666 |
+
+**文件外层的格式版本永远是 V5**；`metadata_version` 控制的是每条消息**内部**的版本 ——
+Arrow 当年加新特性（decimal256、视图类型）就是在这里**加 flag 位**，不改已有位的含义。
+所以老 reader 读到新 flag 只会「不认识」，不会「读错」。
+
+实测向后兼容：写一个 Feather V1 老格式（654 字节），用 pyarrow 26.0.1 读回来 →
+`3 行 / ['a', 'b']` ✅。**磁盘格式这一层是向后兼容的** ——
+「Arrow 版本差异」在磁盘上不是个坑。
+
+### 2. ABI 里没有版本号 —— 这才是能共享的根本原因
+
+实测自 pyarrow 自带的 `arrow/c/abi.h`：
+
+```c
+struct ArrowSchema {
+  const char* format; const char* name; const char* metadata;
+  int64_t flags; int64_t n_children;
+  struct ArrowSchema** children; struct ArrowSchema* dictionary;
+  void (*release)(struct ArrowSchema*);   // ← 所有权回调
+  void* private_data;
+};
+```
+
+`ArrowSchema` 和 `ArrowArray` 里**都没有 version 字段**，但**都有 `release` 回调**。
+所以共享靠的不是「我们版本一样」，而是三件事：
+
+1. **布局标准化** —— 一个 Arrow 数组 = 一组指向内存的 buffer 指针 + 一个描述 format 的字符串。
+   谁的实现都一样，谁的指针都能被读懂。
+2. **所有权靠回调移交** —— 生产方交出数据的同时交出一个 `release` 函数，消费方用完调它，
+   生产方才真正释放。**没有版本号协商，也没有「谁负责 free」的歧义** ——
+   这就是不需要版本协商也能安全共享的原因。
+3. **入口统一** —— 见下一节。
+
+本仓库三个库的版本差得很远（**26.0.1 / 2.1.0 / 2.0.0**），照样互通 ——
+靠的是上面这三条，不是靠版本对齐。
+
+### 3. 共同的入口是 `__arrow_c_stream__`，不是 `__arrow_c_array__`
+
+| 对象 | `__arrow_c_array__` | `__arrow_c_stream__` |
+| --- | --- | --- |
+| `pyarrow.Table` | — | 有 |
+| `pyarrow.Array` | 有 | — |
+| `pyarrow.ChunkedArray` | — | 有 |
+| `polars.DataFrame` | — | 有 |
+
+反直觉的地方：`__arrow_c_array__`（单个数组）在 **Table 和 DataFrame 上都没有**，
+两边都有的只有 **stream**。
+
+这不是巧合 —— stream 额外带上了 **schema** 和**分批**的语义，两个框架各自实现一遍就能互通；
+单数组接口没有 schema，对面收到也不知道列名和类型。
+**Arrow 官方推荐的跨框架通道是 stream。**
+
+### 4. 零拷贝有边界 —— 它是**列**的性质，不是 DataFrame 的性质
+
+比的是 Arrow buffer 的**实际地址**（`buffer.address`），不是「看起来没拷贝」：
+
+| 方向 | 列 | 各 buffer 是否同一块 | 连续两次导出同一块 | 结论 |
+| --- | --- | --- | --- | --- |
+| pyarrow → polars → pyarrow | num (float64) | validity:— data:✅ | 是 | 零拷贝 ✅ |
+| pyarrow → polars → pyarrow | txt (string) | validity:— offsets:≠ data:≠ | **否** | **拷了** |
+| pyarrow → polars → pyarrow | ts (timestamp) | validity:— data:✅ | 是 | 零拷贝 ✅ |
+| pyarrow → DuckDB → pyarrow | num | validity:≠ data:≠ | —（每次重算） | **拷了** |
+| pyarrow → DuckDB → pyarrow | txt | validity:≠ offsets:≠ data:≠ | —（每次重算） | **拷了** |
+| pyarrow → DuckDB → pyarrow | ts | validity:≠ data:≠ | —（每次重算） | **拷了** |
+
+三件事：
+
+1. **定宽列过 polars 是真零拷贝，而且地址稳定** —— float64 / timestamp 的 buffer 地址
+   跟原始 pyarrow 一模一样，**连续两次导出还是同一块**。
+   因为 Polars 的内部模型**就是** Arrow（它用的就是 arrow2 那套布局）。
+2. **字符串列过 polars 每次导出都重建缓冲区** —— 注意第四列：连续两次 `to_arrow()`
+   拿到的 offsets / data **地址都不一样**。不是「导入时拷一次」，是**每导一次就重拷一次**。
+   数据一个字节不差，但内存一直在动。
+3. **过 DuckDB 一律要拷** —— DuckDB 内部是它自己的 Vector，
+   Arrow 在它那儿只是**输入格式和输出格式**，不是内部表示。
+
+拿本仓库的真实数据（`data/orders.parquet`）再验一遍：
+
+| 列 | Polars 类型 | 各 buffer 是否同一块 | 连续两次导出同一块 | 结论 |
+| --- | --- | --- | --- | --- |
+| `revenue` | Float64 | validity:— data:✅ | 是 | 零拷贝 ✅ |
+| `region` | String | validity:— offsets:≠ data:≠ | **否** | **拷了** |
+
+**这正是 `interop.py` 里「Arrow 底层 buffer 地址不变」那句话的边界**：
+它比的是 `revenue`（float64）那一列，成立；字符串列（`region`）过 polars 每次导出都重建缓冲区。
+
+### 5. 类型会断，也会悄悄改
+
+12 种 Arrow 类型过 polars 2.1（实测；跑在**子进程**里 —— polars 对新类型会触发 Rust panic，
+在主进程里炸掉会连累整个 demo）：
+
+| Arrow 类型 | polars | 进去的类型 | 出来的类型 | 备注 |
+| --- | --- | --- | --- | --- |
+| int64 | 接住 | int64 | int64 | 原样 ✅ |
+| string | 接住 | string | large_string | **改型了** ⚠️ |
+| large_string | 接住 | large_string | large_string | 原样 ✅ |
+| struct | 接住 | struct\<x: int32\> | struct\<x: int32\> | 原样 ✅ |
+| list | 接住 | list\<item: int32\> | large_list\<item: int32\> | **改型了** ⚠️ |
+| fixed_size_list | 接住 | fixed_size_list\<item: int32\>\[2\] | fixed_size_list\<item: int32\>\[2\] | 原样 ✅ |
+| map | 接住 | map\<string, int32\> | map\<large_string, int32\> | **改型了** ⚠️ |
+| dictionary | 接住 | dictionary\<values=string, indices=int32\> | dictionary\<values=large_string, indices=uint32\> | **改型了** ⚠️ |
+| decimal256 | **接不住** | decimal256(40, 2) | — | PanicException |
+| string_view | 接住 | string_view | large_string | **改型了** ⚠️ |
+| run_end_encoded | **接不住** | run_end_encoded\<run_ends: int32\> | — | ComputeError |
+| list_view | **接不住** | list_view\<item: int32\> | — | ComputeError |
+
+两类断法（实测 **3 种硬断、5 种改型**）：
+
+- **硬断** —— polars 2.1 根本不认这些 Arrow 26 的新类型：
+  - `decimal256` → `PanicException: operator does not support primitive Int256`
+  - `run_end_encoded` → `ComputeError: The datatype "+r" is still not supported in Rust implementation`
+  - `list_view` → `ComputeError: The datatype "+vl" is still not supported in Rust implementation`
+  - 其中 `decimal256` 抛的是 **Rust panic**（pyo3 翻译成 `PanicException`）。
+    实测这个异常**不是 `Exception` 的子类** —— 写 `except Exception` 接不住，
+    得写 `except BaseException`。
+- **改型** —— 数据一个字节不差，但 schema 变了：
+  `string` → `large_string`、`list` → `large_list`、`map` → `map<large_string, int32>`、
+  `dictionary` → `dictionary<values=large_string, indices=uint32>`、
+  `string_view` → `large_string`。
+  这类最容易出事：**读进来是对的，写出去就变了型**。
+
+### 6. 小结
+
+1. **「Arrow 的版本」是三层。** 发行版各走各的；磁盘格式版本向后兼容；
+   **ABI 层根本没有版本号**。
+2. **共享不是靠版本对齐，是靠约定。** 布局标准化 + `release` 回调移交所有权 +
+   统一的 `__arrow_c_stream__` 入口。
+3. **零拷贝是列的性质。** 定宽列过 polars 地址不变；字符串列每次导出都重建；
+   过 DuckDB 一律要拷。
+4. **类型会断，也会悄悄改。** 新类型直接不认（其中一个是 Rust panic），
+   旧类型会被改型 —— 数据对，schema 不对。
+5. **实用结论**：跨框架传数据优先传**定宽列**，或者先统一 schema 再传；
+   遇到新类型先在两个框架各读一遍确认能不能过。
+
 ## 目录结构
 
 ```
@@ -7973,6 +8139,7 @@ duckdb-polars-demo/
 │   ├── materialize_demo.py  # 结果物化方式的代价：几条通道的代价与语义
 │   ├── columnar_demo.py    # 列式存储：行组里按列分段 / 投影下推 / 按列压缩
 │   ├── reader_demo.py      # 四个 reader 对照：口径 / 物化代价 / 行组数决定并行
+│   ├── arrow_demo.py       # Arrow 三层版本 / ABI 无版本号 / 零拷贝边界 / 类型断点
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
@@ -7999,6 +8166,8 @@ duckdb-polars-demo/
 - DuckDB 文档：<https://duckdb.org/docs/>
 - Polars 文档：<https://docs.pola.rs/>
 - DuckDB 与 Arrow 互操作：<https://duckdb.org/docs/guides/python/sql_on_arrow>
+- Arrow C Data Interface（跨框架共享的 ABI 规范，本项目 demo 读的就是它）：<https://arrow.apache.org/docs/format/CDataInterface.html>
+- Arrow 列式格式规范（IPC 文件 / MessageVersion）：<https://arrow.apache.org/docs/format/Columnar.html>
 - DuckDB ASOF JOIN：<https://duckdb.org/docs/guides/sql_features/asof_join>
 - DuckDB JSON：<https://duckdb.org/docs/stable/data/json/overview>
 - Polars `join_asof`：<https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.join_asof.html>
