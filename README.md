@@ -95,6 +95,8 @@ uv run python src/materialize_demo.py  # 结果物化方式的代价：把数据
 uv run python src/columnar_demo.py     # 列式存储：行组里按列分段、投影下推、按列压缩
 uv run python src/reader_demo.py       # 四个 reader 读同一份 parquet：口径决定数字，行组数决定谁能并行
 uv run python src/arrow_demo.py        # Arrow 的三层版本 + 零拷贝的边界 + 三个框架的脾气：共享靠什么、断在哪
+uv run python src/prune_probe_demo.py  # 行组裁剪的探针：把「跳没跳过」变成「报没报错」
+uv run python src/merge_demo.py        # MERGE INTO vs Polars 的手工复刻：逐行对账 + 重复键的两种错法
 ```
 
 一键跑完整流程：
@@ -169,6 +171,8 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `columnar_demo.py` | 列式存储：行组里按列分段、投影下推的代价、按列压缩，以及「列式不是 DuckDB 对 Polars 的差异点」 |
 | `reader_demo.py` | 读 parquet 的四个 reader 对照：口径不对数字能差 40 倍、DuckDB 慢在物化不在读、行组数决定谁能用上并行 |
 | `arrow_demo.py` | Arrow 的三层版本 + 零拷贝的边界 + 三个框架的脾气：ABI 里没有版本号、共享靠的是布局与所有权回调、零拷贝是列的性质、类型会断也会改、Arrow IPC 文件只有一边能读、polars 吃 DuckDB relation 会静默给错形状 |
+| `prune_probe_demo.py` | 行组裁剪的探针：把「跳没跳过」变成「报没报错」，不靠计数器就测出 Polars 到底剪没剪 |
+| `merge_demo.py` | MERGE INTO：一条语句里的改、插、删，和 Polars 侧的手工复刻逐行对账 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -257,7 +261,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，63 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，65 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -629,7 +633,12 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 273 | 三个框架的「性格」 | duckdb 2.0 **最宽**：12 种类型接住 11 种（只有 decimal256 报 `NotImplementedException`），但会**偷偷改型** | polars 2.1 **最严**：3 种硬断、5 种改型；pyarrow 是参考实现，什么都原样 | **改型只动 schema，不动数据**；但 duckdb 是**语义层面**的改型（字典被解开、run-end-encoded 被解码），原始编码拿不回来 |
 | 274 | Arrow IPC 文件谁读得了 | duckdb 2.0 **读不了也写不了** —— `duckdb_extensions()` 的 30 项里**压根没有 `arrow`**（不是「没装」，是「没这一项」） | `pl.read_ipc` ✅ / `pl.DataFrame.write_ipc` ✅ | 不是「版本太老」，是**没有这个 reader**；格式本身 pyarrow ↔ polars 互相读得动 |
 | 275 | polars 能不能直接吃 DuckDB 的 relation | `rel` 有 `__arrow_c_stream__` ✅（没有 `__arrow_c_array__`） | `pl.from_arrow(rel)` **不报错，但静默给错形状** —— 给你一列 struct 的 Series（shape `(3,)` 而不是 `(3, 2)`），退出时还报 nanobind 引用泄漏 | 必须先 `.to_arrow_table()`；同一个 stream 换 pyarrow 读出来是对的（3 行 2 列） |
-| 276 | 「过滤下推」是不是同一件事 | **分两层**：计划层面（`Filters:` 塞进扫描节点）≠ 统计层面（reader 跳行组）—— `id < 100` → 1/8 行组、读盘 7.7%；`(id % 2) = 0` → 计划里照样有 `Filters:`，但 8/8 行组一个没剪 | ——（Polars 没有 IO 计数器，这层测不了） | **别把「计划里写着 Filters」当成「reader 跳过了数据」**；csv / json 在 DuckDB 里过滤是独立的 `FILTER` 节点，整个文件照读 |
+| 276 | 「过滤下推」是不是同一件事 | **分两层**：计划层面（`Filters:` 塞进扫描节点）≠ 统计层面（reader 跳行组）—— `id < 100` → 1/8 行组、读盘 7.7%；`(id % 2) = 0` → 计划里照样有 `Filters:`，但 8/8 行组一个没剪 | **也剪**（实测出来的）：`use_statistics=True` 跳过 7/8 个行组，`False` 一个都不跳 —— 不靠 IO 计数器，靠「把行组弄坏看报不报错」 | **别把「计划里写着 Filters」当成「reader 跳过了数据」**；csv / json 在 DuckDB 里过滤是独立的 `FILTER` 节点，整个文件照读 |
+| 277 | 「reader 跳没跳过那个行组」能不能测 | 能 —— 关掉 `filter_pushdown`，探针立刻从「跳过」翻成「报错」 | 能 —— `use_statistics=False`，探针从「跳过」翻成「报错」 | **把行组的数据页弄坏**，看报不报错：跳过就不报错，读了必报错。三个引擎同一把尺子 |
+| 278 | 「一条语句同时改插删」有没有对应物 | `MERGE INTO`：`WHEN MATCHED` / `WHEN NOT MATCHED` / `WHEN NOT MATCHED BY SOURCE` + `RETURNING` | `DataFrame.update(how='full')` ≈ 更新 + 插入；**删除、条件分支、RETURNING 都没有** | 手工拼：`update` + `anti join` + `concat` —— 结果能对齐，原子性对不齐 |
+| 279 | 源里有重复键 | **更新分支报错**（不能影响同一目标行两次）；**插入分支不查重** —— 插两行也不报错 | 静默把目标行**复制成两行** | DuckDB 靠主键约束兜底；Polars 侧得自己先 `unique()` |
+| 280 | 合并的键是 NULL | NULL = NULL 不是 TRUE → 算「没匹配」→ 插进去 → 目标表出现两行 id=NULL | 结果**一致**；但键列全是 NULL 时 dtype 推断成 `Null`，join 直接 `SchemaError`（报的是**类型错**，不是「键不能是 NULL」） | 两边语义一致；Polars 侧先把 dtype 统一 |
+| 281 | 合并是不是原子的 | 一条语句 —— 事务里 `ROLLBACK` 撤得干干净净 | 三步操作，中间失败停在半路；而且**没有事务**这个概念 | 要原子性得自己写临时文件再原子替换（那是另一回事） |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.execute(sql).to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那份拷贝是**内存**代价；**时间**上哪条路快取决于文件的行组数（本项目这份 1 行组的 fixture 上，反而是 `execute()` 快 1.43×），所以别照着警告改代码。
 
@@ -669,7 +678,10 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 269~275 条（Arrow 的三层版本 / ABI 里没有版本号 / 零拷贝是列的性质 / 类型会断会改 /
 三个框架三种性格 / Arrow IPC 文件的互通范围 / polars 吃 DuckDB relation 的坑）在
 `Arrow 的三层版本，和「零拷贝」到底在哪儿断` 里展开；
-第 276 条（过滤下推的计划层面 vs 统计层面）在 `查询计划：EXPLAIN 与投影裁剪` 里展开。
+第 276~277 条（过滤下推的计划层面 vs 统计层面 / 「跳没跳过」能不能测）在
+`查询计划：EXPLAIN 与投影裁剪` 和 `行组裁剪的探针` 里展开；
+第 278~281 条（一条语句改插删 / 重复键 / NULL 键 / 原子性）在
+`MERGE INTO：一条语句里的改、插、删` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -2597,6 +2609,254 @@ Polars 侧结论不一样：行序是数据的一部分，但要小心哪些算�
 真正该比的量是「同样的一件事」，而不是「两种模型各自的代价」：
 DuckDB 写完的数据在磁盘上，Polars 的结果只在内存里。
 
+## MERGE INTO：一条语句里的改、插、删
+
+`src/merge_demo.py`。上一节的 `UPDATE` / `INSERT` / `ON CONFLICT` 各自管一件事；
+当「改一部分、插一部分、删一部分」要在**同一次操作**里发生时，DuckDB 给了一条语句：
+`MERGE INTO`。Polars 侧没有对应物 —— 只能拿 `update` + `anti join` + `concat` 手工拼。
+
+这一节的重点不是「能不能写出等价结果」（能，逐行对账是 ✅），
+而是**什么时候两边会对不齐** —— 重复键、NULL 键、原子性。
+
+### 1. 基本形：改 + 插
+
+目标表 `tgt`（3 行 × 3 列：`id` / `v` / `note`），源表 `src`（2 行 × 2 列：`id=2` / `id=4`）。
+
+```sql
+MERGE INTO tgt USING src ON tgt.id = src.id
+WHEN MATCHED THEN UPDATE SET v = src.v
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)
+```
+
+Polars 侧的对应写法只有一行：
+
+```python
+result = target.update(source, on='id', how='full')
+```
+
+| 对账 | 结果 |
+| --- | --- |
+| 合并后的目标表 | 两边都是 4 行 × 3 列 |
+| 逐行对账 | ✅ 两侧完全一致 —— 4 行 × 3 列全部一致 |
+
+> `how='full'` 是关键：`how='left'` 只更新匹配的行（源里多出来的键会被丢掉），
+> `how='full'` 才把没匹配上的行插进来 —— 这才等价于 MERGE。
+
+### 2. 第三件事：删掉源里已经没有的目标行
+
+```sql
+MERGE INTO tgt USING src ON tgt.id = src.id
+WHEN MATCHED THEN UPDATE SET v = src.v
+WHEN NOT MATCHED BY SOURCE THEN DELETE
+```
+
+`WHEN NOT MATCHED BY SOURCE` 是 DuckDB 独有的分支 ——
+「目标行在源里找不到对应的」就叫 NOT MATCHED BY SOURCE。
+
+Polars 侧只能拿 `anti join` 补：
+
+```python
+gone = target.join(source, on='id', how='anti').select('id')
+result = result.join(gone, on='id', how='anti')
+```
+
+逐行对账：✅ 两侧完全一致 —— 1 行 × 3 列全部一致。
+
+再看一个「删 + 插」同时发生的场景：结果同样是 ✅ 一致。
+
+> → **删掉的是「合并之前就存在、而源里没有」的目标行**。
+> 这一轮刚插进来的行**不受影响** —— MERGE 操作的是合并开始那一刻的目标表快照，
+> 不是合并过程中的中间状态。Polars 侧的 anti join 天然也是这个语义
+> （拿合并前的 `tgt` 去 anti）。
+
+### 3. 条件分支：`WHEN MATCHED AND`
+
+```sql
+MERGE INTO tgt USING src ON tgt.id = src.id
+WHEN MATCHED AND src.v > 250 THEN UPDATE SET v = src.v
+WHEN MATCHED THEN UPDATE SET note = 'kept'
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)
+```
+
+规则是「**第一个满足的分支赢**」：`src.v=300 > 250` 的走第一个分支（`v` 改成 300），
+`src.v=200` 的落到第二个分支（`note='kept'`，`v` 保持 20）。
+
+Polars 侧**没有**这个能力 —— 得把源拆成两拨，各走各的分支，再拼回去：
+
+```python
+hi = source.filter(pl.col('v') > 250)     # 命中第一个分支
+lo = source.filter(pl.col('v') <= 250)    # 落到第二个分支
+res = target.update(hi, on='id', how='full')
+res = res.update(lo.select('id').with_columns(
+             pl.lit('kept').alias('note')), on='id', how='left')
+new_lo = lo.join(target, on='id', how='anti')   # lo 里的新键还得插
+res = pl.concat([res, new_lo.select(target.columns)], how='vertical_relaxed')
+```
+
+逐行对账：✅ 两侧完全一致 —— 3 行 × 3 列全部一致。
+
+> 注意 `lo` 那一步为什么只 `select('id')`：`update` 会把「另一个 frame 里同名同列」的值全盖过去 ——
+> 如果把 `v` 也带上，id=2 的 `v` 会被改成 200，而 DuckDB 的第二个分支只改 `note`，`v` 应该保持 20。
+
+→ 结果能对齐，但**代价是写法**：DuckDB 一行 `WHEN MATCHED AND`，
+Polars 侧要拆源、分支处理、再拼回去 —— 每一步都得自己保证语义。
+分支一多（「A 改这个、B 改那个、都不匹配就插」），这套拼法就没有可读性可言了。
+
+### 4. `RETURNING`：改了什么，直接返回
+
+```sql
+MERGE INTO tgt USING src ON tgt.id = src.id
+WHEN MATCHED THEN UPDATE SET v = src.v
+WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)
+RETURNING id, v
+```
+
+`RETURNING` 返回的是**受影响的那几行**（更新后的新值 + 插入的行）：
+
+| id | v |
+| --- | --- |
+| 2 | 200 |
+| 4 | 400 |
+
+→ 不用再查一遍表就知道改了什么 —— 这是 MERGE 相对
+「UPDATE 一次 + INSERT 一次 + 再 SELECT 一次」最直接的优势。
+
+Polars 侧：`update` 返回的是**整个结果表**，不是「被改动的行」。
+想知道到底改了哪些行，得自己拿合并前后做差集 —— 又是一段 DuckDB 那边一句话就能写完的代码。
+
+### 5. 重复键：两个引擎，两种错法
+
+源表里有**两行同一个键**，目标表里也有这个键 —— 该怎么办？
+
+**(a) 重复键命中已有目标行（走 UPDATE 分支）**
+
+目标 id=2 只能被改一次 —— 源里那两行 id=2 都想改它。
+
+DuckDB → `InvalidInputException`：
+
+```
+Invalid Input Error: MERGE INTO command cannot affect the same target row more than once.
+A target row matched more than one source row; ensure the source rows are deduplicated
+or the ON condition is unique.
+```
+
+→ **DuckDB 报错**：一个目标行不能被影响两次。源不唯一的时候，这句话是救命的 ——
+换句话说，DuckDB 认「源必须唯一」这条规则。
+
+Polars 侧则**静默把目标行复制了**（id=2 出现两次，v 分别是 200 和 300）——
+不报错、不警告，行数从 2 变成 3，数据就这么坏掉了。
+Polars 自己的 docstring 里写着：
+
+> 'left' will keep all rows from the left table; **rows may be duplicated** if multiple rows
+> in the right frame match the left row's key.
+
+**(b) 重复键落到插入分支（目标表里没有这个键）**
+
+| | 结果 |
+| --- | --- |
+| DuckDB | 插了两行 id=7，**不报错** |
+| Polars | 插了两行 id=7，**不报错** |
+
+→ **两个引擎都插了两行，而且都不报错。**
+DuckDB 上一节那个「不能影响同一行两次」的检查，**只管更新分支，不管插入分支** ——
+源里两行都没匹配上，目标表的两行都是「新增」，不冲突。
+
+目标表换成带 PRIMARY KEY 的 —— 这次被约束拦住了：
+
+```
+Constraint Error: PRIMARY KEY or UNIQUE constraint violation: duplicate key "7"
+```
+
+→ 所以「源必须唯一」这条规则，**DuckDB 靠约束兜底**，不是靠 MERGE 自己查。
+目标表没有主键的话，两行照样插进去。
+
+### 6. NULL 键：两边一致，但手工拼的那条路走不通
+
+| | 结果 |
+| --- | --- |
+| DuckDB | 4 行 × 3 列（目标表里出现**两行 `id=NULL`**） |
+| Polars | 4 行 × 3 列（同上） |
+
+逐行对账：✅ 两侧完全一致 —— 4 行 × 3 列全部一致。
+
+→ **NULL 键算「没匹配」** —— 两边一致，都把源里那行 `id=NULL` 插了进去，
+于是目标表里出现了两行 `id=NULL`（原来那行 + 新插那行）。
+这不是 bug，是 `=` 的三值逻辑：NULL = NULL 不是 TRUE。
+
+但手工拼的那条路有个坑 —— 源里那一列**全是 NULL** 时，
+Polars 会把它推断成 `Null` 类型，跟目标表的 `Int64` 对不上：
+
+```
+左边的 dtype = Null，右边 = Int64
+SchemaError: datatypes of join keys don't match - `id`: null on left does not match `id`: i64 on right
+(and no other type was available to cast to)
+```
+
+→ `SchemaError`：一边是 `null` 一边是 `i64`，join 直接拒绝。
+DuckDB 那条路没有这个问题 —— SQL 里 NULL 就是个值，类型照旧是 INT。
+也就是说：**DuckDB 能吃的输入，Polars 的手工拼法可能吃不下** ——
+而且它报的是**类型错**，不是「你的键有 NULL」，读错误消息的人很难往「键不能是 NULL」上想。
+
+### 7. 插入的列：不给全就报错
+
+目标表 `tgt` 有 3 列（`id` / `v` / `note`）。插入的时候：
+
+| 写法 | 结果 |
+| --- | --- |
+| `WHEN NOT MATCHED THEN INSERT VALUES (src.id, src.v)` | ❌ `Binder Error: table "tgt" has 3 columns but 2 values were supplied` |
+| `WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v)` | ✅ 插入的行 `note` 取默认值 NULL |
+
+Polars 侧的 `update(how='full')` 插进来的行，目标表里源没有的列**一律是 NULL** ——
+相当于第二种写法。
+
+### 8. 原子性：一条语句 vs 三步操作
+
+DuckDB：MERGE 是**一条语句**，跑在事务里：
+
+```
+合并后（未提交）：[(1, 10), (2, 200), (3, 300)]
+ROLLBACK 之后    ：[(1, 10), (2, 20)]
+```
+
+→ 撤销得干干净净 —— 因为它就是一条语句，没有中间状态。
+
+Polars 侧：手工复刻是**三步**（`update` → `anti join` → `concat`），
+中间任何一步失败，前两步的结果都已经产出了；
+而且 Polars **没有事务**这个概念 —— 真要原子性，得自己写临时文件再原子替换（那是另一回事）。
+
+### 9. 代价：一条语句和一次调用，各要多久
+
+目标表 200,000 行 / 源表 200,000 行（一半命中、一半是新键），
+重复 9 次，**串行**跑（8 核共享开发机，load1 = 0.8）。
+
+每次测之前都把目标表**恢复成合并前的状态**（恢复动作不计时）——
+不然第二轮 MERGE 就没东西可插了，每轮测的就不是同一件事。
+
+| 写法 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB `MERGE INTO`（一条语句） | 28.6 | 26.9 |
+| DuckDB `UPDATE ... FROM` + `INSERT`（两条语句） | 28.2 | 27.6 |
+| Polars `update(how='full')`（一次调用） | 18.9 | 17.3 |
+| Polars 手工三步（`update` + `anti join` + `concat`） | **6.8** | **6.0** |
+
+先对账 —— 代价只有在「算的是同一件事」时才有意义：
+
+| 对账 | 结果 |
+| --- | --- |
+| Polars `update(how='full')` vs DuckDB MERGE | ✅ 一致 —— 300000 行 × 3 列全部一致 |
+| Polars 手工三步 vs DuckDB MERGE | ✅ 一致 —— 300000 行 × 3 列全部一致 |
+
+⚠️ **这几个数字不能直接比大小**：
+
+- DuckDB 的 MERGE 跑在一张**真实的表**上，包含写回（含 WAL）；
+  Polars 这边只是**算出一个新的 DataFrame**，一个字节都没落盘。
+- 真正该比的是「同一件事」：DuckDB 那边 `UPDATE ... FROM` + `INSERT`（两条语句）
+  和 Polars 这边的手工三步 —— 那才是同一个东西的两种写法。
+
+→ 一句话：**MERGE 的价值不在「快」，在「一条语句把三件事绑在一起」** ——
+绑在一起才有原子性，才不用自己判断「哪些该更新、哪些该插、哪些该删」。
+
+
 ## Schema 演进
 
 `src/schema_demo.py`。改 schema 在两个引擎里是两件完全不同的事：DuckDB 改的是磁盘上的表，Polars 造的是内存里的新对象。
@@ -3577,6 +3837,10 @@ Polars 侧 `explain()` 只给计划文本，没有 IO 计数器；`collect()` �
 
 → 那句 `PROJECT 2/12` 是一句**承诺**，不是一个**观测**。
 调优的时候 DuckDB 能直接拿「读盘字节数」当反馈信号，Polars 只能靠「改代码再测一遍」间接验证。
+
+> **但「读盘字节数」测不到的不等于「测不了」。** 读多少字节只是其中一种口径；
+> 「这个行组到底有没有被读」可以用另一种办法量 —— 把行组的数据页弄坏，看报不报错。
+> 见 `行组裁剪的探针` 那一节（Polars 侧的结论就是那里推翻的）。
 
 ### 3. 过滤下推：过滤被塞进了哪一步
 
@@ -6968,11 +7232,12 @@ DuckDB 的 `EXPLAIN ANALYZE` 会直接报出扫了几个行组。两份数据内
 > 顺带提醒一句：**「计划里写着 `Filters:`」≠「reader 跳过了数据」** ——
 > 前者是计划层面，什么谓词都能塞进去；后者要统计能证明才行
 > （`id % 2 = 0` 计划里有 `Filters:`，但 8 个行组一个都没剪）。
-> 三个 reader 的读盘对账表在 `查询计划：EXPLAIN 与投影裁剪` 那一节。
+> 三个 reader 的读盘对账表在 `查询计划：EXPLAIN 与投影裁剪` 那一节；
+> 「到底跳没跳过那个行组」怎么直接量，见 `行组裁剪的探针` 那一节。
 
 ### 4. Polars 侧：只有一个开关，看不到过程
 
-Polars 的 `scan_parquet` 有个 `use_statistics` 参数（默认 True），但**不告诉你**剪掉了多少 —— 没有等价的「Row Groups Scanned」。能看到的只有「快了多少」。
+Polars 的 `scan_parquet` 有个 `use_statistics` 参数（默认 True），但**不告诉你**剪掉了多少 —— 没有等价的「Row Groups Scanned」。在这个接口上，能看到的只有「快了多少」。
 
 100 万行 / 49 个行组（本机实测，**串行跑**，重复 9 次取中位数）：
 
@@ -6986,6 +7251,11 @@ Polars 的 `scan_parquet` 有个 `use_statistics` 参数（默认 True），但*
 排好序那份**开着快了 2.4 倍**（49 个行组里 48 个能被 min/max 直接排除）；打乱那份**开不开基本没差别** —— 49 个行组的 min/max 挨个比了一遍，结果一个也剪不掉，那份检查的钱等于白花了。
 
 > **机制是同一个**（zonemap 剪枝），只是 Polars 不告诉你内部发生了什么。
+
+> ⚠️ 但「不告诉你」≠「测不了」：「不告诉你」说的是**没有计数器**，
+> 不是**没有观测办法**。把行组的数据页弄坏、看报不报错，就能直接测出 Polars 到底跳没跳那个行组。
+> 实测结论：**Polars 会剪**（`use_statistics=True`），`use_statistics=False` 才不剪。
+> 见 `行组裁剪的探针` 那一节。
 
 ### 5. 代价：剪枝到底值多少时间
 
@@ -7030,6 +7300,196 @@ Polars 的 `scan_parquet` 有个 `use_statistics` 参数（默认 True），但*
 > 所以顺序永远是：**先排好序落盘（免费），不够再考虑索引（要钱）。**
 
 顺带说一句：`index_demo` / `parquet_meta_demo` / `partition_demo` 讲的其实是同一件事的三个面 —— **「让数据物理上挨在一起」，比在逻辑上建结构更划算。**
+
+## 行组裁剪的探针：把「跳没跳过」变成「报没报错」
+
+`src/prune_probe_demo.py`。前面说过一句「Polars 没有 IO 计数器，这层测不了」——
+**这句话是错的**。探针不需要计数器：把某个行组的数据页**弄坏**，
+reader 跳过它就不报错，读了它就报错 ——「跳没跳过」变成了一个是非题。
+
+### 1. 探针原理：用 parquet 自己的布局当把手
+
+parquet 文件里每个列块都记着自己的字节位置（这些数字来自 `parquet_metadata()`）：
+
+| 列块 | 数据页偏移 | 压缩字节数 |
+| --- | --- | --- |
+| rg0 · `id` | 4 | 508,904 |
+| rg0 · `v` | 508,908 | 507,614 |
+| rg1 · `id` | 1,016,522 | 508,172 |
+| rg1 · `v` | 1,524,694 | 507,225 |
+| … | | |
+
+`data_page_offset` 是这个列块第一个数据页在文件里的字节位置，
+`total_compressed_size` 是它有多长。把这段区间全换成 `0xFF`：
+
+- **footer / 元数据一点没动** —— 文件在「目录」层面还是合法的；
+- 数据页的页头解不开了 —— 谁碰这段字节谁报错。
+
+于是「reader 有没有读这个行组」变成一个**是非题**：
+
+```
+跳过了   → 没碰这些字节 → 不报错
+没跳过   → 碰了这些字节 → 报错
+```
+
+这把尺子对三个引擎是同一把 —— 不需要任何引擎自报家门，
+也不需要「读盘字节数」这种只有 DuckDB 报得出的计数器。
+
+### 2. 对照组：文件没坏的时候，七种读法都得对
+
+100 万行 / 8 个行组 / 7,999,526 字节：
+
+| 读法 | 值 |
+| --- | --- |
+| DuckDB `sum(id) WHERE id < 100` | 4950 |
+| DuckDB `sum(id)` 全读 | 499,999,500,000 |
+| DuckDB `sum(v)`（另一列，不碰 `id`） | 999,999,000,000 |
+| Polars `sum(id) WHERE id < 100` | 4950 |
+| Polars 同上，但 `use_statistics=False` | 4950 |
+| pyarrow `pq.read_table` | 1,000,000 行 |
+| pyarrow `pyarrow.dataset` | 100 行 |
+
+（`id < 100` 的和 = 4950 = 0+1+…+99。）
+
+这一节是**必须**的：不然后面那些「报错」分不清是文件坏了、还是查询本身就写错了。
+
+### 3. 逐行组对账：一个一个弄坏，看谁跳过了
+
+做法：把 8 个行组一个一个弄坏（每次只坏 `id` 列的数据页），
+对每个坏掉的文件跑六个读法。表里 **跳过** = 没报错（这个行组没被读），**报错** = 被读了。
+
+| 坏掉的行组 | DuckDB 过滤 | DuckDB 全读 | Polars 过滤 | Polars 关统计 | pa `read_table` | pa `dataset` |
+| --- | --- | --- | --- | --- | --- | --- |
+| rg0 | 报错 | 报错 | 报错 | 报错 | 报错 | 报错 |
+| rg1 | 跳过 | 报错 | 跳过 | 报错 | 报错 | 跳过 |
+| rg2 | 跳过 | 报错 | 跳过 | 报错 | 报错 | 跳过 |
+| rg3 | 跳过 | 报错 | 跳过 | 报错 | 报错 | 跳过 |
+| rg4 | 跳过 | 报错 | 跳过 | 报错 | 报错 | 跳过 |
+| rg5 | 跳过 | 报错 | 跳过 | 报错 | 报错 | 跳过 |
+| rg6 | 跳过 | 报错 | 跳过 | 报错 | 报错 | 跳过 |
+| rg7 | 跳过 | 报错 | 跳过 | 报错 | 报错 | 跳过 |
+
+读法说明：
+
+- DuckDB 过滤 = `sum(id) WHERE id < 100`（过滤进了扫描节点）
+- DuckDB 全读 = `sum(id)`（没有过滤，所有行组都得读）
+- Polars 过滤 = `scan_parquet(...).filter(id < 100)`（`use_statistics=True`）
+- Polars 关统计 = 同上，但 `use_statistics=False`
+- pa `read_table` = `pq.read_table(path, columns=['id'])`
+- pa `dataset` = `pyarrow.dataset(...).to_table(filter=id < 100)`
+
+四件事，一次测出来：
+
+1. **DuckDB 剪枝**：rg0 报错、rg1~rg7 跳过 —— 过滤条件只落在 rg0 上（`id < 100`），
+   reader 把另外 7 个行组跳了。「DuckDB 全读」那一列**每个行组都报错** ——
+   同一份文件、同一列，只因为没过滤，就一个行组都没跳。
+
+2. **Polars 也剪枝** —— 这一点以前只靠推测，现在有硬证据了：
+   「Polars 过滤」和 DuckDB 一模一样（rg0 报错、其余跳过），
+   而「Polars 关统计」**每个行组都报错** ——
+   同一个查询、同一份文件，只把 `use_statistics` 翻成 False，剪枝就没了。
+   **所以 Polars 跳不跳那个行组，是能测的。**
+
+3. **pyarrow 的两个接口不是一个东西**：`pq.read_table` 压根不剪（每行组都报错），
+   `pyarrow.dataset` 剪（rg1~rg7 跳过）。
+   → 「pyarrow 支不支持行组裁剪」这个问题问得太粗 —— 得先问「哪个 API」。
+
+4. **坏一列不影响另一列**：单独跑 `sum(v)`（不碰 `id` 列）在所有坏文件上都是「跳过」——
+   说明探针坏的是**一个列块**，不是整个行组，也没有波及别的读法。
+
+### 4. 元数据捷径：`count(*)` 和 `min()` 连列块都不碰
+
+同一批查询跑在三份文件上：好的、坏了 rg0 的、坏了 rg1 的。
+
+| 查询 | 好的文件 | 坏 rg0 | 坏 rg1 |
+| --- | --- | --- | --- |
+| `count(*)` | 1,000,000 | 1,000,000 | 1,000,000 |
+| `count(*) WHERE id >= 0` | 1,000,000 | 1,000,000 | 1,000,000 |
+| `min(id)` | 0 | 0 | 0 |
+| `sum(id) WHERE id >= 0` | 499,999,500,000 | 报错 | 报错 |
+| `count(*) WHERE id < 100` | 100 | 报错 | 100 |
+
+- `count(*)` —— 行数直接取自行组元数据（`row_group_num_rows`），一个字节的列数据都不用读。
+  这在「先 count 一下再决定要不要细查」的场景里非常值钱：count 完再去读明细等于读了两遍文件，
+  count 直接从元数据来，只读一遍。
+- `min(id)` —— 直接取 zonemap 里的 `stats_min`。同一个文件里 rg0 的 `stats_min` 就是全局最小值，
+  所以连 rg0 都不用读。
+- `sum(id)` 必须真的把列读出来，所以坏 rg0 / 坏 rg1 都报错。
+
+最后一行是**剪枝本身**的证据：`count(*) WHERE id < 100` 在坏 rg1 的文件上照样给出 100
+（rg1 被跳过了，只有 rg0 被读），在坏 rg0 的文件上报错（rg0 必须读）。
+
+> ⚠️ 一个容易被误读的地方：**`count(*)` 报错不代表「没剪枝」**。
+> 坏 rg0 上它报错，是因为 rg0 恰好是唯一被保留下来要读的行组 —— 跟剪不剪枝无关。
+> 判断剪枝看的是**被跳过的那些行组**。
+
+### 5. 裁剪归谁管：把 DuckDB 的优化器开关逐个关掉
+
+DuckDB 2.0 里能单独关掉的优化器里，有两个跟「过滤下推」沾边。
+把它们逐个关掉，再跑同一条查询、同一份坏掉 rg1 的文件：
+
+| 关掉的优化器 | 扫描节点里的 `Filters:` | 坏 rg1 的文件 |
+| --- | --- | --- |
+| （默认） | 有 | 跳过 |
+| `row_group_pruner` | 有 | 跳过 |
+| `filter_pushdown` | 没有 | 报错 |
+| 两个都关 | 没有 | 报错 |
+
+- **关掉 `filter_pushdown`，坏 rg1 的文件立刻报错** —— 过滤没进扫描节点，
+  reader 拿不到谓词，也就无从剪枝。这就是「计划层面」和「统计层面」的分界：
+
+  ```
+  下推到扫描节点   → reader 拿得到谓词 → 可能剪
+  下推到 reader     → reader 拿 min/max 一比 → 真的剪
+  ```
+
+- **关掉 `row_group_pruner` 没有任何影响** —— 说明 parquet 的行组裁剪不是那个优化器干的：
+  过滤进了扫描节点之后，是 **reader 自己**拿着每个行组的 min/max 决定读不读。
+  （`row_group_pruner` 管的是关系代数层的行组裁剪，跟 parquet 无关。）
+  这也解释了为什么 Polars 那边只要 `use_statistics=False` 就够了 ——
+  它对应的是「reader 拿不拿统计」这一层，而不是「过滤有没有进扫描」。
+
+### 6. 计时能回答吗：同一个问题，两种测法
+
+探针给的是「跳 / 没跳」这个确定答案。计时给的是「快了多久」——
+同一件事，两种测法，量一下它们的差别。
+
+计时这一节刻意用**同一条查询**做 A/B —— 结果完全一样，变的只有「剪不剪」：
+
+- DuckDB：关掉 `filter_pushdown`（过滤不进扫描节点，reader 拿不到谓词）
+- Polars：`use_statistics=False`（reader 拿不到统计）
+
+100 万行 / 8 个行组（本机实测，**串行跑**，重复 9 次取中位数；8 核共享开发机，load1 = 0.9）：
+
+| 读法 | 中位数 (ms) | 最快 (ms) |
+| --- | --- | --- |
+| DuckDB `sum(id) WHERE id < 100`（下推 → 剪到 1/8 行组） | 2.7 | 2.6 |
+| DuckDB 同一条查询，关掉 `filter_pushdown`（8/8 行组） | 3.9 | 3.6 |
+| Polars `id < 100`，`use_statistics=True`（剪） | 2.7 | 2.4 |
+| Polars 同一条查询，`use_statistics=False`（不剪） | 3.0 | 2.8 |
+
+→ DuckDB：不剪比剪慢 **1.43×**；Polars：不剪比剪慢 **1.13×**。
+
+→ 计时能看出「快慢」，但**看不出「跳了哪几个行组」**：两边快慢的量级差不多
+（都是同一套 parquet + 同一套统计），可计时是个**连续量** —— 差 0.1ms 是「剪了」还是「没剪」？
+机器一忙、磁盘一缓存，这个差别就没了。探针是个**二值量**：跳过 / 报错，一个字都不用猜。
+
+→ 所以这两件事是**互补的，不是替代关系**：计时回答「值不值得」，探针回答「到底做了什么」。
+
+### 7. 这一节推翻了 README 里的一句话
+
+在本节之前，主表第 276 条写的是：
+
+> Polars 侧 ——（Polars 没有 IO 计数器，这层测不了）
+
+**这句话不准确**：Polars 侧没有计数器，但**不需要**计数器。
+探针把「剪枝有没有发生」变成了「读没读到那段字节」，两个引擎用同一把尺子量。
+第 276 条现在改成了「Polars 也剪（实测出来的）」，第 277 条新增了「跳没跳过能不能测」。
+
+顺便把上一节 `### 4. Polars 侧：只有一个开关，看不到过程` 的结论也修正一下 ——
+Polars 仍然**不告诉你**剪掉了多少行组（这没错），
+但「它到底剪没剪」是能测的，只是量法不是数计数器，而是看报不报错。
+
 
 ## 并发、锁与多进程访问：DuckDB 拒绝，Polars 不设防
 
@@ -8324,6 +8784,8 @@ duckdb-polars-demo/
 │   ├── columnar_demo.py    # 列式存储：行组里按列分段 / 投影下推 / 按列压缩
 │   ├── reader_demo.py      # 四个 reader 对照：口径 / 物化代价 / 行组数决定并行
 │   ├── arrow_demo.py       # Arrow 三层版本 / ABI 无版本号 / 零拷贝边界 / 三种性格 / 类型断点 / IPC 互通范围 / relation 陷阱
+│   ├── prune_probe_demo.py # 行组裁剪的探针：把行组的数据页弄坏，用「报不报错」量「跳没跳过」
+│   ├── merge_demo.py       # MERGE INTO：一条语句里的改插删 vs Polars 手工复刻，逐行对账
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
