@@ -21,7 +21,7 @@
 | 写入与事务 | 覆盖还是追加、原子性、事务与并发读写 |
 | 文件布局 | 多文件与分区表：schema 冲突、分区裁剪、往返保真 |
 | 读取路径 | 同一个 parquet 文件换个 reader 能差多少 —— 口径（冷热进程 / 物化端点）、物化代价、行组数决定谁能并行 |
-| 跨框架共享 | Arrow 是怎么让两个框架互通数据的 —— 三层版本、ABI 为什么没有版本号、零拷贝在哪儿断 |
+| 跨框架共享 | Arrow 是怎么让两个框架互通数据的 —— 三层版本、ABI 为什么没有版本号、零拷贝在哪儿断、三个框架各自的脾气 |
 | 性能 | 相同数据规模下的耗时对比；结果等价性校验 |
 | 语义覆盖面 | 窗口 / 聚合 / 集合运算 / 正则 / 增删改 / Schema / 时间轴 / 近似计算 —— 每个都有一份实测对账 |
 | 形状与能力 | 多维聚合 / 透视重塑 / 嵌套类型 / 查询计划 / 采样 / 约束 / DDL / 内存 —— 引擎能做什么、不能做什么 |
@@ -94,7 +94,7 @@ uv run python src/config_demo.py       # 调引擎与改配置：表函数、CAL
 uv run python src/materialize_demo.py  # 结果物化方式的代价：把数据拿出引擎的几条通道
 uv run python src/columnar_demo.py     # 列式存储：行组里按列分段、投影下推、按列压缩
 uv run python src/reader_demo.py       # 四个 reader 读同一份 parquet：口径决定数字，行组数决定谁能并行
-uv run python src/arrow_demo.py        # Arrow 的三层版本 + 零拷贝的边界：共享靠什么、断在哪
+uv run python src/arrow_demo.py        # Arrow 的三层版本 + 零拷贝的边界 + 三个框架的脾气：共享靠什么、断在哪
 ```
 
 一键跑完整流程：
@@ -168,7 +168,7 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `materialize_demo.py` | 结果物化方式的代价：Arrow / numpy / 元组 / 字典几条通道，代价差一个数量级，语义还不一样 |
 | `columnar_demo.py` | 列式存储：行组里按列分段、投影下推的代价、按列压缩，以及「列式不是 DuckDB 对 Polars 的差异点」 |
 | `reader_demo.py` | 读 parquet 的四个 reader 对照：口径不对数字能差 40 倍、DuckDB 慢在物化不在读、行组数决定谁能用上并行 |
-| `arrow_demo.py` | Arrow 的三层版本 + 零拷贝的边界：ABI 里没有版本号、共享靠的是布局与所有权回调、零拷贝是列的性质、类型会断也会改 |
+| `arrow_demo.py` | Arrow 的三层版本 + 零拷贝的边界 + 三个框架的脾气：ABI 里没有版本号、共享靠的是布局与所有权回调、零拷贝是列的性质、类型会断也会改、Arrow IPC 文件只有一边能读、polars 吃 DuckDB relation 会静默给错形状 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -626,6 +626,9 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 270 | ABI 里有没有版本号 | —— | —— | **没有**：`ArrowSchema` / `ArrowArray` 里只有布局 + `release` 回调；共享靠的是**约定**（布局标准化 + 所有权回调 + `__arrow_c_stream__` 入口），不靠版本协商 |
 | 271 | 零拷贝是不是整个表的性质 | 过 DuckDB **一律要拷**（Arrow 是它的输入/输出格式，不是内部表示） | 定宽列过 polars **地址不变**（连续两次导出还是同一块）；字符串列**每次导出都重建缓冲区** | **零拷贝是列的性质**：定宽列成立、变宽列不成立 |
 | 272 | 跨框架的类型会不会断 | —— | pyarrow 26 的 decimal256 / run_end_encoded / list_view，polars 2.1 **直接不认**（decimal256 是 Rust panic，`except Exception` 接不住）；`string`/`list`/`map`/`dictionary` 被**改型** | 数据一个字节不差，**schema 变了**；跨框架传数据前先在两边各读一遍 |
+| 273 | 三个框架的「性格」 | duckdb 2.0 **最宽**：12 种类型接住 11 种（只有 decimal256 报 `NotImplementedException`），但会**偷偷改型** | polars 2.1 **最严**：3 种硬断、5 种改型；pyarrow 是参考实现，什么都原样 | **改型只动 schema，不动数据**；但 duckdb 是**语义层面**的改型（字典被解开、run-end-encoded 被解码），原始编码拿不回来 |
+| 274 | Arrow IPC 文件谁读得了 | duckdb 2.0 **读不了也写不了** —— `duckdb_extensions()` 的 30 项里**压根没有 `arrow`**（不是「没装」，是「没这一项」） | `pl.read_ipc` ✅ / `pl.DataFrame.write_ipc` ✅ | 不是「版本太老」，是**没有这个 reader**；格式本身 pyarrow ↔ polars 互相读得动 |
+| 275 | polars 能不能直接吃 DuckDB 的 relation | `rel` 有 `__arrow_c_stream__` ✅（没有 `__arrow_c_array__`） | `pl.from_arrow(rel)` **不报错，但静默给错形状** —— 给你一列 struct 的 Series（shape `(3,)` 而不是 `(3, 2)`），退出时还报 nanobind 引用泄漏 | 必须先 `.to_arrow_table()`；同一个 stream 换 pyarrow 读出来是对的（3 行 2 列） |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.execute(sql).to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那份拷贝是**内存**代价；**时间**上哪条路快取决于文件的行组数（本项目这份 1 行组的 fixture 上，反而是 `execute()` 快 1.43×），所以别照着警告改代码。
 
@@ -662,7 +665,8 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 在 `列式存储：行组里按列分段` 里展开；
 第 266~268 条（读 parquet 的口径 / 「读慢」慢在哪 / 并行粒度）在
 `读 parquet 到底谁快：四个 reader 的口径对照` 里展开。
-第 269~272 条（Arrow 的三层版本 / ABI 里没有版本号 / 零拷贝是列的性质 / 类型会断会改）在
+第 269~275 条（Arrow 的三层版本 / ABI 里没有版本号 / 零拷贝是列的性质 / 类型会断会改 /
+三个框架三种性格 / Arrow IPC 文件的互通范围 / polars 吃 DuckDB relation 的坑）在
 `Arrow 的三层版本，和「零拷贝」到底在哪儿断` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
@@ -676,7 +680,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 | 层面 | 通用的部分 | 不通用的部分 |
 | --- | --- | --- |
-| 磁盘格式 | Parquet / CSV / JSON / Arrow IPC —— 两边都能读 | `demo.duckdb` 只有 DuckDB 能开；DuckDB 还能读 SQLite/Postgres/S3 等，Polars 有 connectorx 等，两边的独占能力不重叠 |
+| 磁盘格式 | Parquet / CSV / JSON —— 两边都能读 | **Arrow IPC 只有一边能读**：Polars 有 `pl.read_ipc`，DuckDB 2.0 **读不了也写不了**（`SELECT * FROM 'x.arrow'` 报 `No extension found`；`COPY … (FORMAT arrow)` 报 `Copy Function with name arrow does not exist`）—— 不是「没装扩展」，是 `duckdb_extensions()` 的 30 项里**压根没有 `arrow`**；`demo.duckdb` 也只有 DuckDB 能开 |
 | 内存格式 | **Arrow** —— Polars 的内部模型就是 Arrow，DuckDB 的结果集能直接物化成 Arrow Table | 无 |
 | 引擎私有对象 | 能互相转换：DuckDB→Arrow→Polars，Polars→`con.register()`→DuckDB 表 | 直接用 SQL 查对方的 DataFrame 需要 DuckDB 的 `polars` 扩展（联网下载，本项目默认不装） |
 
@@ -691,6 +695,10 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 pl.from_arrow(con.sql("SELECT ...").to_arrow_table())  # DuckDB -> Polars
 con.register("t", polars_df)  # Polars -> DuckDB
 ```
+
+> `.to_arrow_table()` 那一步**不能省**：直接 `pl.from_arrow(con.sql("SELECT ..."))`
+> 不报错，但给的是一列 struct 的 Series（shape `(3,)` 而不是 `(3, 2)`），
+> 退出时还会报 nanobind 引用泄漏 —— 实测见 `Arrow 的三层版本，和「零拷贝」到底在哪儿断`。
 
 但**格式通用 ≠ 语义通用**：默认类型和名次规则仍要显式对齐（见上面第 2、3、7 条）。选型时的实用结论是：想让两个引擎都能碰的数据存 Parquet 最安全；引擎私有的 `.duckdb` 一旦落盘就把引擎锁死了。
 
@@ -7996,42 +8004,127 @@ struct ArrowSchema {
 **这正是 `interop.py` 里「Arrow 底层 buffer 地址不变」那句话的边界**：
 它比的是 `revenue`（float64）那一列，成立；字符串列（`region`）过 polars 每次导出都重建缓冲区。
 
-### 5. 类型会断，也会悄悄改
+### 5. 三个框架，三种性格
 
-12 种 Arrow 类型过 polars 2.1（实测；跑在**子进程**里 —— polars 对新类型会触发 Rust panic，
-在主进程里炸掉会连累整个 demo）：
+12 种 Arrow 类型，分别过 pyarrow（参考实现）、polars 2.1、duckdb 2.0
+（实测；跑在**子进程**里 —— polars 对新类型会触发 Rust panic，在主进程里炸掉会连累整个 demo）：
 
-| Arrow 类型 | polars | 进去的类型 | 出来的类型 | 备注 |
+| Arrow 类型 | pyarrow（参考） | polars 2.1 | duckdb 2.0 | 值 |
 | --- | --- | --- | --- | --- |
-| int64 | 接住 | int64 | int64 | 原样 ✅ |
-| string | 接住 | string | large_string | **改型了** ⚠️ |
-| large_string | 接住 | large_string | large_string | 原样 ✅ |
-| struct | 接住 | struct\<x: int32\> | struct\<x: int32\> | 原样 ✅ |
-| list | 接住 | list\<item: int32\> | large_list\<item: int32\> | **改型了** ⚠️ |
-| fixed_size_list | 接住 | fixed_size_list\<item: int32\>\[2\] | fixed_size_list\<item: int32\>\[2\] | 原样 ✅ |
-| map | 接住 | map\<string, int32\> | map\<large_string, int32\> | **改型了** ⚠️ |
-| dictionary | 接住 | dictionary\<values=string, indices=int32\> | dictionary\<values=large_string, indices=uint32\> | **改型了** ⚠️ |
-| decimal256 | **接不住** | decimal256(40, 2) | — | PanicException |
-| string_view | 接住 | string_view | large_string | **改型了** ⚠️ |
-| run_end_encoded | **接不住** | run_end_encoded\<run_ends: int32\> | — | ComputeError |
-| list_view | **接不住** | list_view\<item: int32\> | — | ComputeError |
+| int64 | int64 | int64 ✅ | int64 ✅ | ✅ |
+| string | string | large_string ⚠ | string ✅ | ✅ |
+| large_string | large_string | large_string ✅ | string ⚠ | ✅ |
+| struct | struct\<x: int32\> | struct\<x: int32\> ✅ | struct\<x: int32\> ✅ | ✅ |
+| list | list\<item: int32\> | large_list\<item: int32\> ⚠ | list\<l: int32\> ⚠ | ✅ |
+| fixed_size_list | fixed_size_list\<item: int32\>\[2\] | fixed_size_list\<item: int32\>\[2\] ✅ | fixed_size_list\<: int32\>\[2\] ⚠ | ✅ |
+| map | map\<string, int32\> | map\<large_string, int32\> ⚠ | map\<string, int32\> ✅ | ✅ |
+| dictionary | dictionary\<values=string, indices=int32\> | dictionary\<values=large_string, indices=uint32\> ⚠ | string ⚠ | ✅ |
+| decimal256 | decimal256(40, 2) | **接不住** PanicException | **接不住** NotImplementedException | — |
+| string_view | string_view | large_string ⚠ | string ⚠ | ✅ |
+| run_end_encoded | run_end_encoded\<run_ends: int32\> | **接不住** ComputeError | int32 ⚠ | ✅ |
+| list_view | list_view\<item: int32\> | **接不住** ComputeError | list\<l: int32\> ⚠ | ✅ |
 
-两类断法（实测 **3 种硬断、5 种改型**）：
+图例：✅ 原样收下 · ⚠ **改型**（schema 变了） · **接不住** 直接报错；
+「pyarrow（参考）」那列 = 进去的类型（pyarrow 就是 Arrow 的定义本身，收下什么是什么）；
+「值」列 = **接住的那边**进出两边的值逐个比对（不是只看类型）。
 
-- **硬断** —— polars 2.1 根本不认这些 Arrow 26 的新类型：
+三种性格：
+
+- **pyarrow = 参考实现** —— 它就是 Arrow 的定义本身，什么都原样收下。
+- **polars = 最严** —— 实测 3 种硬断、5 种改型。
+- **duckdb = 最宽** —— 实测 1 种硬断、7 种改型：几乎什么都接，但会**偷偷改型**。
+
+**硬断**（实测原文）：
+
+- polars 2.1 根本不认 Arrow 26 的新类型：
   - `decimal256` → `PanicException: operator does not support primitive Int256`
   - `run_end_encoded` → `ComputeError: The datatype "+r" is still not supported in Rust implementation`
   - `list_view` → `ComputeError: The datatype "+vl" is still not supported in Rust implementation`
   - 其中 `decimal256` 抛的是 **Rust panic**（pyo3 翻译成 `PanicException`）。
     实测这个异常**不是 `Exception` 的子类** —— 写 `except Exception` 接不住，
     得写 `except BaseException`。
-- **改型** —— 数据一个字节不差，但 schema 变了：
-  `string` → `large_string`、`list` → `large_list`、`map` → `map<large_string, int32>`、
-  `dictionary` → `dictionary<values=large_string, indices=uint32>`、
-  `string_view` → `large_string`。
-  这类最容易出事：**读进来是对的，写出去就变了型**。
+- duckdb 2.0 只有 `decimal256` 不行 →
+  `NotImplementedException: Not implemented Error: Unsupported Internal Arrow Type for Decimal d:40,2,256`
+  —— 规规矩矩的 Python 异常。
 
-### 6. 小结
+**改型** —— 谁改了型，改成了什么：
+
+| Arrow 类型 | polars 2.1 | duckdb 2.0 |
+| --- | --- | --- |
+| string | string → large_string | —— |
+| large_string | —— | large_string → string |
+| list | list\<item: int32\> → large_list\<item: int32\> | list\<item: int32\> → list\<l: int32\> |
+| fixed_size_list | —— | fixed_size_list\<item: int32\>\[2\] → fixed_size_list\<: int32\>\[2\] |
+| map | map\<string, int32\> → map\<large_string, int32\> | —— |
+| dictionary | dictionary\<values=string, indices=int32\> → dictionary\<values=large_string, indices=uint32\> | dictionary\<values=string, indices=int32\> → string |
+| string_view | string_view → large_string | string_view → string |
+| run_end_encoded | —— | run_end_encoded\<run_ends: int32, values: int32\> → int32 |
+| list_view | —— | list_view\<item: int32\> → list\<l: int32\> |
+
+**改型只动 schema，不动数据** —— 上表每一行的「值」都是 ✅：
+接住的那边把值取回来逐个比，一个字节不差。
+
+但两边的改型**不是一回事**：
+
+- **polars 的改型是物理层面的** —— 换个等价的存储类型（`string` → `large_string`、
+  `int32` indices → `uint32` indices）。原始信息还在，只是类型对不上。
+- **duckdb 的改型是语义层面的** —— 读的时候顺手把编码解了：
+  字典被**解开**成 `string`、run-end-encoded 被**解码**成 `int32`、
+  `list` 的子字段名从 `item` 改成 `l`。原始编码**拿不回来了**。
+
+真正会咬人的是**改型**而不是断：**读进来是对的，写出去就变了型**。
+
+### 6. 磁盘格式的实际互通范围，比「版本向后兼容」小得多
+
+| 框架 | 写 .arrow | 读 .arrow |
+| --- | --- | --- |
+| pyarrow | `ipc.new_file` ✅（666 字节） | `ipc.open_file` ✅（3 行） |
+| polars | `pl.DataFrame.write_ipc` ✅（736 字节） | `pl.read_ipc` ✅（3 行 2 列） |
+| duckdb | `COPY … (FORMAT arrow)` ❌ | `SELECT * FROM 'x.arrow'` ❌ · `read_arrow()` ❌ |
+
+duckdb 三处失败的错误原文（实测）：
+
+- 写：`Catalog Error: Copy Function with name arrow does not exist!`
+- 读（自动识别扩展名）：`Binder Error: No extension found that is capable of reading the file "…"`
+- 读（显式 reader）：`Catalog Error: Table Function with name read_arrow does not exist!`
+
+原因**不是「版本太老」**：实测 duckdb 2.0.0 的 `duckdb_extensions()` 共 30 项，
+**清单里压根没有 `arrow`** —— 不是「默认没装、装一下就行」，是这个版本没有这个 reader/writer。
+
+换个方向看 —— **格式**是共享的，差别只在谁实现了 reader：
+pyarrow 写的文件 polars 读得动（3 行 2 列 ✅），polars 写的文件 pyarrow 读得动（3 行 ✅）。
+第 1 节说的「磁盘格式向后兼容」是真的；duckdb 读不了，
+**不是因为格式，是因为它没有这个 reader**。
+
+（顺带：`.arrow` / `.feather` 是二进制 Arrow IPC，和 DuckDB 熟悉的 `.parquet` 是两回事 ——
+本仓库的 `data/orders.parquet` 才是两个框架都能读的那个。）
+
+### 7. polars 吃 DuckDB 的 relation：直连是个坑
+
+DuckDB 的 relation 上伸出来哪些手（实测）：
+
+| 入口 | 拿到什么 | polars 吃下去是什么 |
+| --- | --- | --- |
+| `rel`（relation 本身） | `__arrow_c_stream__` 有 / `__arrow_c_array__` — | **Series，shape (3,)** ⚠ |
+| `rel.to_arrow_table()` | pyarrow.Table | DataFrame，shape (3, 2) ✅ |
+| `rel.to_arrow_reader()` | pyarrow.RecordBatchReader | DataFrame，shape (3, 2) ✅ |
+| `rel.arrow()` | pyarrow.RecordBatchReader | DataFrame，shape (3, 2) ✅ |
+| `rel.pl()` | polars.DataFrame | DataFrame，shape (3, 2) ✅（DuckDB 自己转的，跟 Arrow 无关） |
+
+**坑在这儿**：
+
+- `pl.from_arrow(con.sql("SELECT ..."))` **不报错**，但给的是「一列 struct 的 Series」——
+  shape `(3,)` 而不是 `(3, 2)`。
+- 同一个 stream，pyarrow 读出来是对的（3 行 2 列 ✅）——
+  所以不是 DuckDB 给的数据不对，是 **polars 这条路把 relation 当成了「一个 struct 列」**。
+- 还有更隐蔽的：**polars 直连 relation 会在退出时触发 nanobind 引用泄漏**。
+  实测 —— 直连那版 stderr 里有 3 条 `nanobind: leaked`；
+  同一段代码**只去掉 `pl.from_arrow(rel)` 这一行**，就是 0 条。
+
+→ `pl.from_arrow(con.sql(...))` 这种写法是**又错形状、又漏引用**，两个问题叠在一起。
+**polars 要吃 DuckDB 的结果，先 `.to_arrow_table()`。**
+
+### 8. 小结
 
 1. **「Arrow 的版本」是三层。** 发行版各走各的；磁盘格式版本向后兼容；
    **ABI 层根本没有版本号**。
@@ -8039,9 +8132,13 @@ struct ArrowSchema {
    统一的 `__arrow_c_stream__` 入口。
 3. **零拷贝是列的性质。** 定宽列过 polars 地址不变；字符串列每次导出都重建；
    过 DuckDB 一律要拷。
-4. **类型会断，也会悄悄改。** 新类型直接不认（其中一个是 Rust panic），
-   旧类型会被改型 —— 数据对，schema 不对。
-5. **实用结论**：跨框架传数据优先传**定宽列**，或者先统一 schema 再传；
+4. **三个框架三种性格。** pyarrow 参考、polars 最严、duckdb 最宽；
+   硬断 polars 3 种 / duckdb 1 种，改型 polars 5 种 / duckdb 7 种。
+   **改型只动 schema，不动数据。**
+5. **磁盘格式的实际互通范围比「向后兼容」小得多。** Arrow IPC 文件 pyarrow / polars 能读写，
+   **duckdb 2.0 读不了也写不了** —— 它的扩展清单里没有 `arrow`。
+6. **polars 直接吃 DuckDB 的 relation 会静默给错形状**，还漏引用 —— 先 `.to_arrow_table()`。
+7. **实用结论**：跨框架传数据优先传**定宽列**，或者先统一 schema 再传；
    遇到新类型先在两个框架各读一遍确认能不能过。
 
 ## 目录结构
@@ -8139,7 +8236,7 @@ duckdb-polars-demo/
 │   ├── materialize_demo.py  # 结果物化方式的代价：几条通道的代价与语义
 │   ├── columnar_demo.py    # 列式存储：行组里按列分段 / 投影下推 / 按列压缩
 │   ├── reader_demo.py      # 四个 reader 对照：口径 / 物化代价 / 行组数决定并行
-│   ├── arrow_demo.py       # Arrow 三层版本 / ABI 无版本号 / 零拷贝边界 / 类型断点
+│   ├── arrow_demo.py       # Arrow 三层版本 / ABI 无版本号 / 零拷贝边界 / 三种性格 / 类型断点 / IPC 互通范围 / relation 陷阱
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
