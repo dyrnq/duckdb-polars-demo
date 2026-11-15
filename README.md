@@ -99,6 +99,7 @@ uv run python src/prune_probe_demo.py  # 行组裁剪的探针：把「跳没跳
 uv run python src/merge_demo.py        # MERGE INTO vs Polars 的手工复刻：逐行对账 + 重复键的两种错法
 uv run python src/temporal_demo.py     # 时间分桶：closed / label / every / period 四个旋钮，三个会静默改数
 uv run python src/unicode_demo.py      # Unicode 文本：规范等价性、规范化工具箱、grapheme cluster
+uv run python src/json_full_demo.py    # JSON 扩展全特性：57 个函数逐个点名，最后自动对账
 ```
 
 一键跑完整流程：
@@ -177,6 +178,7 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `merge_demo.py` | MERGE INTO：一条语句里的改、插、删，和 Polars 侧的手工复刻逐行对账 |
 | `temporal_demo.py` | 时间分桶：`closed` / `label` / `every` / `period` 四个旋钮，三个会静默改数（多算、丢行、重复计） |
 | `unicode_demo.py` | Unicode 文本：预组合 vs 分解形、去重多一个 join 漏一半、NFC 是唯一公共路径、grapheme 只有 DuckDB 有 |
+| `json_full_demo.py` | JSON 扩展全特性：57 个函数逐个点名（取值 / 探针 / Schema / 拆解 / 构造 / 合并 / 聚合 / 读取器 / 脏数据 / 序列化 / GeoJSON），最后一节自动对账「一个没漏」 |
 | `sql.py` | 临时跑一条 SQL（绕开 duckdb CLI 的版本问题） |
 
 其他开关：
@@ -265,7 +267,7 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 
 `ci_demos.sh` 负责把每个 demo 的规模开关对上（`--rows` / `--repeat` / `--repeats` / `--rounds` / `--files` / `--trades` / `--quotes` / `--keys` —— 每个 demo 叫的名字都不一样），并且**所有 demo 都会跑完**再汇总：这样 CI 挂掉时，artifact 里照样能看到其它 demo 的输出，而不只是第一个失败的那个。
 
-汇总表里的「用时」是**毫秒**：按秒算的话，67 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
+汇总表里的「用时」是**毫秒**：按秒算的话，68 个 demo 里有一大半会被抹成 `0s` —— 分不出「快」和「更快」，也看不出有没有卡住。它量的是从拉起进程到退出的整段墙钟时间，每个 demo 都要先付约 250ms 的固定开销（启动 Python + import polars/duckdb），所以「不到 300ms」的那几个基本上只付了这份开销。
 
 > **加了新 demo，要把它补进 `scripts/ci_demos.sh` 的清单。** 脚本会检查 `src/` 下有没有「能直接跑却不在清单里」的脚本，有就报错退出 —— 因为这种漏法是**静默**的（CI 照样绿，新 demo 一次都没跑过）。
 
@@ -307,6 +309,10 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | `asof_quotes.parquet` | 20 万条报价 | `symbol`、`ts`、`px` | ASOF JOIN（单独一份是刻意的：时间序列 join 的右表要能乱序，才能测出排序要求的坑） |
 | `json_events.ndjson` | 20 万行 | `event_id`、`user_id`、`event_type`、`ts`、`amount`、`props`（含嵌套 STRUCT/LIST） | JSON 与嵌套类型 |
 | `json_bigint.ndjson` | 3 行 | 超大整数 | JSON 大整数精度 |
+| `json_docs.ndjson` | 20 万行 | `doc_id`、`name`、`amount`、`city`、`event`、`user`（嵌套）、`tags`（数组） | JSON 扩展全特性（主线数据源） |
+| `json_mixed.ndjson` | 4 行 | 同一个键在不同行里是不同类型 | JSON 扩展全特性（类型不一致时两边怎么和解） |
+| `json_dirty.ndjson` | 3 行 | 第 2 行是**坏的**（截断的 JSON） | JSON 扩展全特性（`json_valid` / `ignore_errors`） |
+| `json_array.json` | 2 个对象 | 顶层是 **JSON 数组**（不是 NDJSON） | JSON 扩展全特性（读同一个文件，四个读取器四种结果） |
 | `index_customers_sorted_*.parquet` | 500 万行 | `customer_id`、`name`、`region`、`balance` | 索引与点查（**按主键排序**） |
 | `index_customers_shuf_*.parquet` | 500 万行 | 同上（**整行随机置换**） | 索引与点查（对照组） |
 | `decimal_amounts_1000000.parquet` | 100 万笔金额 | `id`、`amount`（最小单位 0.0001 元）、`amount_units`（整数最小单位，**精确答案的基准列**） | 金额与 Decimal |
@@ -1022,6 +1028,538 @@ DuckDB 的 `json_extract` 是「一行一次解析」，抽 N 个字段就解析
 
 读一份 NDJSON 谁快（load1 = 6.5）：DuckDB `read_json_auto` 257.9 ms vs Polars `read_ndjson` 263.0 ms —— **两边基本打平（1.02× 以内）**。
 两边读出来的行数一致（200,000 / 200,000），`amount` 求和一致（34996936.32000019 vs 34996936.319999985）。
+
+→ 上面讲的是 JSON 的**主线**（怎么读、怎么取字段、类型推断的坑、解析代价）。
+json 扩展整个函数面的逐个对账见下一节。
+
+## JSON 扩展全特性：57 个函数逐个点名
+
+`src/json_full_demo.py`。DuckDB 的 **json 扩展**整个摊开 —— 不挑主线，**每个函数**都过一遍：
+
+- 扩展目录里一共 **141 个重载**（98 个标量函数 + 31 个表函数 + 11 个宏 + 1 个 pragma），
+  **去重后 57 个函数名**；
+- 每个函数要么**用起来**、要么**证明用不了**（两个 `__internal_*` 被 DuckDB 在绑定期就拦下来）；
+- 最后一节**自动对账**：demo 把自己执行过的每一条 SQL 都过一遍，统计这 57 个名字
+  各自在哪一节被真的调用过 —— 「全部特性」是量出来的，不是写出来的。
+
+json 扩展是**静态链接**的（`install_mode = STATICALLY_LINKED`），不联网、不装扩展就能用。
+
+> 口径：本节所有数字都来自 `uv run python src/json_full_demo.py --rows 200000 --repeat 5`
+> 的**一次串行**运行（load1 = 1.2）。demo 自己会打印机器状态 —— 共享开发机上绝对值会飘，看相对关系。
+
+### 1. 取值：五种写法，三种返回类型
+
+同一份文档 `{"doc_id":7,"name":"双十一","price":9.5,"active":true,"tags":["a","b"],"user":{…},"note":null}`：
+
+| 写法 | 返回类型 | 取数字 `$.doc_id` | 取字符串 `$.name` |
+| --- | --- | --- | --- |
+| `json_extract(j, '$.doc_id')` | **JSON** | `7` | `"双十一"`（带引号） |
+| `json_extract_string(j, '$.doc_id')` | VARCHAR | `7` | `双十一`（没引号） |
+| `json_value(j, '$.doc_id')` | VARCHAR | `7` | `"双十一"`（**带引号**） |
+| `j -> '$.doc_id'` | **JSON** | `7` | `"双十一"` |
+| `j ->> '$.doc_id'` | VARCHAR | `7` | `双十一` |
+
+→ `json_extract` / `->` 给的是 **JSON 类型** —— 值是 JSON 原文，字符串带引号，要数字得自己 `::INTEGER`。
+→ `json_extract_string` / `->>` 给的是**去掉引号的裸文本**。
+→ `json_value` 名字像「取值」，**返回 VARCHAR，但给的是 JSON 原文**（repr 实测）：
+
+```
+json_extract_string(j, '$.name')    '双十一'
+json_value(j, '$.name')             '"双十一"'
+j ->> '$.name'                      '双十一'
+```
+
+→ 路径不存在时三个函数都返回 NULL，**不报错**。
+
+Polars 侧只有 `str.json_path_match`，返回的永远是字符串：字符串取值两边一致（`'双十一'` vs `'双十一'`），
+但 `json_value` 这种「带引号的原文」Polars 给不出来。
+
+### 2. `json_extract_path` 的数组是「并列的路径」，不是「嵌套的路径」
+
+`json_extract_path` 的第二个参数可以是 `VARCHAR[]`，一次取多条路径：
+
+```
+json_extract_path(j, ['$.doc_id', '$.user.city'])  →  ['7', '"杭州"']
+```
+
+**关键**：数组里每个元素是一条**独立**的路径，并列，不是串起来的。
+
+| 路径数组 | 结果 |
+| --- | --- |
+| `['$.user', '$.user.city']` | `['{"id":42,…,"city":"杭州"}', '"杭州"']` —— 「user」和「user.city」是两条路，各取各的 |
+| `['$.user', '$.tags']` | `['{"id":42,…}', '["a","b"]']` —— 「tags」不是 user 里的东西 |
+| `['$.user.city']` | `['"杭州"']` —— 想要「user 里的 city」这一条路径，得写全 |
+
+第二个参数也可以是**一个**路径字符串 —— 那就是普通取值，返回标量：
+`json_extract_path(j, '$.user.city')` → `'"杭州"'`，`json_extract_path_text(j, '$.user.city')` → `'杭州'`。
+
+`json_extract` 有同样的重载（第二个参数是路径数组），两者等价（实测一致）。
+
+Polars 侧没有「一次给多个路径」的对应物 —— 只能一条一条写。
+
+### 3. 五个探针：存在性、类型、键、长度、包含
+
+**`json_exists`** —— 路径在不在：`$.doc_id` → True，`$.user.city` → True，`$.user.zip` → False。
+
+**`json_type`** —— 给的是 **DuckDB 的 SQL 类型名**，不是 JSON 的说法：
+
+| 路径 | `json_type` | JSON 里的说法 |
+| --- | --- | --- |
+| `$.doc_id` | UBIGINT | 整数 |
+| `$.price` | DOUBLE | 小数 |
+| `$.name` | VARCHAR | 字符串 |
+| `$.active` | BOOLEAN | 布尔 |
+| `$.tags` | ARRAY | 数组 |
+| `$.user` | OBJECT | 对象 |
+| `$.note` | NULL | null |
+
+注意整数是 **UBIGINT**（无符号）；负数会变成 BIGINT —— 实测 `json_type('{"n":-1}')` → `BIGINT`。
+
+**`json_keys`** —— 对象有哪些键：`json_keys(j)` → `['doc_id','name','price','active','tags','user','note']`，
+`json_keys(j, '$.user')` → `['id','name','city']`。
+
+**`json_array_length`** —— 数组多长。对**不是数组**的值调用返回 **0**（不报错），
+只有**路径本身不存在**才返回 NULL：
+
+```
+json_array_length(j, '$.tags')      → 2
+json_array_length(j, '$.user')      → 0      （对象，不是数组）
+json_array_length(j, '$.missing')   → NULL   （路径不存在）
+```
+
+**`json_contains`** —— **JSON 语义**的包含（不是字符串包含），而且**两个参数都是整份文档**，
+没有「在某条路径下包含」这种用法：
+
+| 左 | 右 | 结果 |
+| --- | --- | --- |
+| `{"a":[1,2,3]}` | `[1,2]` | True |
+| `{"a":[1,2,3]}` | `[1,2,3]` | True |
+| `{"a":[1,2,3]}` | `[9]` | False |
+| `{"a":{"b":1}}` | `{"b":1}` | True |
+| `{"a":{"b":1}}` | `{"b":2}` | False |
+| `{"a":"abc"}` | `"abc"` | True |
+
+数组包含是**递归**的（`[1,2,3]` 包含 `[1,2]` → True）。
+
+Polars 侧这五个探针一个都没有 —— 要么自己写 path 匹配，要么先把 JSON 解开再判。
+
+### 4. Schema 驱动：`json_structure` → `json_transform` → 强类型列
+
+**第 1 步 · `json_structure`** —— 看这份文档长什么样（反推 schema）：
+
+```json
+{"doc_id":"UBIGINT","name":"VARCHAR","price":"DOUBLE","active":"BOOLEAN",
+ "tags":["VARCHAR"],"user":{"id":"UBIGINT","name":"VARCHAR","city":"VARCHAR"},"note":"NULL"}
+```
+
+**第 2 步 · `json_transform`** —— 照着 schema 把 JSON 投影成**带类型的列**：
+
+```python
+{'doc_id': 7, 'name': '双十一', 'price': 9.5, 'user': {'id': 42, 'city': '杭州'}}
+# 类型：STRUCT(doc_id INTEGER, "name" VARCHAR, price DOUBLE, "user" STRUCT(id INTEGER, city VARCHAR))
+```
+
+值是**原生类型**，不是 JSON 文本（`doc_id` 是 INTEGER 不是 `'7'`）；
+嵌套也保留了（`user` 是 STRUCT，不是被摊平的 `'user.id'` 字符串列）。
+
+**第 3 步 · 缺字段时两种模式完全不同**：
+
+| 写法 | 缺字段时 |
+| --- | --- |
+| `json_transform` | 不报错 → `{'没有的字段': None}` |
+| `json_transform_strict` | **报错** → `Invalid Input Error: Object {…} does not have key "没有的字段"` |
+
+**第 4 步 · `from_json` / `from_json_strict`** —— 同一件事，**参数顺序反过来**（schema 在前）：
+
+```
+from_json        {'doc_id': 7, 'name': '双十一', 'price': 9.5, 'user': {'id': 42, 'city': '杭州'}}
+from_json_strict 同上；缺字段时同样报错
+```
+
+Polars 侧两条路，都比 DuckDB 多一步：
+
+- `str.json_decode(dtype=…)`：dtype 得**用 Python 对象写出来**（`pl.Int32` / `pl.Struct({…})`），
+  DuckDB 那边是一段 JSON Schema 文本；而且 Polars **不认 JSON Schema**，只认 Polars 的 dtype。
+  缺字段给 null，**不报错** —— 没有 strict 那条路。
+- `pl.json_normalize`：把嵌套**摊平**成 `'user.city'` 这样的列名
+  （实测列名：`['doc_id','name','price','active','tags','note','user.id','user.name','user.city']`）。
+  它靠的是 **Python 值**的类型（不是 schema 文本），而且形状是摊平的 ——
+  跟 DuckDB 的 `json_transform`（保留嵌套）不是一回事。
+
+### 5. 拆解：`json_each` 拆一层，`json_tree` 递归拆
+
+`json_each` 输出 **8 列**：`key, value, type, atom, id, parent, fullkey, path`（只拆一层）：
+
+| key | value | type | atom | fullkey |
+| --- | --- | --- | --- | --- |
+| doc_id | 7 | UBIGINT | 7 | `$.doc_id` |
+| name | `"双十一"` | VARCHAR | `"双十一"` | `$.name` |
+| price | 9.5 | DOUBLE | 9.5 | `$.price` |
+| active | true | BOOLEAN | true | `$.active` |
+| tags | `["a","b"]` | ARRAY | None | `$.tags` |
+| user | `{"id":42,"name":"张三",…` | OBJECT | None | `$.user` |
+| note | null | NULL | None | `$.note` |
+
+→ `value` 是 **JSON 类型**（对象那行看到的是 `'{"id":42,…}'`），`atom` 才是原子值。
+→ `fullkey` 是这一项的完整路径 —— `json_each` 顶层的 fullkey 就是 `'$.xxx'`。
+
+`json_tree` 递归拆到底，多出 `fullkey` 的层级和 `parent`：
+
+```
+0     VARCHAR  "a"      $.tags[0]      $.tags
+user  OBJECT   None     $.user         $
+city  VARCHAR  "杭州"    $.user.city    $.user
+id    UBIGINT  42       $.user.id      $.user
+```
+
+`user.city` 这一层被拆出来了，`fullkey` 是 `'$.user.city'`，`path` 是 `'$.user'`。
+`json_each` 要做到同一件事，得自己递归。
+
+**Polars 侧 —— 能拆，但形状不一样，而且必须先知道 schema**：
+
+| | DuckDB | Polars |
+| --- | --- | --- |
+| 拆出来是什么 | **行**（key / value / type / fullkey 每一项一行） | **列**（`struct.unnest` 之后每个键一列） |
+| 要不要先声明 schema | 不要 | **要** |
+
+顶层键集合对账（同一份文档）：
+
+| | 顶层键 |
+| --- | --- |
+| DuckDB `json_each` | `['active','doc_id','name','note','price','tags','user']` |
+| Polars（dtype 只写了一半） | `['doc_id','name','tags','user']` ❌ 不一致 |
+| Polars（dtype 写全了） | `['active','doc_id','name','note','price','tags','user']` ✅ 一致 |
+
+→ **键集合能不能对上，取决于 dtype 写没写全**。DuckDB 那边不需要事先声明 ——
+文档里有什么它就拆出什么；Polars 这边少写一个字段，那个字段就**整条消失**，不是变成 NULL。
+
+### 6. 构造与改写
+
+| 写法 | 结果 |
+| --- | --- |
+| `json_object('k', 1, 'j', 'x')` | `{"k":1,"j":"x"}` |
+| `json_array(1, 'x', true)` | `[1,"x",true]` |
+| `to_json(t)` / `row_to_json(t)` | `{"a":1,"b":"x"}`（两者等价） |
+| `array_to_json([1,2,3])` | `[1,2,3]` |
+| `json_quote('he said "hi"')` | `"he said \"hi\""` —— **包成 JSON 字符串字面量** |
+| `json_normalize('{ "a" : 1 }')` | `{"a":1}` |
+| `json_strip_nulls('{"a":1,"b":null}')` | `{"a":1}` |
+
+→ `json_value` 拿到的是 JSON 原文（带引号），`json_extract_string` 拿到的是去引号的裸文本 ——
+这跟 `json_quote` 是同一个分界：**「JSON 值」和「文本」**。
+
+往已有 JSON 里塞东西 —— 三个函数，**语义不一样**（原值 `{"a":1}`）：
+
+| 写法 | 结果 |
+| --- | --- |
+| `json_insert(j, '$.a', '9')` | `{"a":1}` —— 键**已经存在就原样不动** |
+| `json_set(j, '$.a', '9')` | `{"a":9}` —— 覆盖 |
+| `json_replace(j, '$.a', '9')` | `{"a":9}` —— 覆盖 |
+| `json_insert(j, '$.b', '9')` | `{"a":1,"b":9}` —— 插进去了 |
+| `json_remove('{"a":1,"b":2}', '$.a')` | `{"b":2}` |
+
+Polars 侧没有 JSON 构造器：造 JSON 只能自己拼字符串，改 JSON 只能 `json_decode` 成 struct → 改 → 再 encode ——
+而 Polars 2.1 连 `str.json_encode` 都没有（只有 `DataFrame.write_json` / `write_ndjson`）。
+
+### 7. 合并语义三兄弟
+
+左 `{"a":1,"b":{"x":1},"c":3}`，右 `{"b":{"y":2},"c":null,"d":4}`：
+
+| 写法 | 结果 |
+| --- | --- |
+| `json_merge_patch(左, 右)` | `{"a":1,"b":{"x":1,"y":2},"d":4}` |
+| `json_deep_merge(左, 右)` | `{"a":1,"c":3,"b":{"x":1,"y":2},"d":4}` |
+
+两个合并函数的语义**完全相反**：
+
+- **`json_merge_patch`（RFC 7396）** —— 右边是「补丁」：
+  右边的 `null` 表示**删掉这个键**（`c` 没了）；
+  右边的对象**整个替换**左边的同名对象（`b.x` 没了，不是合并）。
+- **`json_deep_merge`** —— 右边是「新版本」，**递归合并**：
+  右边的 `null` **保留**（`c` 变成 null，而不是消失）；
+  嵌套对象是合并不是替换（`b` 变成 x 和 y 都有）。
+
+**`json_merge_patch_diff(source, target)`** 是第三个：**第二个参数是目标，不是补丁**。
+它算的是「怎么把 source 变成 target」的那份补丁：
+
+```
+source = {"a":1,"b":{"x":1},"c":3}
+target = {"a":2,"b":{"x":9,"z":8}}
+diff   = {"c":null,"a":2,"b":{"x":9,"z":8}}
+        （c 在 target 里没了 → diff 里标成 null = 删掉；
+          b.x 从 1 变成 9 → diff 里写 9；b.z 是新增 → 写 8。）
+
+patch(source, diff) = {"a":2,"b":{"x":9,"z":8}}   == target   ✅
+```
+
+**但这个回放有个坑**：target 里只要有一个 `null` 值，就回放不回去。
+
+```
+target 带 null = {"b":{"y":2},"c":null,"d":4}
+diff            = {"a":null,"b":{"x":null,"y":2},"c":null,"d":4}
+patch(source,diff) = {"b":{"y":2},"d":4}          ← 那个 null 没了   ❌
+```
+
+原因：**RFC 7396 里 `null` 的意思是「删掉这个键」**，
+所以「把某个键设成 null」这个动作**没法用补丁表达** —— diff 只能写 null（=删），写不出「设成 null」。
+
+Polars 侧这三个都没有。最接近的是把两个 struct 用 `pl.concat` 拼，但那是「同名列取左边/右边」，
+不是 JSON 的合并语义 —— null 的含义完全不一样。
+
+### 8. 聚合回写：把行再聚合成一份 JSON
+
+| 写法 | 结果 |
+| --- | --- |
+| `json_group_array(x)` | `[1,2,3]` |
+| `json_group_object(k, v)` | `{"a":1,"b":2}` |
+| `json_group_structure(...)` | `{"a":"UBIGINT","b":"VARCHAR"}` |
+
+→ `json_group_structure` 把多行的**结构**合成一份 schema；
+**类型撞车的时候退化成 `'JSON'`**（`1` 和 `"x"` 混在一起 → `{"a":"JSON"}`，
+逐行 `json_structure` 则是各说各的）。
+→ `json_group_object` 的键**不能是 NULL** —— 直接报 `Invalid Input Error: json_group_object key cannot be NULL`。
+
+Polars 侧没有「聚合成 JSON」的原生函数：最接近的是 `agg.list()` 拿到一个 Python list 再 `str.join`，
+但键值对、嵌套结构都得自己拼。
+
+### 9. 读取器家族：8 个读取器 + 3 个表函数
+
+json 扩展里一共 **31 个表函数重载**，去重后 **11 个名字**：
+
+| 类别 | 名字 |
+| --- | --- |
+| 读取器（8 个） | `read_json` / `read_json_auto` / `read_json_objects` / `read_json_objects_auto` / `read_ndjson` / `read_ndjson_auto` / `read_ndjson_objects` / `read_single_json_file` |
+| 其他表函数（3 个） | `json_each` / `json_tree` / `json_execute_serialized_sql` |
+
+挨个实测（NDJSON 文件 200,000 行 / JSON 数组文件 2 个对象）：
+
+| 读取器 | 喂 NDJSON | 喂 JSON 数组文件 |
+| --- | --- | --- |
+| `read_json_auto` | 200,000 行 | 2 行 |
+| `read_json` | 200,000 行 | 2 行 |
+| `read_json_objects` | 200,000 行，每行一条**原始 JSON 文本** | 2 行（每个对象一行文本） |
+| `read_json_objects_auto` | 同上 | 2 行 |
+| `read_ndjson` / `read_ndjson_auto` | 200,000 行 | ⚠️ **不报错，但只有 1 行**（整个数组塞进一个 LIST 列） |
+| `read_ndjson_objects` | 200,000 行，每行一条原文 | 1 行（整个数组一行文本） |
+| `read_single_json_file` | — | 读**只含一个 JSON 对象的文件**，出一行（顶层字段各成一列） |
+
+→ `read_json` **一个函数两种格式都吃**（NDJSON 和 JSON 数组都行，不写 `format` 也能自己认）。
+→ `read_ndjson` 喂数组文件**不报错**，但把整个数组当成**一行** ——
+静默给错形状，比直接报错还难查。
+
+Polars 侧要**两个函数**才覆盖同样的输入，而且**喂错格式会报错**：
+
+| 写法 | 结果 |
+| --- | --- |
+| `pl.read_json(NDJSON 文件)` | ❌ 报错：`InternalError(TapeError) at character 122 ('}')` |
+| `pl.read_json(JSON 数组文件)` | ✅ 2 行 × 2 列 |
+| `pl.read_ndjson(NDJSON 文件)` | ✅ 200,000 行 × 7 列 |
+| `pl.read_ndjson(JSON 数组文件)` | ❌ 报错：`NDJSON line expected to contain JSON object: list[struct[2]]` |
+
+→ **DuckDB 的 `read_json` 一个函数两种格式都吃；Polars 侧喂错格式直接炸。**
+
+### 10. 读取器选项
+
+| 选项 | 干什么 |
+| --- | --- |
+| `columns=` | 自己指定 schema，不让 DuckDB 猜 |
+| `format='array'` | 顶层是数组 |
+| `records=false` | 每条记录**整体塞进一列**（行数不变，列名固定叫 `json`，整条记录是一个 STRUCT） |
+| `maximum_depth=` | 嵌套超过几层就不再往里拆 |
+| `sample_size=` | 推断类型时看多少行（auto 系列才有） |
+| `union_by_name=` | 多个文件、列不一样时，把列并起来 |
+| `filename=true` | 额外给一列来源文件名 |
+| `maximum_object_size=` | 单个 JSON 对象最大多少字节（超过就当字符串存） |
+
+`maximum_depth` 那一行值得单独看 —— **每一层都会降级成 JSON 文本列**，拆不动了就整块留着：
+
+```
+maximum_depth=0 → ('{"a":{"b":{"c":{"d":1}}}}',)
+maximum_depth=1 → ('{"b":{"c":{"d":1}}}',)
+maximum_depth=2 → ({'b': '{"c":{"d":1}}'},)
+maximum_depth=3 → ({'b': {'c': '{"d":1}'}},)
+```
+
+这是防「深嵌套把解析器撑爆」的开关，也是防 JSON 炸弹的手段。
+
+Polars 侧只有 `pl.read_json(schema=…, schema_overrides=…, infer_schema_length=…)` ——
+**没有** `format` / `records` / `maximum_depth` / `maximum_object_size` / `union_by_name` / `filename`。
+也就是说 Polars 没有「拆到第几层就停」这个概念。
+
+### 11. 脏数据：`json_valid` 与容错读取
+
+`json_valid` 是**唯一**能提前问一句「这份文本是不是合法 JSON」的办法
+（它对 `NULL` 返回 `NULL`，不是 `false`）。
+
+直接读坏文件会报错：
+
+```
+Invalid Input Error: Malformed JSON in file "…/json_dirty.ndjson", at byte 23 in line 3: unexpected character.
+```
+
+**`ignore_errors=true` —— 注意它不是「跳过坏行」**：实测坏行**还在那儿**，只是**整行变成 NULL**，
+行数没少（3 行 → 3 行，第 2 行 id 和 v 都是 NULL）。想要「只要好的那些行」，还得自己筛。
+
+另一条路 —— 先拿文本、再自己筛：
+
+```sql
+SELECT * FROM read_csv('json_dirty.ndjson', columns={'json':'VARCHAR'},
+                       delim='\x01', quote='', escape='', header=false)
+WHERE json_valid(json)     -- → 2 行
+```
+
+→ `json_valid` 判的是**语法**，不判语义 —— `'[1,2]'` 合法但可能不是你想要的形状。
+真正的形状校验得靠 `json_structure` / `json_transform_strict`。
+
+Polars 侧没有 `json_valid` —— 读坏了只能等 Python 的 `json` 库在循环里抛异常，或者自己写正则去猜。
+（`pl.read_ndjson` 遇到坏行也是直接抛异常，没有容错开关。）
+
+### 12. 序列化往返：SQL → JSON → SQL → 执行
+
+```
+SELECT 1 AS a, 'x' AS b
+  → json_serialize_sql  → {"error":false,"statements":[{"node":{"type":"SELECT_NODE",…}}]}   （681 字符）
+  → json_deserialize_sql → "SELECT 1 AS a, 'x' AS b"     和原文一致 ✅
+  → json_execute_serialized_sql → [(1, 'x')]
+```
+
+`json_serialize_plan` 序列化的是**执行计划**（不是 SQL 文本）：
+
+```json
+{"error":false,"plans":[{"type":"LOGICAL_PROJECTION","children":[{"type":"LOGICAL_DUMMY_SCAN",…
+```
+
+→ 这四个函数是 DuckDB 独有的「**把查询本身当数据处理**」的能力。
+用途：把一条查询序列化下来发给别的机器执行；或者把计划存下来做审计。
+→ `json_serialize_sql` 的输出**不含数据**，只含语法树 —— 它是「查询的形状」，不是「查询的结果」。
+→ Polars 侧没有对应物 —— LazyFrame 没有可序列化的执行计划对象。
+
+### 13. GeoJSON 互转：这两个函数**属于 json 扩展**
+
+`st_geomfromgeojson` / `st_asgeojson` 名字里带 geo，但归类是 **json**（不是 spatial），
+因为它们干的是 JSON 解析。
+
+| 输入 GeoJSON | `ST_AsText(ST_GeomFromGeoJSON(…))` | `ST_AsGeoJSON(ST_GeomFromGeoJSON(…))` |
+| --- | --- | --- |
+| `{"type":"Point","coordinates":[1.5,2.5]}` | `POINT (1.5 2.5)` | `{"type":"Point","coordinates":[1.5,2.5]}` |
+| `{"type":"Point","coordinates":[1,2]}` | `POINT (1 2)` | `{"type":"Point","coordinates":[1.0,2.0]}` |
+
+→ **整数坐标会被规范化成浮点**：输入 `[1,2]`，回写出来是 `[1.0,2.0]`；
+输入本来就是浮点的 `[1.5,2.5]`，回写还是 `[1.5,2.5]`。
+所以 GeoJSON → GeoJSON 往返，字符串**不一定**和原文逐字相同。
+（WKT 那边的文本输出更忠实：整数坐标写成 `POINT (1 2)`。）
+
+Polars 侧零空间支持 —— 没有 `pl.geo`，DataFrame 上也没有任何 geo/point/space 方法。
+GeoJSON 在 Polars 里就是**一个字符串**，要自己 `json_decode` 再取 `coordinates`。
+
+### 14. 宏与内部函数
+
+`json(x)` 是个宏，等价于 `json_extract(x, '$')`（实测两者结果一致）。
+
+`json_copy_strftime_if_date` / `_timestamp` 是 `to_json` 的内部钩子，直接调会露馅：
+
+| 写法 | 结果 |
+| --- | --- |
+| `json_copy_strftime_if_date(DATE '2024-01-01', 'x')` | `'x'` —— 类型检查通过就**原样返回** |
+| `json_copy_strftime_if_date(DATE '2024-01-01', '%Y/%m/%d')` | `'2024/01/01'` |
+| `json_copy_strftime_if_date(123, '%Y/%m/%d')` | `123` —— 不是日期就原样返回 |
+
+`__internal_json_copy_to_json` / `__internal_json_copy_to_geojson` —— DuckDB 自己说「不许直接调」：
+
+```
+Binder Error: __internal_json_copy_to_json is for internal use only
+Binder Error: __internal_json_copy_to_geojson is for internal use only
+```
+
+这两个是 json 扩展挂在**函数目录里的内部函数**，但 DuckDB 在**绑定阶段**就拦下来 ——
+不是「没有权限」，是「不给你用」。所以覆盖自检里它们标成「调过，但报错」。
+
+### 15. 代价：同样一件事，两个引擎各要多少
+
+- 数据：`json_docs.ndjson`，200,000 行
+- 重复 5 次取中位数；**三行做的是同一件活儿**
+
+| 做法 | DuckDB (ms) | Polars (ms) | 倍数 |
+| --- | --- | --- | --- |
+| A. NDJSON → 强类型列 → 求和 | 147.7 | **74.0** | Polars 快 2.00× |
+| B. JSON 文本行 → 取嵌套字段 | **165.1** | 523.8 | DuckDB 快 3.17× |
+| C. JSON 文本行 → 照 schema 投影 | 526.7 | **412.0** | Polars 快 1.28× |
+
+口径：
+
+- A. 两边都是「读 NDJSON → 推断/给定类型 → 求和」，读的是同一个文件。
+- B. 两边都是「读文件 → 拿到原始 JSON 文本 → 解析 → 按路径取一个字段」——
+  DuckDB 用 `read_json_objects` 拿文本列，Polars 用 `read_text().splitlines()`。
+- C. 两边都是「读文件 → 拿到原始 JSON 文本 → 解析 → 照给定的类型定义投影」——
+  DuckDB 给的是 JSON Schema 文本，Polars 给的是 `pl.Struct`。
+
+→ B/C 两行里，**读文件都在计时范围内**：DuckDB 每次重读，Polars 侧也是每次重读
+（没有把 I/O 挪到计时外面）。
+→ 两边读到的行数都是 200,000。倍数是用**表里显示的那两个毫秒数**算的。
+
+→ 读法：**B 是 DuckDB 赢**（单点路径提取，DuckDB 的 JSON 解析器更快）；
+**C 反过来**（照 schema 投影，Polars 的 `str.json_decode` 更快）。
+A 是「整份读成强类型列再聚合」，Polars 领先。
+
+> C 这一行的差距**窄**：另一次串行重跑是 532.0 / 387.7（1.37×），Polars 侧 387.7–412.0 ms 之间飘。
+> 共享开发机上这是常态 —— 「谁快」这个结论稳，「快多少」别当精确值用。
+> A / B 两行在两次跑里方向和量级都没变（A 1.92×–2.00×，B 3.17×–3.18×）。
+
+### 16. 覆盖自检：57 / 57
+
+最后一节把前面各节**真的执行过**的 SQL 过一遍，跟 `duckdb_functions()` 的目录对账：
+
+| 结论 | 数字 |
+| --- | --- |
+| 目录里的函数名（去重） | **57** |
+| 成功调用过的 | **55** |
+| 调了但 DuckDB 报错（`__internal_*`） | **2** |
+| **完全没碰的** | **0** |
+
+→ **成功调用 55 个 + 调过但用不了 2 个 = 57 个**，加上不在目录里的 `->` 运算符，
+整个 json 扩展的函数面**一个没漏**。
+
+换到 Polars：
+
+| | 数字 |
+| --- | --- |
+| 在 Polars 侧**有**对应物 | **16 / 57** |
+| 在 Polars 侧**没有**对应物（要自己补的活儿） | **41 / 57** |
+
+有对应物的 16 个是：
+`->>`、`from_json`、`from_json_strict`、`json_each`、`json_extract`、`json_extract_string`、
+`json_structure`、`json_transform`、`json_transform_strict`、`json_value`、
+`read_json`、`read_json_auto`、`read_ndjson`、`read_ndjson_auto`、`row_to_json`、`to_json`。
+
+→ **「有对应物」≠「语义一样」**：第 1 节 `json_value` 的引号、第 4 节 `json_normalize` 的形状
+（Polars 是摊平成表）、第 5 节 `json_each` 的路径（Polars 没有 `fullkey`），三处都对不上。
+
+Polars 2.1 的 JSON API 表面（实测过，不是印象）：
+
+| 位置 | 跟 JSON 有关的名字 |
+| --- | --- |
+| `pl` 顶层 | 4 个：`json_normalize` / `read_json` / `read_ndjson` / `scan_ndjson` |
+| 字符串命名空间 | 2 个：`json_decode` / `json_path_match` |
+| DataFrame | 2 个：`write_json` / `write_ndjson` |
+| `Expr` | **0 个** |
+
+→ 也就是说：**读、写、解、查**四件事 Polars 都有，
+但「按 schema 投影」「递归拆」「合并语义」「聚合成 JSON」「序列化查询本身」这五件，
+Polars **一件都没有**。
+
+### 小结
+
+1. **取值有两种语义**：`json_extract` / `->` 给 JSON 原文（带引号），
+   `json_extract_string` / `->>` 给裸文本，`json_value` 名字像取值、给的是 JSON 原文。
+2. **`json_extract_path` 的数组是并列路径**，不是嵌套路径 —— 写 `['$.user','$.user.city']`
+   不会得到「user 里再找 city」。
+3. **Polars 必须先知道 schema**：少写一个字段，那个字段**整条消失**；DuckDB 不用声明。
+4. **`ignore_errors=true` 不是「跳过坏行」** —— 坏行还在，整行变 NULL，行数不变。
+5. **合并的三兄弟语义相反**：`merge_patch` 的 null = 删、`deep_merge` 的 null = 保留；
+   `merge_patch_diff` 的第二个参数是**目标**，而且目标里有 null 时补丁回放不回去。
+6. **`read_json` 一个函数吃两种格式**（Polars 要两个）；`read_ndjson` 喂数组文件不报错但只给 1 行。
+7. **json 扩展整个函数面 57 个，demo 一个不漏**（55 个用起来 + 2 个证明用不了）；
+   换到 Polars，**41 个要自己补**。
 
 ## 索引与点查
 
@@ -9378,6 +9916,10 @@ duckdb-polars-demo/
 │   ├── asof_quotes.parquet     # asof_demo.py：报价
 │   ├── json_events.ndjson      # json_demo.py：事件流
 │   ├── json_bigint.ndjson      # json_demo.py：大整数样本
+│   ├── json_docs.ndjson        # json_full_demo.py：主线数据源
+│   ├── json_mixed.ndjson       # json_full_demo.py：同一个键类型不一致
+│   ├── json_dirty.ndjson       # json_full_demo.py：第 2 行是坏的
+│   ├── json_array.json         # json_full_demo.py：顶层是 JSON 数组
 │   ├── index_customers_sorted_*.parquet  # index_demo.py：按主键排序
 │   ├── index_customers_shuf_*.parquet    # index_demo.py：打乱行序
 │   ├── decimal_amounts_*.parquet         # decimal_demo.py：金额样本
@@ -9456,6 +9998,7 @@ duckdb-polars-demo/
 │   ├── merge_demo.py       # MERGE INTO：一条语句里的改插删 vs Polars 手工复刻，逐行对账
 │   ├── temporal_demo.py    # 时间分桶：closed / label / every / period 四个旋钮，三个会静默改数
 │   ├── unicode_demo.py     # Unicode 文本：规范等价性 / 规范化工具箱 / grapheme cluster
+│   ├── json_full_demo.py   # JSON 扩展全特性：57 个函数逐个点名 + 覆盖自检
 │   └── benchmark.py        # 计时 + 等价性校验
 └── scripts/
     ├── bench.sh            # 一键跑完整流程
