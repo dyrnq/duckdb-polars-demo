@@ -131,7 +131,7 @@ scripts/bench.sh 1000000 5           # 参数：订单行数、重复次数
 | `tz_demo.py` | 日期时间与时区：精度、会话时区、夏令时、Parquet 往返 |
 | `order_demo.py` | 排序稳定性：NULL/NaN 位置、并列顺序不确定、LIMIT 会取到不同的行 |
 | `partition_demo.py` | 多文件与分区表：glob 读法、schema 冲突、分区裁剪、分区写 |
-| `window_demo.py` | 窗口函数 + 排名全家桶：默认 frame 是 RANGE 还是 ROWS、frame 家族、命名窗口、QUALIFY、LAG/LEAD，以及 9 个排名函数逐个对账 |
+| `window_demo.py` | 窗口函数 + 排名全家桶：默认 frame 是 RANGE 还是 ROWS、frame 家族、时间滑动窗口（RANGE + INTERVAL）、EXCLUDE、每行一个窗口宽度、命名窗口、QUALIFY、LAG/LEAD，以及 9 个排名函数逐个对账 |
 | `agg_demo.py` | 聚合函数语义：分位数插值、众数、arg_max 并列、字符串聚合顺序、整数求和溢出 |
 | `setop_demo.py` | 集合运算与去重：EXCEPT/INTERSECT 里的 NULL、UNION、去重保留哪一行 |
 | `regex_demo.py` | 正则与字符串：分组编号、整串 vs 子串、替换、切分、位置、中文与 Emoji 的字节/字符 |
@@ -660,6 +660,10 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 | 290 | `strip_accents` 是不是 NFKD | 不是 —— 它是**拉丁重音剥离器**：é→e、ğ→g 会动，**ı/ø/ß/ﬁ/①/Ⅻ 原样不动** | 没有 `strip_accents`，只能 `NFKD` + 去组合标记凑 | 10 个样本里两边只有 7 个结果一样 —— 当去重键，两边的键集合不同 |
 | 291 | 「一个字」是几个（grapheme） | **有**：`length_grapheme` / `left_grapheme` / `right_grapheme` / `substring_grapheme` | **一个都没有** —— `str` 命名空间 47 个方法，没有一个带 grapheme | 家庭 emoji = 1 个字但 7 个码点；「取前 N 个字」在 Polars 侧做不到 |
 | 292 | 大小写映射会不会改长度 | `upper('ß')` = `ẞ`（1 个字符，**简单映射**） | `to_uppercase('ß')` = `SS`（2 个字符，**完整映射**） | 拿 `upper(x)` 当去重键，两边结果不一样；Polars 另有 `to_titlecase`，DuckDB 一个 titlecase 函数都没有 |
+| 293 | 时间滑窗的左端点算不算 | `RANGE BETWEEN INTERVAL n DAY PRECEDING` 是**闭区间** `[t-Δ, t]` | `rolling_*_by` 默认 `closed='right'` = 左开 `(t-Δ, t]` | 差一行而且不报错；Polars 加 `closed="both"` 才跟 DuckDB 一致 |
+| 294 | 能不能把窗口里的某些行踢掉 | `EXCLUDE CURRENT ROW / GROUP / TIES / NO OTHERS` 四种全有 | **没有** EXCLUDE，得自己 group_by + join 减 | EXCLUDE 不能挂在命名窗口后面（Parser Error）；Polars 侧能拼出来，多一次聚合 + 一次 join |
+| 295 | 窗口宽度能不能每行不一样 | **能**：偏移可以引用列（`ROWS BETWEEN w PRECEDING AND CURRENT ROW`） | `rolling_*(window_size)` 的 size 必须是标量（传 Expr 直接 TypeError） | 每行一个宽度得自己用前缀和 + 索引 gather 拼 |
+| 296 | 小数能不能当窗口宽度 | 能跑，但取整跟**列的类型**走：DOUBLE 五成双、DECIMAL 逢五远离零 | —— | 同一个 2.5 写成 DOUBLE 列和 DECIMAL 列差一行，都不报错；先 CAST 成 INTEGER 才没歧义 |
 
 > 第 6 条的坑：`con.execute(sql)` 在 2.0 里返回的是连接对象而不是结果，`.arrow()` 已经不存在；退而用 `con.execute(sql).to_arrow_table()` 会警告 "makes an extra copy of the rows" —— 那份拷贝是**内存**代价；**时间**上哪条路快取决于文件的行组数（本项目这份 1 行组的 fixture 上，反而是 `execute()` 快 1.43×），所以别照着警告改代码。
 
@@ -706,7 +710,9 @@ bash scripts/ci_demos.sh 200000 3 ci-out    # 输出目录默认 ci-out/
 第 282~286 条（分桶默认值 / 旋钮静默改数 / every 与 period / 按时间列滚动 / 指数加权移动平均）在
 `时间分桶：同一批时间戳，两边怎么切` 里展开；
 第 287~292 条（规范等价性 / 规范化函数 / 兼容性分解 / strip_accents / grapheme / 大小写映射改长度）在
-`Unicode 文本：肉眼一样，字节可以不一样` 里展开。
+`Unicode 文本：肉眼一样，字节可以不一样` 里展开；
+第 293~296 条（时间滑窗的左端点 / EXCLUDE / 每行一个窗口宽度 / 小数窗口宽度）在
+`窗口函数` 里展开。
 
 两边都能把过滤和投影下推到 Parquet 扫描，用 `--explain` 可以直接看到：
 
@@ -2524,7 +2530,7 @@ Parquet SCAN [/tmp/.../dt=2024-01-02/part-0.parquet]   ← SCAN 里只剩那一�
 
 ## 窗口函数
 
-`src/window_demo.py`。DuckDB 的 `OVER (...)` 和 Polars 的 `.over(...)` 看着像，语义上却有三处默认不一致 —— 而且都不是「报错」，是「安静地算出另一个数」。
+`src/window_demo.py`。DuckDB 的 `OVER (...)` 和 Polars 的 `.over(...)` 看着像，语义上却有一串默认不一致 —— 而且都不是「报错」，是「安静地算出另一个数」：默认 frame 随排序键个数变、时间滑窗的左端点闭开不同、小数窗口宽度的取整规则跟着列的类型走。
 
 ### 1. 默认 frame 是 RANGE 还是 ROWS
 
@@ -2579,7 +2585,138 @@ Polars 侧对应的是表达式家族，而不是 frame 子句：
 | `rolling_*(...).over(...)` | `ROWS BETWEEN n PRECEDING AND n FOLLOWING` |
 | RANGE / GROUPS | **没有现成表达式**，得自己拼 |
 
-### 3. 分区窗口，以及 Polars 侧怎么拼出 RANGE
+### 3. 时间滑动窗口（RANGE + INTERVAL）
+
+「最近 N 天」这种口径，SQL 里对应的是 **RANGE frame + INTERVAL 偏移**：
+
+```sql
+sum(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL 2 DAY PRECEDING AND CURRENT ROW)
+```
+
+窗口不是「最近 N 条」，是「时间落在 [当前时间-2天, 当前时间] 里的行」——
+日期中间有空档时，窗口会**真的收缩**。
+
+6 行小表（日期中间有空档，末尾有一天两行并列）：
+
+| d | v | DuckDB RANGE 2 天 | DuckDB RANGE 4 天 | DuckDB ROWS 前一行 | Polars `rolling_sum_by` 2 天 | Polars 4 天 | Polars 4 天 `closed="both"` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2024-01-01 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 |
+| 2024-01-02 | 2.0 | 3.0 | 3.0 | 3.0 | 3.0 | 3.0 | 3.0 |
+| 2024-01-05 | 3.0 | 3.0 | **6.0** | 5.0 | 3.0 | **5.0** | 6.0 |
+| 2024-01-06 | 4.0 | 12.0 | **14.0** | 7.0 | 12.0 | **12.0** | 14.0 |
+| 2024-01-06 | 5.0 | 12.0 | **14.0** | 9.0 | 12.0 | **12.0** | 14.0 |
+| 2024-01-10 | 6.0 | 6.0 | **15.0** | 11.0 | 6.0 | **6.0** | 15.0 |
+
+2 天窗口两边一致 ✅；4 天窗口 **❌** —— 01-05 往前 4 天正好是 01-01：
+
+- DuckDB 的 RANGE 是**闭区间** `[t-Δ, t]`，01-01 在窗口里（`1+2+3 = 6`）；
+- Polars 的 `rolling_sum_by` 默认 `closed='right'`，是**左开区间** `(t-Δ, t]`，正好落在左端点上的那一行被丢掉（只剩 `2+3 = 5`）。
+
+加 `closed="both"` 之后，Polars 给出的就是 DuckDB 那一列 ✅。
+
+> 差一行，而且**不报错** —— 只有当某行正好落在 `t-Δ` 上时才会差。
+> 窗口越宽、数据越稀疏，这种行越常见：这是那种「小数据看不出、上线才发现」的坑。
+> 想两边一致，只能让 Polars 加 `closed="both"`（DuckDB 侧改不了这个闭开）。
+
+RANGE 的四条限制（三条报错、一条允许但有前提）：
+
+| 写法 | 结果 |
+| --- | --- |
+| `ORDER BY d, v RANGE BETWEEN INTERVAL 2 DAY PRECEDING …` | ❌ `Binder Error: RANGE frames must have only one ORDER BY expression` |
+| `ORDER BY d RANGE BETWEEN 2.5 PRECEDING …`（DATE 列配小数偏移） | ❌ `No function matches … '-(DATE, DECIMAL(2,1))'` |
+| `ORDER BY v RANGE BETWEEN INTERVAL 2 DAY PRECEDING …`（数值列配 INTERVAL） | ❌ `No function matches … '-(DOUBLE, INTERVAL)'` |
+| `ORDER BY d RANGE BETWEEN 2 PRECEDING …`（DATE 列配**整数**偏移） | ✅ **允许**，整数被当成「天」，跟 `INTERVAL 2 DAY` 算出来一模一样 |
+
+所以时间滑窗只能配**一个**排序键（想加并列打破键就不行了）；
+DATE 列可以配整数偏移（＝天），但小数偏移会炸，数值列配 INTERVAL 也炸。
+
+### 4. EXCLUDE 子句：把窗口里的某些行踢掉
+
+SQL:2011 的 frame 排除子句，DuckDB 四种全支持：
+`EXCLUDE CURRENT ROW` / `EXCLUDE GROUP` / `EXCLUDE TIES` / `EXCLUDE NO OTHERS`。
+
+分区 `g='a'`（`x` = 1,2,2,3，`v` = 10,20,30,40，全组和 100）：
+
+| 口径 | 4 行的结果 | 含义 |
+| --- | --- | --- |
+| 基准（全在窗口里） | `[100, 100, 100, 100]` | —— |
+| `EXCLUDE CURRENT ROW` | `[90, 80, 70, 60]` | 踢掉**自己** |
+| `EXCLUDE GROUP` | `[90, 50, 50, 60]` | 踢掉**整组**（`x=2` 那两行 = 50） |
+| `EXCLUDE TIES` | `[100, 70, 80, 100]` | 踢掉**同值的同伴**，保留自己 |
+
+Polars 侧**没有** EXCLUDE，但三种都能拼出来（7 行全对账 ✅）：
+
+| SQL | Polars 写法 | 结果 |
+| --- | --- | --- |
+| `EXCLUDE CURRENT ROW` | `sum().over('g') - 自己` | `[90, 80, 70, 60, 130, 120, 110]` ✅ |
+| `EXCLUDE GROUP` | `sum().over('g') - 同组和`（`group_by` + `join`） | `[90, 50, 50, 60, 70, 70, 110]` ✅ |
+| `EXCLUDE TIES` | `EXCLUDE GROUP` 的结果 + 自己 | `[100, 70, 80, 100, 120, 130, 180]` ✅ |
+
+差的是**写法**不是**能力**：DuckDB 一行写完，Polars 要多一次聚合 + 一次 join。
+
+一个语法限制：`EXCLUDE` **不能挂在命名窗口后面** —— `OVER (w EXCLUDE CURRENT ROW)` 直接
+`Parser Error: syntax error at or near "EXCLUDE"`，窗口规格得整段写出来。
+
+### 5. 窗口宽度：参数、表达式，甚至「每行一个宽度」
+
+窗口宽度不一定是写死的常量：
+
+| 写法 | 结果（7 行小表） |
+| --- | --- |
+| `ROWS BETWEEN 2 PRECEDING AND CURRENT ROW` | `[10.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0]` |
+| `ROWS BETWEEN ? PRECEDING …`，参数传 1 / 2 / 3 | 与写死 1 / 2 / 3 **逐值一致** ✅ |
+| `ROWS BETWEEN (2+1) PRECEDING …` | 与写死 3 一致 ✅ |
+| `ROWS BETWEEN (SELECT 3) PRECEDING …` | 与写死 3 一致 ✅ |
+
+DuckDB 真的在算这些表达式，不是当成常量糊弄过去的 —— 换参数就换窗口宽度。
+**窗口宽度可以从配置、参数或表里来，不用拼 SQL 字符串**（拼字符串是注入的口子，也是口径失控的源头）。
+Polars 侧 `rolling_sum(window_size)` 本来就是个普通参数，天然没有这个问题。
+
+更狠的一条：**偏移可以直接引用列** —— 每行的窗口宽度都不一样：
+
+```sql
+sum(v) OVER (ORDER BY ord ROWS BETWEEN w PRECEDING AND CURRENT ROW)  -- w 是列
+```
+
+6 行小表（`w` = 0,1,2,1,3,0）：
+
+| ord | v | w | 窗口里的行 | DuckDB | Polars 手拼 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 10.0 | 0 | `[10.0]` | 10.0 | 10.0 |
+| 2 | 20.0 | 1 | `[10.0, 20.0]` | 30.0 | 30.0 |
+| 3 | 30.0 | 2 | `[10.0, 20.0, 30.0]` | 60.0 | 60.0 |
+| 4 | 40.0 | 1 | `[30.0, 40.0]` | 70.0 | 70.0 |
+| 5 | 50.0 | 3 | `[20.0, 30.0, 40.0, 50.0]` | 140.0 | 140.0 |
+| 6 | 60.0 | 0 | `[60.0]` | 60.0 | 60.0 |
+
+两端都能引用列（`w PRECEDING AND w FOLLOWING`）：`[10.0, 60.0, 150.0, 120.0, 200.0, 60.0]`。
+
+Polars 侧 `rolling_*` 的窗口大小**必须是标量**，传列直接
+`TypeError: 'Expr' object cannot be interpreted as an integer`。
+但一样能算出来：前缀和 + 按行 `gather`（窗口 = 前缀和差），四步，结果逐值一致 ✅。
+
+两个边界，一个报错、一个静默：
+
+- 负数宽度 → `InvalidInputException: Window ROWS PRECEDING expression cannot be negative`（当场报错）
+- 小数宽度 → **不报错**，但取整口径跟着**列的类型**走：
+
+| f | DOUBLE 列的偏移 | DECIMAL 列的偏移 | `CAST(f AS INTEGER)` | `CAST(f::DECIMAL AS INTEGER)` |
+| --- | --- | --- | --- | --- |
+| 0.5 | 0 | **1** | 0 | 1 |
+| 1.5 | 2 | 2 | 2 | 2 |
+| 2.5 | 2 | **3** | 2 | 3 |
+| 3.5 | 4 | 4 | 4 | 4 |
+| 4.5 | 4 | **5** | 4 | 5 |
+
+DuckDB 的 DOUBLE→INTEGER 是「四舍六入五成双」（round half to even），
+DECIMAL→INTEGER 是「四舍五入、逢五远离零」。
+frame 偏移跟着列的类型走 —— **同一个 2.5，写成 DOUBLE 列窗口少一行，写成 DECIMAL 列多一行，两边都不报错**。
+（实测偏移 == `CAST(同类型列)` ✅，说明 frame 用的就是该类型的转换规则。）
+
+> 实践上：别拿小数当窗口宽度；要拿，先 `CAST` 成 INTEGER ——
+> CAST 和 frame 偏移用的是同一套规则，cast 完就没有歧义了。
+
+### 6. 分区窗口，以及 Polars 侧怎么拼出 RANGE
 
 分区累计两边都能做，口径对齐后结果一致（✅）。分区里有并列值时 RANGE 与 ROWS 照样分叉 ——
 分区 `a` 的 `x` 是 1,2,2,3：
@@ -2595,7 +2732,7 @@ Polars 侧 RANGE 的配方：先 `group_by(分区, 排序键)` 把并列行合�
 另外：Polars 的 `over(..., order_by=...)` **不写 `order_by` 时窗口内顺序未定义**，
 累计类表达式（`cum_sum`）会直接算错，且不报错。
 
-### 4. 命名窗口
+### 7. 命名窗口
 
 DuckDB 的 `WINDOW w AS (PARTITION BY g ORDER BY x, ord)` 把「分区 + 排序」命名一次，
 后面 `sum(v) OVER w`、`rank() OVER w` 反复引用，共用一套 frame，口径改一处就够。
@@ -2628,7 +2765,7 @@ Polars 没有命名窗口 —— 想共用就得把 `over('g', order_by=[...])` 
 
 Polars 的 `rank()` **默认值是 `average`**（并列取平均名次），DuckDB 没有对应函数 —— 别用默认值。
 
-### 5. QUALIFY
+### 8. QUALIFY
 
 | | DuckDB | Polars |
 | --- | --- | --- |
@@ -2642,7 +2779,7 @@ Polars 有两种等价写法：`with_columns` 造出窗口列再 `filter`（两�
 > 差别不在能不能算，而在 DuckDB 把「窗口结果直接当过滤条件」做成了语法；
 > Polars 靠表达式的求值顺序，效果一样，写法和报错方式不一样。
 
-### 6. LAG / LEAD 与 shift
+### 9. LAG / LEAD 与 shift
 
 | | DuckDB | Polars |
 | --- | --- | --- |
@@ -2659,18 +2796,43 @@ Polars 的 `shift()` 不加 `over()` 是在整张表上移位，不分区 ——
 Polars shift(1) 不加 over： [None, 1, 2, 2, 3, 2, 2]
 ```
 
-### 7. 窗口函数的代价
+### 10. 窗口变宽，代价怎么变
+
+100 万行（365 个不同日期），三种口径各跑一遍：
+
+| 窗口宽度 | DuckDB ROWS | DuckDB RANGE（单位是**天**） | Polars `rolling_mean` |
+| --- | --- | --- | --- |
+| 10 | 52.2 ms | 108.6 ms | 15.2 ms |
+| 100 | 58.4 ms | 556.2 ms | 20.2 ms |
+| 1000 | 71.3 ms | 1244.7 ms | 20.0 ms |
+
+窗口宽 100 倍（10 → 1000）之后：**DuckDB ROWS 只慢了 1.37×**、**Polars 只慢了 1.32×**，
+而 **DuckDB RANGE 慢了 11.46×**。
+
+- ROWS 窗口**不随宽度线性变慢**：朴素实现每行都要把窗口里的值重新加一遍（O(n×w)），
+  DuckDB 对滑动窗口做了优化，代价主要花在排序和物化上，不是乘窗口宽度。Polars 同理。
+- RANGE 是另一个口径 —— 它的宽度单位是**天**：表里只有 365 个不同日期，
+  宽度 1000 天时窗口已经覆盖整张表，于是每一行都要扫全表，慢了 11.46× 很正常。
+  拿 RANGE 的数字去和 ROWS 比大小没有意义 —— 两边窗口里装的行数根本不是一回事。
+- DuckDB 的窗口要自己排 `ORDER BY` 的键，Polars 的 `rolling_*` 走物理序不排 ——
+  DuckDB 这边多付了一份排序钱（Polars 侧已预先按 `ts` 排好）。
+
+口径：输入已物化（Parquet 落盘、DuckDB 建表、Polars 读进内存），计时的只有「窗口计算」这一段；
+同一宽度下三个实现**交错**跑，各 5 轮取中位数。机器状态：8 核，load1 = 3.7。
+DuckDB ROWS 和 Polars `rolling_mean` 都是「最近 N **行**」口径，可以直接比；DuckDB RANGE 是「最近 N **天**」，单列出来。
+
+### 11. 窗口函数的代价
 
 100 万行（region 分区、order_id 排序的累计销售额）：
 
 | 引擎 | 中位数 (ms) | 最快 (ms) |
 | --- | --- | --- |
-| DuckDB | 97.9 | 90.6 |
-| Polars | **35.9** | 30.7 |
+| DuckDB | 92.9 | 89.4 |
+| Polars | **35.5** | 29.8 |
 
-Polars 快 **2.73×**。口径：输入已物化（Parquet 落盘、DuckDB 建表、Polars 读进内存），
-计时的只有「窗口计算 + 结果物化」这一段；两边**交错**跑（避免「谁先跑谁吃亏」）。
-机器状态：8 核，load1 = 6.4（偏高，测量结果会偏保守）。
+Polars 快 **2.62×**。口径：输入已物化（Parquet 落盘、DuckDB 建表、Polars 读进内存），
+计时的只有「窗口计算 + 结果物化」这一段；两边**交错**跑 5 轮（避免「谁先跑谁吃亏」）。
+机器状态：8 核，load1 = 4.0。
 窗口函数贵的主因是排序：分区越大，要排的键越多。
 
 ## 聚合函数语义
@@ -9951,7 +10113,7 @@ duckdb-polars-demo/
 │   ├── tz_demo.py          # 日期时间与时区：精度 / 会话时区 / 夏令时 / Parquet 往返
 │   ├── order_demo.py       # 排序稳定性：NULL 位置 / 并列顺序 / LIMIT 后果
 │   ├── partition_demo.py   # 多文件与分区表：glob / schema 冲突 / 分区裁剪
-│   ├── window_demo.py      # 窗口函数与排名全家桶：frame / 命名窗口 / QUALIFY / 9 个排名函数
+│   ├── window_demo.py      # 窗口函数与排名全家桶：frame / 时间滑窗 / EXCLUDE / 动态宽度 / 命名窗口 / QUALIFY / 9 个排名函数
 │   ├── agg_demo.py         # 聚合语义：分位数插值 / 众数 / arg_max 并列 / 整数溢出
 │   ├── setop_demo.py       # 集合运算与去重：NULL 参与比较 / UNION / DISTINCT ON
 │   ├── regex_demo.py       # 正则与字符串：分组编号 / 切分 / 位置 / 字节与字符

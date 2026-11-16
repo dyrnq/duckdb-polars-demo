@@ -1,4 +1,4 @@
-"""窗口函数专场：frame 的默认值、并列行、命名窗口、QUALIFY 与窗口代价。
+"""窗口函数专场：frame 的默认值、并列行、时间滑窗、EXCLUDE、动态宽度、命名窗口、QUALIFY 与窗口代价。
 
 窗口函数是「看着一样、算出来不一样」的重灾区：
 
@@ -8,6 +8,12 @@
   一旦写成 `ORDER BY x, ord`（多键），RANGE 表达不了，SQL 就悄悄退化成 ROWS，
   结果跟着变，语句还不报错。
 * Polars 侧没有 frame 概念，只有 `cum_sum()` / `shift()` / `rolling_*()` 这一族表达式。
+* **时间滑窗的左端点两边不一样**：DuckDB 的 RANGE 是闭区间 [t-Δ, t]，
+  Polars 的 `rolling_*_by` 默认 `closed='right'`，也就是左开区间 (t-Δ, t] ——
+  正好落在左端点上的那一行，Polars 会少算。
+* DuckDB 的 frame 偏移**可以引用列**：`ROWS BETWEEN w PRECEDING AND CURRENT ROW`
+  里的 `w` 是一列，每行的窗口宽度可以不一样；Polars 的 `rolling_*` 只吃标量。
+* 小数当窗口宽度**不报错**，但取整跟着列的类型走（DOUBLE 五成双、DECIMAL 逢五远离零）。
 
 每个场景都拿同一份小数据并排打印两个引擎的结果，最后给出等价写法。
 
@@ -19,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import statistics
 import tempfile
 import time
@@ -40,6 +47,45 @@ SMALL = pl.DataFrame(
     }
 )
 
+# 给时间滑窗用的小表：日期中间有**空档**（01-02 → 01-05 隔了 3 天），
+# 末尾 01-06 有两行并列 —— 空档让「窗口真的会收缩」看得见，
+# 并列让「RANGE 把同伴一起算进来」看得见。
+TIMEY = pl.DataFrame(
+    {
+        "d": [
+            datetime.date(2024, 1, 1),
+            datetime.date(2024, 1, 2),
+            datetime.date(2024, 1, 5),
+            datetime.date(2024, 1, 6),
+            datetime.date(2024, 1, 6),
+            datetime.date(2024, 1, 10),
+        ],
+        "v": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    }
+)
+
+
+# 每行一个窗口宽度：w 是「这一行自己的窗口要回看几行」。
+# 用来试 DuckDB 里「frame 偏移引用列」这件事。
+WIDTHY = pl.DataFrame(
+    {
+        "ord": [1, 2, 3, 4, 5, 6],
+        "v": [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
+        "w": [0, 1, 2, 1, 3, 0],
+    }
+)
+
+# 小数宽度专用：前面 20 行是垫片（宽度 0），小数行全放在最后 ——
+# 这样窗口左端不会被表头截断，量出来的长度就是真实偏移。
+# f 是 DOUBLE，fm 是同样数值的 DECIMAL —— 用来比「同一个数、两种类型」。
+FRACY = pl.DataFrame(
+    {
+        "ord": list(range(1, 21)) + list(range(21, 29)),
+        "v": [0.0] * 20 + [1.0] * 8,
+        "f": [0.0] * 20 + [0.5, 1.5, 2.5, 3.5, 4.5, 0.6, 1.4, 2.4],
+    }
+).with_columns(pl.col("f").cast(pl.Decimal(10, 1)).alias("fm"))
+
 
 def section(title: str) -> None:
     print(f"\n{'=' * 74}\n{title}\n{'=' * 74}")
@@ -48,6 +94,9 @@ def section(title: str) -> None:
 def connect() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     con.register("w", SMALL)
+    con.register("tw", TIMEY)
+    con.register("wy", WIDTHY)
+    con.register("fy", FRACY)
     return con
 
 
@@ -175,14 +224,351 @@ def scenario_frame_kinds(con: duckdb.DuckDBPyConnection) -> None:
         "  rolling_*(...).over(...)  -> 固定行数窗口"
         "（对应 ROWS BETWEEN n PRECEDING AND n FOLLOWING）"
     )
-    print("  RANGE / GROUPS            -> 没有现成表达式，得自己拼（见场景 3）")
+    print("  RANGE / GROUPS            -> 没有现成表达式，得自己拼（见场景 6）")
 
 
-# ---------------------------------------------------------------- 3. 分区窗口
+# ---------------------------------------------------------------- 3. 时间滑动窗口
+
+
+def scenario_time_sliding_window(con: duckdb.DuckDBPyConnection) -> None:
+    section("场景 3 · 时间滑动窗口（RANGE + INTERVAL）")
+
+    print("「最近 N 天」这种口径，SQL 里对应的是 RANGE frame 配 INTERVAL 偏移：\n")
+    print("  RANGE BETWEEN INTERVAL 2 DAY PRECEDING AND CURRENT ROW")
+    print("  —— 窗口不是「最近 N 行」，是「时间落在 [当前时间-2天, 当前时间] 里的行」。\n")
+
+    duck_df = pl.from_arrow(
+        con.sql(
+            """
+            SELECT d, v,
+                   sum(v) OVER (ORDER BY d
+                       RANGE BETWEEN INTERVAL 2 DAY PRECEDING AND CURRENT ROW) AS r2,
+                   sum(v) OVER (ORDER BY d
+                       RANGE BETWEEN INTERVAL 4 DAY PRECEDING AND CURRENT ROW) AS r4,
+                   sum(v) OVER (ORDER BY d, v
+                       ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS rowwise
+            FROM tw
+            ORDER BY d, v
+            """
+        ).arrow()
+    )
+
+    polars_df = TIMEY.with_columns(
+        pl.col("v").rolling_sum_by("d", "2d", min_samples=1).alias("p2"),
+        pl.col("v").rolling_sum_by("d", "4d", min_samples=1).alias("p4"),
+        pl.col("v").rolling_sum_by("d", "4d", min_samples=1, closed="both").alias("p4_both"),
+        pl.col("v").rolling_sum(2, min_samples=1).alias("prow"),
+    ).sort("d", "v")
+
+    common.print_frame(duck_df, "DuckDB（RANGE 2天 / RANGE 4天 / ROWS 前一行）", max_rows=10)
+    common.print_frame(
+        polars_df, "Polars（rolling_sum_by 2d / 4d / 4d+closed='both'）", max_rows=10
+    )
+
+    d_r2 = duck_df["r2"].to_list()
+    d_r4 = duck_df["r4"].to_list()
+    d_row = duck_df["rowwise"].to_list()
+    p_r2 = polars_df["p2"].to_list()
+    p_r4 = polars_df["p4"].to_list()
+    p_r4_both = polars_df["p4_both"].to_list()
+    p_row = polars_df["prow"].to_list()
+
+    print("\n逐值对账：")
+    print(f"  2 天窗口   DuckDB {d_r2}")
+    print(f"             Polars {p_r2}   一致：{'✅' if d_r2 == p_r2 else '❌'}")
+    print(f"  4 天窗口   DuckDB {d_r4}")
+    print(f"             Polars {p_r4}   一致：{'✅' if d_r4 == p_r4 else '❌'}")
+    print(f"  前一行     DuckDB {d_row}")
+    print(f"             Polars {p_row}   一致：{'✅' if d_row == p_row else '❌'}")
+
+    print("\n要点一：窗口是**真的会收缩**的，不是「最近 N 条」。")
+    print("  01-05 那行往前 2 天是 01-03，01-01 和 01-02 都掉出窗口了 → 只剩自己（3）。")
+    print("  换成按行数算（ROWS 前一行）就完全不是一回事了：窗口里始终有人。")
+
+    print("\n要点二：时间滑窗的**左端点两边不一样** —— 这是本场景唯一的分叉。")
+    print("  DuckDB 的 RANGE 是闭区间 [t-Δ, t]：01-05 往前 4 天正好是 01-01，")
+    print("  01-01 在窗口里（1+2+3 = 6）。")
+    print("  Polars 的 rolling_sum_by 默认 closed='right'，是左开区间 (t-Δ, t]：")
+    print("  正好落在左端点上的 01-01 被排除（只剩 2+3 = 5）。")
+    print(
+        f"  加 closed='both' 之后 Polars 给出 {p_r4_both}，与 DuckDB 一致："
+        f"{'✅' if d_r4 == p_r4_both else '❌'}"
+    )
+
+    print("\n  → 差一行，而且不报错：只有当某行**正好**落在 t-Δ 上时才会差。")
+    print("    窗口越宽、数据越稀疏，这种行越常见 —— 所以它是那种「小数据看不出、")
+    print("    上线才发现」的坑。DuckDB 这边要跟 Polars 对齐，只能靠 Polars 加 closed='both'。")
+
+    print("\nRANGE frame 的类型限制（报错的有两个，能跑的那个有前提）：")
+    for label, sql in [
+        (
+            "RANGE + 多个排序键",
+            "SELECT sum(v) OVER (ORDER BY d, v RANGE BETWEEN INTERVAL 2 DAY PRECEDING "
+            "AND CURRENT ROW) FROM tw",
+        ),
+        (
+            "DATE 列 + 整数偏移",
+            "SELECT sum(v) OVER (ORDER BY d RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) FROM tw",
+        ),
+        (
+            "DATE 列 + 小数偏移",
+            "SELECT sum(v) OVER (ORDER BY d RANGE BETWEEN 2.5 PRECEDING AND CURRENT ROW) FROM tw",
+        ),
+        (
+            "数值列 + INTERVAL 偏移",
+            "SELECT sum(v) OVER (ORDER BY v RANGE BETWEEN INTERVAL 2 DAY PRECEDING "
+            "AND CURRENT ROW) FROM tw",
+        ),
+    ]:
+        try:
+            con.execute(sql).fetchall()
+            print(f"  {label:22}: 允许")
+        except Exception as exc:
+            print(f"  {label:22}: {type(exc).__name__}: {str(exc).splitlines()[0]}")
+
+    print("\n  所以时间滑窗只能配**一个**排序键（想加并列打破键就不行了）；")
+    print("  DATE 列配整数偏移是**允许**的，而且这个整数被当成「天」——")
+    print("  RANGE 2 PRECEDING 和 RANGE INTERVAL 2 DAY PRECEDING 算出来一模一样。")
+    print("  但小数偏移直接炸（DECIMAL 减不了 DATE），数值列配 INTERVAL 也炸。")
+
+
+# ---------------------------------------------------------------- 4. EXCLUDE
+
+
+def scenario_exclude(con: duckdb.DuckDBPyConnection) -> None:
+    section("场景 4 · EXCLUDE 子句：把窗口里的某些行踢掉")
+
+    print("SQL:2011 里的 frame 排除子句，DuckDB 四种全支持：")
+    print("  EXCLUDE CURRENT ROW / EXCLUDE GROUP / EXCLUDE TIES / EXCLUDE NO OTHERS\n")
+
+    base = "PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"
+    duck_df = pl.from_arrow(
+        con.sql(
+            f"""
+            SELECT g, x, ord, v,
+                   sum(v) OVER ({base})                      AS base,
+                   sum(v) OVER ({base} EXCLUDE CURRENT ROW)  AS ex_current,
+                   sum(v) OVER ({base} EXCLUDE GROUP)        AS ex_group,
+                   sum(v) OVER ({base} EXCLUDE TIES)         AS ex_ties
+            FROM w
+            ORDER BY g, x, ord
+            """
+        ).arrow()
+    )
+
+    common.print_frame(duck_df, "DuckDB 四种 EXCLUDE", max_rows=10)
+
+    d_base = duck_df["base"].to_list()
+    d_cur = duck_df["ex_current"].to_list()
+    d_group = duck_df["ex_group"].to_list()
+    d_ties = duck_df["ex_ties"].to_list()
+
+    print("\n看 g='a' 这一组（x = 1,2,2,3，v = 10,20,30,40，全组和 100）：")
+    print(f"  基准（全都在窗口里）        : {d_base[:4]}")
+    print(f"  EXCLUDE CURRENT ROW（踢自己）: {d_cur[:4]}")
+    print(f"  EXCLUDE GROUP（踢整组）      : {d_group[:4]}")
+    print(f"  EXCLUDE TIES（踢同值的同伴） : {d_ties[:4]}")
+    print()
+    print("  x=2 那两行（v=20、v=30）是同伴，一组的和是 50：")
+    print("    EXCLUDE GROUP  → 100-50 = 50（两行都只剩另外两组）")
+    print("    EXCLUDE TIES   → 100-30 = 70（踢掉同伴 30，保留自己 20）")
+    print("    EXCLUDE CURRENT→ 100-20 = 80（只踢自己）")
+    print("  x=1 和 x=3 没有同伴：EXCLUDE GROUP 和 EXCLUDE CURRENT 一样，")
+    print("  EXCLUDE TIES 什么都不踢（没同伴可踢）。")
+
+    print("\nPolars 侧**没有** EXCLUDE —— 但这三种都能拼出来：")
+    polars_current = SMALL.with_columns(
+        (pl.col("v").sum().over("g") - pl.col("v")).alias("ex_current")
+    ).sort("g", "x", "ord")
+    grouped = SMALL.group_by(["g", "x"], maintain_order=True).agg(pl.col("v").sum().alias("gv"))
+    polars_group = (
+        SMALL.join(grouped.select("g", "x", "gv"), on=["g", "x"], how="left")
+        .with_columns((pl.col("v").sum().over("g") - pl.col("gv")).alias("ex_group"))
+        .sort("g", "x", "ord")
+    )
+    polars_ties = polars_group.with_columns((pl.col("ex_group") + pl.col("v")).alias("ex_ties"))
+
+    p_cur = polars_current["ex_current"].to_list()
+    p_group = polars_group["ex_group"].to_list()
+    p_ties = polars_ties["ex_ties"].to_list()
+    print(f"  EXCLUDE CURRENT ROW：sum().over('g') - 自己                     → {p_cur}")
+    print(f"  EXCLUDE GROUP      ：sum().over('g') - 同组和（group_by + join）→ {p_group}")
+    print(f"  EXCLUDE TIES       ：EXCLUDE GROUP + 自己                      → {p_ties}")
+    print(
+        f"\n  与 DuckDB 一致：CURRENT {'✅' if d_cur == p_cur else '❌'}"
+        f"  GROUP {'✅' if d_group == p_group else '❌'}"
+        f"  TIES {'✅' if d_ties == p_ties else '❌'}"
+    )
+
+    print("\n  → DuckDB 一行写完；Polars 要自己 group_by 再 join 回来，多一次聚合 + 一次 join。")
+    print("    这就是「有没有这个语法」的差别：不是能不能算，是要多绕两步。")
+
+    print("\n一个语法限制：EXCLUDE 不能挂在命名窗口后面 ——")
+    try:
+        con.sql(
+            "SELECT sum(v) OVER (w EXCLUDE CURRENT ROW) FROM w WINDOW w AS (ORDER BY x)"
+        ).fetchall()
+        print("  允许")
+    except Exception as exc:
+        print(f"  {type(exc).__name__}: {str(exc).splitlines()[0]}")
+    print("  窗口规格得整段写出来，命名窗口只能用在「不带 EXCLUDE」的地方。")
+
+
+# ---------------------------------------------------------------- 5. 动态窗口宽度
+
+
+def scenario_dynamic_frame(con: duckdb.DuckDBPyConnection) -> None:
+    section("场景 5 · 窗口宽度可以是参数、表达式、子查询，甚至「每行一个宽度」")
+
+    print("窗口宽度不一定是写死的常量。DuckDB 这几种都实测能跑：\n")
+
+    def run(frame_expr: str, params: list[int] | None = None) -> list[float]:
+        sql = (
+            "SELECT sum(v) OVER (ORDER BY ord ROWS BETWEEN "
+            f"{frame_expr} PRECEDING AND CURRENT ROW) FROM w ORDER BY ord"
+        )
+        if params is None:
+            return [r[0] for r in con.execute(sql).fetchall()]
+        return [r[0] for r in con.execute(sql, params).fetchall()]
+
+    const2 = run("2")
+    print(f"  常量 2 PRECEDING              : {const2}")
+    for p in (1, 2, 3):
+        got = run("?", [p])
+        same = got == run(str(p))
+        print(
+            f"  ? PRECEDING，参数传 {p}         : {got}   与写死 {p} 一致：{'✅' if same else '❌'}"
+        )
+    print(
+        f"  表达式 (2+1) PRECEDING         : {run('(2+1)')}   与写死 3 一致："
+        f"{'✅' if run('(2+1)') == run('3') else '❌'}"
+    )
+    print(
+        f"  子查询 (SELECT 3) PRECEDING    : {run('(SELECT 3)')}   与写死 3 一致："
+        f"{'✅' if run('(SELECT 3)') == run('3') else '❌'}"
+    )
+
+    print("\n→ DuckDB 真的在算这几个表达式，不是当成常量糊弄过去的：")
+    print("  换参数就换窗口宽度，表达式和子查询都按值算出了对应的行数。")
+    print("\n实用价值：窗口宽度可以从配置、参数或表里来，")
+    print("  不用拼 SQL 字符串 —— 拼字符串是注入的口子，也是口径失控的源头。")
+    print("  （Polars 侧 `rolling_sum(window_size)` 本来就是个普通参数，天然没有这个问题。）")
+
+    # ---------------------------------------------------------------- 每行一个宽度
+    print("\n更狠的一条：偏移可以直接引用**列** —— 每行的窗口宽度都不一样。\n")
+
+    width_df = pl.from_arrow(
+        con.sql(
+            """
+            SELECT ord, v, w,
+                   sum(v) OVER (ORDER BY ord ROWS BETWEEN w PRECEDING AND CURRENT ROW) AS win,
+                   list(v) OVER (ORDER BY ord ROWS BETWEEN w PRECEDING AND CURRENT ROW) AS win_rows,
+                   sum(v) OVER (ORDER BY ord ROWS BETWEEN w PRECEDING AND w FOLLOWING) AS win2
+            FROM wy
+            ORDER BY ord
+            """
+        ).arrow()
+    )
+    common.print_frame(width_df, "DuckDB：偏移引用列 w（每行自己的宽度）", max_rows=10)
+
+    d_win = width_df["win"].to_list()
+    d_win2 = width_df["win2"].to_list()
+    print("\n  每行窗口（w 是这一行要回看几行）：")
+    for ordv, v, w, wr in zip(
+        width_df["ord"].to_list(),
+        width_df["v"].to_list(),
+        width_df["w"].to_list(),
+        width_df["win_rows"].to_list(),
+        strict=True,
+    ):
+        print(f"    ord={ordv} v={v:5} w={w} → 窗口 {wr} 和 {sum(wr)}")
+    print(f"  两端都能引用列（w PRECEDING AND w FOLLOWING）: {d_win2}")
+
+    print("\n  → 同一句 SQL，每行的窗口边界都不同：w=1 的那行只看自己 + 前一行，")
+    print("    w=3 的那行看前 4 行。这是「每行一个窗口」的原生写法。")
+
+    print("\nPolars 侧 `rolling_*` 的窗口大小必须是**标量**，传列直接报错：")
+    try:
+        WIDTHY.with_columns(pl.col("v").rolling_sum(pl.col("w"), min_samples=1).alias("r"))
+        print("    竟然能跑")
+    except Exception as exc:
+        print(f"    {type(exc).__name__}: {str(exc).splitlines()[0]}")
+    print("  但能自己拼：前缀和 + 按行 gather（窗口 = 前缀和差）")
+    manual = (
+        WIDTHY.with_row_index("i")
+        .with_columns(pl.col("v").cum_sum().alias("cs"))
+        .with_columns(pl.col("cs").shift(1).fill_null(0.0).alias("pre"))
+        .with_columns((pl.col("i") - pl.col("w")).clip(lower_bound=0).alias("start"))
+        .with_columns((pl.col("cs") - pl.col("pre").gather(pl.col("start"))).alias("manual"))
+    )
+    p_manual = manual["manual"].to_list()
+    print(f"    Polars 手拼 : {p_manual}")
+    print(f"    DuckDB      : {d_win}   一致：{'✅' if p_manual == d_win else '❌'}")
+    print("  → 一样能算出来，但 DuckDB 一行、Polars 要前缀和 + 索引 gather 四步。")
+
+    # ---------------------------------------------------------------- 边界与坑
+    print("\n两个边界（一个报错，一个静默）：")
+
+    print("\n  1) 负数宽度 → 直接报错：")
+    neg = WIDTHY.with_columns(pl.Series("w", [-1, 1, 2, 1, 3, 0]))
+    con.register("wy_neg", neg)
+    try:
+        con.execute(
+            "SELECT sum(v) OVER (ORDER BY ord ROWS BETWEEN w PRECEDING AND CURRENT ROW) FROM wy_neg"
+        ).fetchall()
+        print("    竟然能跑")
+    except Exception as exc:
+        print(f"    {type(exc).__name__}: {str(exc).splitlines()[0]}")
+
+    print("\n  2) 小数宽度 → 不报错，但取整口径跟着**列的类型**走：")
+    # 窗口必须在子查询里算完再过滤 —— WHERE 先于窗口函数生效，
+    # 直接在外层过滤会把垫片行剔掉，窗口左端被截断，量出来的偏移是假的。
+    frac_rows = con.execute(
+        """
+        SELECT f, win_d, win_m, cast_d, cast_m FROM (
+            SELECT ord, f,
+                   list(v) OVER (ORDER BY ord ROWS BETWEEN f  PRECEDING AND CURRENT ROW) AS win_d,
+                   list(v) OVER (ORDER BY ord ROWS BETWEEN fm PRECEDING AND CURRENT ROW) AS win_m,
+                   CAST(f  AS INTEGER) AS cast_d,
+                   CAST(fm AS INTEGER) AS cast_m
+            FROM fy
+        )
+        WHERE f <> 0
+        ORDER BY ord
+        """
+    ).fetchall()
+    print("      f      DOUBLE 偏移  DECIMAL 偏移  CAST(DOUBLE)  CAST(DECIMAL)")
+    measured = []
+    for f, win_d, win_m, cast_d, cast_m in frac_rows:
+        d_off = len(win_d) - 1
+        m_off = len(win_m) - 1
+        measured.append((f, d_off, m_off, cast_d, cast_m))
+        print(f"      {f:<6} {d_off:^10} {m_off:^12} {cast_d:^13} {cast_m:^13}")
+    same_d = all(d == cd for _, d, _, cd, _ in measured)
+    same_m = all(m == cm for _, _, m, _, cm in measured)
+    diff = [f for f, d, m, _, _ in measured if d != m]
+    print(
+        f"\n    实得偏移 == CAST(同类型列) ?  DOUBLE：{'✅' if same_d else '❌'}"
+        f"   DECIMAL：{'✅' if same_m else '❌'}"
+    )
+    print(f"    同一个数值，DOUBLE 列和 DECIMAL 列的偏移不一致：{diff}")
+
+    half = [(f, d, m) for f, d, m, _, _ in measured if f % 1 == 0.5]
+    print("\n    → DuckDB 的 DOUBLE→INTEGER 是「四舍六入五成双」（round half to even）：")
+    print("      " + "、".join(f"{f}→{d}" for f, d, _ in half))
+    print("      DECIMAL→INTEGER 是「四舍五入、逢五远离零」：")
+    print("      " + "、".join(f"{f}→{m}" for f, _, m in half))
+    print("      frame 偏移跟着列的类型走 —— 同一个 2.5，写成 DOUBLE 列窗口少一行，")
+    print("      写成 DECIMAL 列多一行，**两边都不报错**。")
+    print("    实践上：别拿小数当窗口宽度；要拿，先 CAST 成 INTEGER")
+    print("      （CAST 和 frame 偏移用的是同一套转换规则，cast 完就没有歧义了）。")
+
+
+# ---------------------------------------------------------------- 6. 分区窗口
 
 
 def scenario_partition(con: duckdb.DuckDBPyConnection) -> None:
-    section("场景 3 · 分区窗口：累计到每个分区重新开始")
+    section("场景 6 · 分区窗口：累计到每个分区重新开始")
 
     duck_rows = con.sql(
         """
@@ -233,11 +619,11 @@ def scenario_partition(con: duckdb.DuckDBPyConnection) -> None:
     print("      累计类的表达式（cum_sum）会直接算错，且不报错。")
 
 
-# ---------------------------------------------------------------- 4. 命名窗口
+# ---------------------------------------------------------------- 7. 命名窗口
 
 
 def scenario_named_window(con: duckdb.DuckDBPyConnection) -> None:
-    section("场景 4 · 命名窗口：SQL 能复用，Polars 只能把表达式抄两遍")
+    section("场景 7 · 命名窗口：SQL 能复用，Polars 只能把表达式抄两遍")
 
     duck_df = pl.from_arrow(
         con.sql(
@@ -305,11 +691,11 @@ def scenario_named_window(con: duckdb.DuckDBPyConnection) -> None:
         print(f"  引用命名窗口时再补 frame：{type(exc).__name__}: {str(exc).splitlines()[0]}")
 
 
-# ---------------------------------------------------------------- 5. QUALIFY
+# ---------------------------------------------------------------- 8. QUALIFY
 
 
 def scenario_qualify(con: duckdb.DuckDBPyConnection) -> None:
-    section("场景 5 · QUALIFY：SQL 能写，Polars 要多走一步")
+    section("场景 8 · QUALIFY：SQL 能写，Polars 要多走一步")
 
     duck_df = pl.from_arrow(
         con.sql(
@@ -362,11 +748,11 @@ def scenario_qualify(con: duckdb.DuckDBPyConnection) -> None:
     print("    Polars 靠表达式的求值顺序，效果一样，但写法和报错方式不一样。")
 
 
-# ---------------------------------------------------------------- 6. LAG / LEAD
+# ---------------------------------------------------------------- 9. LAG / LEAD
 
 
 def scenario_lag_lead(con: duckdb.DuckDBPyConnection) -> None:
-    section("场景 6 · LAG / LEAD 与 shift")
+    section("场景 9 · LAG / LEAD 与 shift")
 
     duck_df = pl.from_arrow(
         con.sql(
@@ -404,11 +790,124 @@ def scenario_lag_lead(con: duckdb.DuckDBPyConnection) -> None:
     print("  Polars shift(1) 不加 over：", whole["lag_x"].to_list())
 
 
-# ---------------------------------------------------------------- 7. 性能
+# ---------------------------------------------------------------- 10. 窗口变宽的代价
+
+
+def scenario_frame_width_cost(con: duckdb.DuckDBPyConnection, rows: int, repeat: int) -> None:
+    section("场景 10 · 窗口变宽，代价怎么变")
+
+    print(f"数据：{rows} 行（365 个不同的日期，v = 行号 % 977）")
+    print(f"机器：{common.describe_machine()}")
+
+    days = pl.Series([i % 365 for i in range(rows)], dtype=pl.Int32)
+    df = (
+        pl.DataFrame({"v": [float(i % 977) for i in range(rows)]})
+        .with_columns((pl.lit(datetime.datetime(2024, 1, 1)) + pl.duration(days=days)).alias("ts"))
+        .select("ts", "v")
+    )
+
+    # 输入先物化：Parquet 落盘、DuckDB 建表、Polars 读进内存，都不计入计时
+    tmpdir = Path(tempfile.mkdtemp(prefix="window_demo_w_"))
+    src = tmpdir / "ts.parquet"
+    df.write_parquet(src)
+    con.execute("CREATE TABLE winw AS SELECT * FROM read_parquet(?)", [str(src)])
+    # Polars 侧按 ts 排好序 —— rolling_* 走物理序，不会自己排
+    polars_src = pl.read_parquet(src).sort("ts")
+
+    def duck_rows_sql(width: int) -> str:
+        return f"""
+            SELECT sum(s) FROM (
+                SELECT avg(v) OVER (ORDER BY ts
+                    ROWS BETWEEN {width - 1} PRECEDING AND CURRENT ROW) AS s
+                FROM winw
+            )
+        """
+
+    def duck_range_sql(width: int) -> str:
+        return f"""
+            SELECT sum(s) FROM (
+                SELECT avg(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL {width} DAY PRECEDING
+                    AND CURRENT ROW) AS s
+                FROM winw
+            )
+        """
+
+    widths = (10, 100, 1000)
+    duck_rows_ms: dict[int, float] = {}
+    duck_range_ms: dict[int, float] = {}
+    polars_ms: dict[int, float] = {}
+
+    for width in widths:
+        # 先跑一次把计划编译好，不计入计时
+        con.execute(duck_rows_sql(width)).fetchone()
+        con.execute(duck_range_sql(width)).fetchone()
+        polars_src.select(pl.col("v").rolling_mean(width, min_samples=1).sum())
+
+        d_rows: list[float] = []
+        d_range: list[float] = []
+        p_times: list[float] = []
+        # 交错跑：谁先跑谁不吃亏
+        for _ in range(repeat):
+            t0 = time.perf_counter()
+            con.execute(duck_rows_sql(width)).fetchone()
+            d_rows.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            con.execute(duck_range_sql(width)).fetchone()
+            d_range.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            polars_src.select(pl.col("v").rolling_mean(width, min_samples=1).sum())
+            p_times.append(time.perf_counter() - t0)
+
+        duck_rows_ms[width] = statistics.median(d_rows) * 1000
+        duck_range_ms[width] = statistics.median(d_range) * 1000
+        polars_ms[width] = statistics.median(p_times) * 1000
+
+    print(f"\n{'窗口宽度':<12}{'DuckDB ROWS':>16}{'DuckDB RANGE':>16}{'Polars':>14}")
+    print("-" * 58)
+    for width in widths:
+        print(
+            f"{width:<12}{duck_rows_ms[width]:>13.1f} ms{duck_range_ms[width]:>13.1f} ms"
+            f"{polars_ms[width]:>11.1f} ms"
+        )
+
+    narrow, wide = widths[0], widths[-1]
+    rows_growth = duck_rows_ms[wide] / duck_rows_ms[narrow]
+    range_growth = duck_range_ms[wide] / duck_range_ms[narrow]
+    polars_growth = polars_ms[wide] / polars_ms[narrow]
+    factor = wide // narrow
+    distinct_days = len({i % 365 for i in range(rows)})
+    print(f"\n窗口宽 {factor} 倍（{narrow} → {wide}）之后：")
+    print(f"  DuckDB ROWS  慢了 {rows_growth:.2f}×")
+    print(f"  DuckDB RANGE 慢了 {range_growth:.2f}×")
+    print(f"  Polars       慢了 {polars_growth:.2f}×")
+    print(
+        f"\n→ DuckDB 的 ROWS 窗口**不随宽度线性变慢**：宽 {factor} 倍，只慢了 {rows_growth:.2f}×。"
+    )
+    print("  朴素实现每行都要把窗口里的值重新加一遍（O(n×w)），")
+    print("  DuckDB 对滑动窗口做了优化，所以代价主要花在排序和物化上，不是乘窗口宽度。")
+    print(
+        "  Polars 的 rolling_mean 同理（宽 100 倍只慢了 "
+        f"{polars_growth:.2f}×），而且它走物理序、不排序，所以基数更低。"
+    )
+    print("\n  DuckDB 的 RANGE 是另一个口径 —— 它的宽度单位是**天**，不是行：")
+    print(f"    表里只有 {distinct_days} 个不同日期，宽度 {wide} 天时窗口已经覆盖整张表，")
+    print(f"    于是每一行都要扫全表（O(n×w)），慢了 {range_growth:.2f}× 很正常。")
+    print("    拿 RANGE 的数字去和 ROWS 比大小没有意义 —— 两边窗口里装的行数根本不是一回事。")
+
+    print("\n口径：输入已物化（Parquet 落盘、DuckDB 建表、Polars 读进内存），")
+    print("      计时的只有「窗口计算」这一段；同一宽度下三个实现**交错**跑，")
+    print(f"      各 {repeat} 轮取中位数。共享开发机，单次数字会抖，看趋势。")
+    print("      DuckDB 的窗口要自己排 ORDER BY 的键，Polars 的 rolling_* 走物理序不排 ——")
+    print("      所以 DuckDB 这边多付了一份排序钱（Polars 侧已预先按 ts 排好）。")
+    print("      DuckDB ROWS 和 Polars rolling_mean 都是「最近 N **行**」口径，可以直接比；")
+    print("      DuckDB RANGE 是「最近 N **天**」，单列出来。")
+
+
+# ---------------------------------------------------------------- 11. 性能
 
 
 def scenario_performance(con: duckdb.DuckDBPyConnection, rows: int, repeat: int) -> None:
-    section("场景 7 · 窗口函数的代价（两个引擎做同一件事）")
+    section("场景 11 · 窗口函数的代价（两个引擎做同一件事）")
 
     print(f"数据：{rows} 行（region 分区、order_id 排序的累计销售额）")
     print(f"机器：{common.describe_machine()}")
@@ -494,10 +993,14 @@ def main() -> None:
     try:
         scenario_default_frame(con)
         scenario_frame_kinds(con)
+        scenario_time_sliding_window(con)
+        scenario_exclude(con)
+        scenario_dynamic_frame(con)
         scenario_partition(con)
         scenario_named_window(con)
         scenario_qualify(con)
         scenario_lag_lead(con)
+        scenario_frame_width_cost(con, args.rows, args.repeat)
         scenario_performance(con, args.rows, args.repeat)
     finally:
         con.close()
